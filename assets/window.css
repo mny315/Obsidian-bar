@@ -1,0 +1,2682 @@
+@define-color fg #ffffff;
+@define-color bar_tint mix(@theme_bg_color,@theme_selected_bg_color,0.10);
+@define-color panel_tint mix(@theme_bg_color,@theme_selected_bg_color,0.07);
+@define-color popup_surface_bg alpha(@panel_tint,0.54);
+@define-color osd_surface_bg alpha(@panel_tint,0.39);
+@define-color popup_surface_border alpha(@theme_selected_bg_color,0.22);
+@define-color popup_list_bg alpha(@theme_fg_color,0.035);
+@define-color glass_bg alpha(@bar_tint,0.68);
+@define-color glass_border alpha(@theme_selected_bg_color,0.34);
+@define-color section_bg alpha(@panel_tint,0.50);
+@define-color section_border alpha(@theme_selected_bg_color,0.18);
+@define-color hover_bg alpha(@theme_fg_color,0.115);
+@define-color active_bg alpha(@theme_fg_color,0.18);
+@define-color soft_overlay_03 alpha(@theme_selected_bg_color,0.05);
+@define-color soft_overlay_05 alpha(@theme_selected_bg_color,0.08);
+@define-color soft_overlay_06 alpha(@theme_selected_bg_color,0.09);
+@define-color soft_overlay_08 alpha(@theme_selected_bg_color,0.12);
+@define-color soft_overlay_09 alpha(@theme_fg_color,0.09);
+@define-color soft_overlay_10 alpha(@theme_fg_color,0.10);
+@define-color soft_overlay_12 alpha(@theme_fg_color,0.12);
+@define-color soft_overlay_16 alpha(@theme_fg_color,0.16);
+@define-color soft_overlay_18 alpha(@theme_fg_color,0.18);
+@define-color soft_overlay_24 alpha(@theme_fg_color,0.24);
+@define-color soft_overlay_42 alpha(@theme_fg_color,0.42);
+@define-color soft_overlay_98 alpha(@theme_fg_color,0.98);
+@define-color soft_overlay_100 @theme_fg_color;
+@define-color accent_overlay_08 alpha(@theme_selected_bg_color,0.08);
+@define-color accent_overlay_12 alpha(@theme_selected_bg_color,0.12);
+@define-color accent_overlay_18 alpha(@theme_selected_bg_color,0.18);
+@define-color accent_overlay_26 alpha(@theme_selected_bg_color,0.26);
+@define-color urgent_bg alpha(@theme_selected_bg_color,0.16);
+@define-color urgent_core alpha(@theme_selected_bg_color,0.92);
+@define-color shadow_08 alpha(@theme_bg_color,0.08);
+@define-color shadow_10 alpha(@theme_bg_color,0.10);
+
+window.bar-window,
+window.bar-window.background,
+window.osd-window,
+window.osd-window.background,
+window.audio-spectrum-window,
+window.audio-spectrum-window.background,
+.audio-spectrum-canvas,
+.osd-placement {
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  border: none;
+}
+
+.audio-spectrum-canvas {
+  color: @fg;
+}
+
+window.osd-window box.osd-frame,
+.osd-frame {
+  min-width: 300px;
+  min-height: 82px;
+  color: @fg;
+  background: @osd_surface_bg;
+  background-color: @osd_surface_bg;
+  background-image: none;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+.osd-body {
+  padding: 12px 16px 14px 16px;
+  background: transparent;
+  background-image: none;
+}
+
+.osd-header {
+  background: transparent;
+  background-image: none;
+}
+
+.osd-icon {
+  min-width: 20px;
+  font-family: "Material Design Icons";
+  font-size: 18px;
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+.osd-title,
+.osd-percent {
+  font-size: 14px;
+}
+
+.osd-title {
+  font-weight: 500;
+}
+
+.osd-percent {
+  min-width: 42px;
+  font-weight: 600;
+}
+
+scale.slider-control.osd-slider {
+  min-width: 268px;
+}
+
+window.wallpaper-transition-window,
+window.wallpaper-transition-window.background,
+.wallpaper-transition-canvas {
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  border: none;
+}
+
+window.bar-window > box.bar-content,
+.bar-content {
+  color: @fg;
+  background-color: @glass_bg;
+  background-image: none;
+  border: 1px solid @glass_border;
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow:
+    inset 0 1px 0 alpha(@theme_selected_bg_color,0.22),
+    inset 0 -1px 0 alpha(@theme_selected_bg_color,0.07);
+  min-height: 40px;
+  padding: 0 3px;
+  transition: background-color 180ms ease, border-color 180ms ease, opacity 180ms ease;
+}
+
+.bar-modules {
+  background: transparent;
+  border-spacing: 0;
+}
+
+.section {
+  color: @fg;
+  background: @section_bg;
+  border: 1px solid @section_border;
+  border-radius: 13px;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_10,
+    inset 0 -1px 0 @shadow_08,
+    0 4px 12px @shadow_10;
+  margin: 5px 3px;
+  padding: 0 6px;
+}
+
+.workspace-indicator-container {
+  min-height: 30px;
+  margin: 5px 3px;
+  padding: 0 10px;
+  border-radius: 999px;
+}
+
+.workspace-indicator {
+  min-height: 30px;
+  padding: 0;
+}
+
+button.workspace-chip {
+  min-width: 18px;
+  min-height: 18px;
+  padding: 0;
+  margin: 0;
+  border-radius: 999px;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  opacity: 0.96;
+  transition: background-color 160ms ease, transform 160ms ease, opacity 160ms ease;
+}
+
+button.workspace-chip:hover {
+  background: @soft_overlay_06;
+}
+
+button.workspace-chip:active {
+  transform: scale(0.94);
+}
+
+button.workspace-chip.active,
+button.workspace-chip.focused {
+  background: @accent_overlay_08;
+}
+
+button.workspace-chip.urgent {
+  background: @urgent_bg;
+}
+
+.workspace-chip-core {
+  min-width: 6px;
+  min-height: 6px;
+  border-radius: 999px;
+  background: @soft_overlay_24;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  transition: min-width 180ms ease, min-height 180ms ease, background-color 180ms ease, opacity 180ms ease;
+  opacity: 0.88;
+}
+
+.workspace-chip-core.occupied {
+  min-width: 7px;
+  min-height: 7px;
+  background: @soft_overlay_42;
+  opacity: 0.96;
+}
+
+.workspace-chip-core.active,
+.workspace-chip-core.focused {
+  min-width: 10px;
+  min-height: 10px;
+  background: @soft_overlay_98;
+  opacity: 1;
+  box-shadow: none;
+}
+
+.workspace-chip-core.focused {
+  background: @soft_overlay_100;
+  box-shadow: none;
+}
+
+.workspace-chip-core.urgent {
+  background: @urgent_core;
+  box-shadow: none;
+  opacity: 1;
+}
+
+button.clock-button,
+button.keyboard-button {
+  min-height: 30px;
+}
+
+.clock-content {
+  border-spacing: 4px;
+  padding: 0 8px;
+}
+
+.clock-icon {
+  min-width: 16px;
+  font-family: "Material Design Icons";
+  font-size: 16px;
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+  opacity: 1;
+}
+
+.clock-label,
+.layout-label {
+  font-size: 14px;
+  font-weight: 400;
+}
+
+
+window.calendar-popup-window,
+window.calendar-popup-window.background,
+window.calendar-popup-window > box {
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.calendar-popup-window box.widget-popup-frame.calendar-popover-window,
+.calendar-popover-window {
+  padding: 10px;
+  color: @fg;
+  background: @popup_surface_bg;
+  background-color: @popup_surface_bg;
+  background-image: none;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+.calendar-widget {
+  padding: 2px;
+  color: @fg;
+  background: transparent;
+  border: none;
+  font-size: 13px;
+}
+
+.calendar-widget button,
+.calendar-widget button:focus {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 8px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.calendar-widget button:hover {
+  background: @hover_bg;
+}
+
+.calendar-widget button:active {
+  background: @active_bg;
+}
+
+.calendar-widget header {
+  margin: 0 0 6px 0;
+  padding: 0 1px;
+}
+
+.calendar-widget header label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.calendar-widget grid label {
+  min-width: 26px;
+  min-height: 24px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.calendar-widget grid label.day-name {
+  min-height: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.62;
+}
+
+.calendar-widget grid label.other-month {
+  opacity: 0.34;
+}
+
+.calendar-widget grid label.today {
+  font-weight: 700;
+  background: alpha(@theme_fg_color,0.08);
+}
+
+.calendar-widget grid label.day-number:selected {
+  color: @fg;
+  background: @active_bg;
+}
+
+button.clock-button,
+button.clock-button:focus,
+button.keyboard-button,
+button.keyboard-button:focus {
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 10px;
+  box-shadow: none;
+  outline: none;
+  min-width: 0;
+  margin: 0;
+}
+
+button.clock-button,
+button.clock-button:focus {
+  padding: 0;
+}
+
+button.keyboard-button,
+button.keyboard-button:focus {
+  padding: 0 8px;
+}
+
+button.clock-button:hover,
+button.keyboard-button:hover {
+  background: @hover_bg;
+  background-image: none;
+}
+
+button.clock-button:active,
+button.clock-button.calendar-popup-open,
+button.clock-button.calendar-popup-open:hover,
+button.clock-button.calendar-popup-open:active,
+button.keyboard-button:active,
+button.keyboard-button:checked {
+  background: @active_bg;
+  background-image: none;
+}
+
+button.clock-button:focus-visible,
+button.keyboard-button:focus-visible {
+  outline: 1px solid alpha(@theme_fg_color,0.42);
+  outline-offset: -2px;
+}
+
+.pinned-player-container {
+  min-height: 30px;
+  min-width: 0;
+  margin-left: 3px;
+  padding: 0 4px;
+}
+
+.pinned-player-inline,
+.player-meta-revealer,
+.pinned-player-meta {
+  background: transparent;
+  min-width: 0;
+}
+
+.pinned-player-controls {
+  min-width: 0;
+  margin-right: 3px;
+}
+
+button.player-source-button,
+button.player-transport-button,
+button.player-main-button {
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+button.player-source-button,
+button.player-transport-button {
+  min-width: 26px;
+  min-height: 30px;
+  padding: 0 3px;
+  border-radius: 10px;
+}
+
+button.player-transport-primary {
+  min-width: 30px;
+}
+
+.player-transport-icon {
+  min-width: 18px;
+  margin: 0;
+  padding: 0;
+  font-family: "Material Design Icons";
+  font-size: 16px;
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+button.player-main-button {
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 4px;
+  border-radius: 10px;
+}
+
+.player-main-label {
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 400;
+}
+
+button.player-source-button:hover,
+button.player-transport-button:hover,
+button.player-main-button:hover {
+  background: @hover_bg;
+  background-image: none;
+}
+
+button.player-source-button:active,
+button.player-transport-button:active,
+button.player-main-button:active {
+  background: @active_bg;
+  background-image: none;
+}
+
+button.player-transport-button:disabled,
+button.player-transport-button:disabled:hover,
+button.player-transport-button:disabled:active {
+  background: transparent;
+  background-image: none;
+  opacity: 0.62;
+}
+
+button.player-transport-button:disabled .player-transport-icon {
+  color: alpha(@theme_fg_color,0.45);
+}
+
+button.player-source-button:focus-visible,
+button.player-transport-button:focus-visible,
+button.player-main-button:focus-visible {
+  outline: 1px solid alpha(@theme_fg_color,0.42);
+  outline-offset: -2px;
+}
+button.wallpaper-widget-trigger {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0 2px;
+  margin: 0;
+  border-radius: 8px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+button.wallpaper-widget-trigger:hover,
+button.wallpaper-widget-trigger:active,
+button.wallpaper-widget-trigger:checked {
+  background: @hover_bg;
+  background-image: none;
+}
+
+button.wallpaper-widget-trigger:focus-visible {
+  outline: 1px solid alpha(@theme_fg_color,0.42);
+  outline-offset: -2px;
+}
+
+.wallpaper-trigger-icon,
+.wallpaper-header-icon,
+.wallpaper-refresh-icon,
+.wallpaper-empty-icon,
+.wallpaper-video-play-icon {
+  font-family: "Material Design Icons";
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+.wallpaper-trigger-icon {
+  min-width: 14px;
+  font-size: 14px;
+}
+
+window.wallpaper-picker-window,
+window.wallpaper-picker-window.background {
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+.wallpaper-picker-surface {
+  padding: 12px;
+  color: @fg;
+  background: @popup_surface_bg;
+  background-image: none;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+.wallpaper-picker {
+  min-width: 472px;
+}
+
+.wallpaper-header {
+  min-height: 28px;
+}
+
+.wallpaper-header-actions {
+  min-height: 28px;
+  padding: 1px 2px;
+  border-radius: 12px;
+  background: @soft_overlay_10;
+  border: 1px solid @soft_overlay_18;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_16,
+    inset 0 -1px 0 @shadow_08,
+    0 4px 12px @shadow_10;
+}
+
+.wallpaper-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.wallpaper-count {
+  font-size: 12px;
+  opacity: 0.72;
+}
+
+.wallpaper-header-icon {
+  min-width: 18px;
+  font-size: 17px;
+  opacity: 0.9;
+}
+
+.wallpaper-path-actions {
+  min-height: 28px;
+  margin-top: 1px;
+  padding: 1px 2px;
+  border-radius: 12px;
+  background: @soft_overlay_10;
+  border: 1px solid @soft_overlay_18;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_16,
+    inset 0 -1px 0 @shadow_08,
+    0 4px 12px @shadow_10;
+}
+
+button.wallpaper-refresh-button,
+button.wallpaper-refresh-button:focus {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 5px;
+  border-radius: 9px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.wallpaper-refresh-icon {
+  min-width: 16px;
+  font-size: 16px;
+  transform-origin: 50% 50%;
+}
+
+button.wallpaper-refresh-button:hover,
+button.wallpaper-refresh-button:focus-visible {
+  background: @soft_overlay_05;
+}
+
+button.wallpaper-refresh-button:active {
+  background: @soft_overlay_09;
+}
+
+button.wallpaper-feature-button:checked {
+  background: @soft_overlay_16;
+  box-shadow: inset 0 0 0 1px @soft_overlay_12;
+}
+
+button.wallpaper-feature-button:checked:hover,
+button.wallpaper-feature-button:checked:focus-visible {
+  background: @soft_overlay_18;
+}
+
+menubutton.wallpaper-random-button,
+menubutton.wallpaper-random-button > button.toggle,
+menubutton.wallpaper-random-button button.toggle {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 5px;
+  margin: 0;
+  border-radius: 9px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+menubutton.wallpaper-random-button > button.toggle:hover,
+menubutton.wallpaper-random-button > button.toggle:focus-visible,
+menubutton.wallpaper-random-button button.toggle:hover,
+menubutton.wallpaper-random-button button.toggle:focus-visible {
+  background: @soft_overlay_05;
+}
+
+menubutton.wallpaper-random-button > button.toggle:active,
+menubutton.wallpaper-random-button > button.toggle:checked,
+menubutton.wallpaper-random-button button.toggle:active,
+menubutton.wallpaper-random-button button.toggle:checked {
+  background: @soft_overlay_09;
+}
+
+popover.wallpaper-random-popover,
+popover.wallpaper-random-popover > arrow {
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+popover.wallpaper-random-popover > contents {
+  padding: 10px;
+  color: @fg;
+  background: @popup_surface_bg;
+  border: 1px solid @popup_surface_border;
+  border-radius: 14px;
+  box-shadow: none;
+}
+
+popover.wallpaper-random-popover > arrow {
+  min-width: 0;
+  min-height: 0;
+  opacity: 0;
+}
+
+.wallpaper-random-panel {
+  min-width: 190px;
+}
+
+.wallpaper-random-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+button.wallpaper-random-now,
+button.wallpaper-random-now:focus {
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 9px;
+  background: @soft_overlay_08;
+  border: 1px solid @soft_overlay_16;
+  box-shadow: none;
+  outline: none;
+}
+
+button.wallpaper-random-now:hover,
+button.wallpaper-random-now:focus-visible {
+  background: @soft_overlay_12;
+}
+
+button.wallpaper-random-now:active {
+  background: @soft_overlay_18;
+}
+
+button.wallpaper-random-toggle,
+button.wallpaper-random-toggle:focus {
+  min-height: 32px;
+  padding: 0 9px;
+  border-radius: 9px;
+  color: @fg;
+  background: @soft_overlay_09;
+  background-image: none;
+  border: 1px solid @soft_overlay_12;
+  box-shadow: none;
+  outline: none;
+}
+
+button.wallpaper-random-toggle:hover,
+button.wallpaper-random-toggle:focus-visible {
+  background: @soft_overlay_12;
+  border-color: @soft_overlay_16;
+}
+
+button.wallpaper-random-toggle:active,
+button.wallpaper-random-toggle:checked {
+  color: @fg;
+  background: @soft_overlay_16;
+  background-image: none;
+  border-color: @soft_overlay_18;
+  box-shadow: none;
+}
+
+.wallpaper-random-toggle-label {
+  font-weight: 500;
+}
+
+.wallpaper-random-toggle-state {
+  min-width: 26px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: alpha(@fg,0.62);
+  background: @soft_overlay_12;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+button.wallpaper-random-toggle:checked .wallpaper-random-toggle-state {
+  color: @fg;
+  background: @soft_overlay_18;
+}
+
+.wallpaper-random-interval-row {
+  min-height: 30px;
+}
+
+spinbutton.wallpaper-random-interval {
+  min-width: 72px;
+  min-height: 28px;
+  border-radius: 8px;
+  background: @soft_overlay_08;
+  border: 1px solid @soft_overlay_16;
+  box-shadow: none;
+}
+
+spinbutton.wallpaper-random-interval:disabled {
+  opacity: 0.45;
+}
+
+.wallpaper-gallery-frame {
+  min-width: 448px;
+  padding: 10px;
+  border-radius: 18px;
+  background: @popup_list_bg;
+  background-image: none;
+  border: 1px solid @soft_overlay_08;
+  box-shadow: none;
+}
+
+.wallpaper-list-wrap,
+.wallpaper-grid-rows {
+  min-width: 448px;
+}
+
+listview.wallpaper-grid-rows {
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+listview.wallpaper-grid-rows > row {
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.wallpaper-grid-row {
+  min-width: 448px;
+  min-height: 84px;
+}
+
+.wallpaper-list-wrap scrollbar,
+.wallpaper-list-wrap scrollbar.vertical,
+.wallpaper-list-wrap scrollbar.horizontal,
+.wallpaper-list-wrap scrollbar slider,
+.wallpaper-list-wrap scrollbar.vertical slider,
+.wallpaper-list-wrap scrollbar.horizontal slider {
+  min-width: 2px;
+  min-height: 2px;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+button.wallpaper-card,
+button.wallpaper-card:focus,
+button.wallpaper-card:focus-visible,
+button.wallpaper-card:checked {
+  min-width: 144px;
+  min-height: 84px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.wallpaper-thumb-wrap {
+  min-width: 144px;
+  min-height: 84px;
+  padding: 0;
+  border-radius: 12px;
+  background: @soft_overlay_03;
+  border: 1px solid @soft_overlay_08;
+}
+
+button.wallpaper-card:hover .wallpaper-thumb-wrap {
+  background: @soft_overlay_12;
+}
+
+.wallpaper-thumb-wrap-active {
+  background: @accent_overlay_12;
+  border-color: @accent_overlay_26;
+}
+
+button.wallpaper-card:hover .wallpaper-thumb-wrap-active {
+  background: @accent_overlay_18;
+  border-color: @accent_overlay_26;
+}
+
+.wallpaper-thumb {
+  min-width: 144px;
+  min-height: 84px;
+}
+
+button.wallpaper-card:hover .wallpaper-thumb {
+  opacity: 0.78;
+}
+
+.wallpaper-image-placeholder,
+.wallpaper-video-placeholder {
+  min-width: 144px;
+  min-height: 84px;
+  padding: 8px;
+  background: @soft_overlay_03;
+}
+
+.wallpaper-image-placeholder-icon {
+  font-family: "Material Design Icons";
+  font-size: 24px;
+  opacity: 0.34;
+}
+
+.wallpaper-video-title {
+  font-size: 12px;
+  opacity: 0.76;
+}
+
+.wallpaper-video-play-icon {
+  color: @fg;
+  font-size: 14px;
+  opacity: 0.92;
+}
+
+.wallpaper-empty {
+  min-width: 448px;
+  min-height: 177px;
+}
+
+.wallpaper-empty-icon {
+  font-size: 28px;
+  opacity: 0.8;
+}
+
+.wallpaper-empty-meta,
+.wallpaper-notice {
+  font-size: 12px;
+  opacity: 0.76;
+}
+
+.wallpaper-stack,
+.wallpaper-selector-page,
+.wallpaper-directory-page {
+  min-width: 472px;
+  background: transparent;
+}
+
+.wallpaper-directory-header {
+  min-height: 28px;
+}
+
+.wallpaper-directory-path {
+  min-width: 448px;
+  padding: 0 2px;
+  font-size: 12px;
+  opacity: 0.76;
+}
+
+.wallpaper-directory-frame {
+  min-width: 448px;
+  padding: 6px;
+  border-radius: 18px;
+  background: @popup_list_bg;
+  border: 1px solid @soft_overlay_08;
+}
+
+.wallpaper-directory-list-wrap,
+.wallpaper-directory-list {
+  min-width: 436px;
+}
+
+.wallpaper-directory-list-wrap scrollbar,
+.wallpaper-directory-list-wrap scrollbar.vertical,
+.wallpaper-directory-list-wrap scrollbar slider,
+.wallpaper-directory-list-wrap scrollbar.vertical slider {
+  min-width: 2px;
+  min-height: 2px;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+button.wallpaper-directory-row,
+button.wallpaper-directory-row:focus,
+button.wallpaper-directory-row:focus-visible {
+  min-height: 34px;
+  padding: 0 8px;
+  border-radius: 10px;
+  color: inherit;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+button.wallpaper-directory-row:hover {
+  background: @soft_overlay_05;
+}
+
+button.wallpaper-directory-row:active {
+  background: @soft_overlay_09;
+}
+
+.wallpaper-directory-row-content {
+  min-width: 0;
+  background: transparent;
+}
+
+.wallpaper-directory-row-icon {
+  min-width: 18px;
+  font-family: "Material Design Icons";
+  font-size: 16px;
+  opacity: 0.9;
+}
+
+.wallpaper-directory-row-label {
+  font-size: 13px;
+}
+
+.wallpaper-directory-empty {
+  min-height: 34px;
+  padding: 0 8px;
+  font-size: 12px;
+  opacity: 0.62;
+}
+
+button.wallpaper-directory-select,
+button.wallpaper-directory-select:focus,
+button.wallpaper-directory-select:focus-visible {
+  min-height: 30px;
+  padding: 0 12px;
+  border-radius: 10px;
+  color: inherit;
+  background: @soft_overlay_10;
+  border: 1px solid @soft_overlay_18;
+  box-shadow: none;
+  outline: none;
+}
+
+button.wallpaper-directory-select:hover {
+  background: @soft_overlay_16;
+}
+
+button.wallpaper-directory-select:active {
+  background: @soft_overlay_18;
+}
+
+.inline-revealer,
+.quick-control,
+.inline-control {
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+.controls-container {
+  margin: 5px 2px;
+  padding: 0 1px;
+}
+
+.section-right-main {
+  padding-left: 1px;
+  padding-right: 1px;
+}
+
+.quick-control,
+.inline-control {
+  min-height: 28px;
+  margin: 0;
+  padding: 0;
+}
+
+.inline-panel {
+  min-height: 30px;
+  margin-right: 6px;
+  padding: 0 7px;
+  border: 1px solid alpha(@theme_selected_bg_color,0.20);
+  border-radius: 12px;
+  background: alpha(@panel_tint,0.58);
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_10,
+    inset 0 -1px 0 @shadow_08,
+    0 6px 18px alpha(@theme_bg_color,0.14);
+  transition: background-color 180ms ease, border-color 180ms ease, opacity 180ms ease;
+}
+
+.power-panel {
+  padding: 0 4px;
+}
+
+button.icon-button,
+button.quick-toggle,
+button.power-action,
+button.icon-button:focus,
+button.quick-toggle:focus,
+button.power-action:focus {
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+button.quick-toggle {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 4px;
+  border-radius: 10px;
+  transition: background-color 160ms ease, opacity 160ms ease;
+}
+
+.controls-container button.quick-toggle,
+.controls-container button.power-toggle {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0 3px;
+  border-radius: 9px;
+}
+
+button.quick-toggle:hover,
+button.power-action:hover {
+  background: @hover_bg;
+  background-image: none;
+}
+
+button.quick-toggle:active,
+button.power-action:active {
+  background: @active_bg;
+  background-image: none;
+}
+
+button.quick-toggle:focus-visible,
+button.power-action:focus-visible {
+  outline: 1px solid alpha(@theme_fg_color,0.42);
+  outline-offset: -2px;
+}
+
+.module-icon,
+.power-action-icon {
+  font-family: "Material Design Icons";
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+.controls-container .module-icon {
+  min-width: 18px;
+  min-height: 18px;
+  margin: -1px 0 0 0;
+  padding: 0;
+  font-size: 17px;
+}
+
+.controls-container .module-icon.control-trigger-icon {
+  min-width: 20px;
+  min-height: 20px;
+  margin: 0;
+  padding: 0;
+  font-size: 15px;
+}
+
+.controls-container button.app-launcher-trigger .launcher-trigger-icon {
+  margin: 1px 0 -1px 0;
+  font-size: 16px;
+}
+
+.controls-container button.brightness-trigger .module-icon.brightness-icon {
+  margin: 1px 0 -1px 0;
+  font-size: 13px;
+}
+
+.controls-container button.network-trigger .module-icon.network-trigger-icon {
+  margin: 1px 0 -1px 0;
+  font-size: 13px;
+}
+
+.controls-container button.audio-trigger .module-icon.control-trigger-icon {
+  margin: 1px 0 -1px 0;
+}
+
+.controls-container button.power-toggle .module-icon.control-trigger-icon {
+  margin: 1px 0 -1px 0;
+  font-size: 16px;
+}
+
+.controls-container button.bluetooth-trigger .module-icon.bluetooth-trigger-icon {
+  margin: 1px 0 -1px 0;
+  font-size: 14px;
+}
+
+button.power-action {
+  min-height: 30px;
+  padding: 0 8px;
+  border-radius: 10px;
+}
+
+button.power-action box {
+  margin: 0 1px;
+}
+
+.power-action-icon {
+  min-width: 16px;
+  font-size: 15px;
+}
+
+.power-action-label {
+  font-size: 14px;
+  font-weight: 400;
+}
+
+
+@define-color card_tint mix(@theme_bg_color,@theme_selected_bg_color,0.08);
+@define-color panel_border alpha(@theme_selected_bg_color,0.20);
+@define-color popup_card_bg alpha(@card_tint,0.42);
+@define-color popup_card_hover_bg alpha(@theme_fg_color,0.105);
+@define-color popup_card_active_bg alpha(@theme_fg_color,0.18);
+@define-color soft_overlay_92 alpha(@theme_fg_color,0.92);
+
+window.audio-popup-window,
+window.audio-popup-window.background,
+window.audio-popup-window > box,
+.widget-popup-root,
+.widget-popup-revealer,
+.audio-list-capsule,
+.audio-list-inner {
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.audio-popup-window box.widget-popup-frame.audio-popover-window,
+.audio-popover-window {
+  padding: 12px;
+  color: @fg;
+  background: @popup_surface_bg;
+  background-color: @popup_surface_bg;
+  background-image: none;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+.audio-popover {
+  min-width: 392px;
+}
+
+
+.audio-header {
+  min-height: 34px;
+  padding: 2px 2px 6px 2px;
+  margin-bottom: 8px;
+}
+
+.audio-header-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.audio-header-meta {
+  font-size: 13px;
+  opacity: 0.82;
+}
+
+.audio-section-title {
+  padding-top: 2px;
+  margin: 8px 0 4px 4px;
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 0.78;
+}
+
+.audio-list-scroller {
+  min-height: 96px;
+  margin: 4px 0;
+}
+
+.audio-list-scroller scrollbar,
+.audio-list-scroller scrollbar.vertical,
+.audio-list-scroller scrollbar.horizontal,
+.audio-list-scroller scrollbar slider,
+.audio-list-scroller scrollbar.vertical slider,
+.audio-list-scroller scrollbar.horizontal slider {
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.audio-sink-row {
+  min-height: 48px;
+  padding: 2px 8px 2px 10px;
+  margin: 3px 0;
+  border-radius: 12px;
+  background: @popup_card_bg;
+  border: 1px solid @panel_border;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_08,
+    inset 0 -1px 0 alpha(@theme_bg_color,0.05);
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.audio-sink-row:hover,
+.audio-sink-current:hover {
+  background: @popup_card_hover_bg;
+  border-color: @glass_border;
+}
+
+.audio-sink-row:active {
+  background: @popup_card_active_bg;
+  border-color: alpha(@theme_selected_bg_color,0.20);
+}
+
+.audio-sink-current {
+  background: @popup_card_bg;
+  border-color: @panel_border;
+}
+
+button.audio-sink-main,
+button.audio-sink-main:hover,
+button.audio-sink-main:active,
+button.audio-sink-main:focus,
+button.audio-sink-main:focus-visible {
+  min-width: 0;
+  min-height: 48px;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 12px;
+  box-shadow: none;
+  outline: none;
+}
+
+.audio-sink-body {
+  min-width: 0;
+  min-height: 48px;
+}
+
+.audio-sink-content {
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.audio-sink-icon-frame {
+  min-width: 24px;
+  min-height: 48px;
+  padding: 0;
+  margin: 0;
+}
+
+.audio-sink-icon,
+.audio-sink-status,
+.audio-sink-side-icon {
+  font-family: "Material Design Icons";
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+.audio-sink-icon {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  margin: 0;
+  font-size: 18px;
+  opacity: 0.92;
+}
+
+.audio-sink-status {
+  min-width: 18px;
+  min-height: 22px;
+  padding: 0;
+  margin: 0;
+  font-size: 18px;
+}
+
+.audio-sink-name {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.audio-sink-meta {
+  font-size: 12px;
+  opacity: 0.78;
+}
+
+.audio-empty {
+  font-size: 13px;
+  opacity: 0.78;
+}
+
+button.audio-sink-side-button,
+button.audio-sink-side-button:focus {
+  min-width: 28px;
+  min-height: 28px;
+  margin: 0;
+  padding: 0;
+  border-radius: 9px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+button.audio-sink-side-button:hover {
+  background: @hover_bg;
+}
+
+button.audio-sink-side-button:active {
+  background: @active_bg;
+}
+
+.audio-sink-side-icon {
+  font-size: 18px;
+}
+
+.slider-panel {
+  min-width: 210px;
+}
+
+button.panel-icon-button,
+button.panel-icon-button:focus {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 8px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  transition: background-color 160ms ease, opacity 160ms ease;
+}
+
+button.panel-icon-button:hover {
+  background: @hover_bg;
+}
+
+button.panel-icon-button:active {
+  background: @active_bg;
+}
+
+scale.slider-control {
+  min-width: 128px;
+  min-height: 20px;
+  padding: 4px 0;
+  margin: 0;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+scale.slider-control trough,
+scale.slider-control > trough {
+  min-height: 8px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 999px;
+  background: @soft_overlay_16;
+  background-image: none;
+  box-shadow: none;
+}
+
+scale.slider-control highlight,
+scale.slider-control fill,
+scale.slider-control > trough > highlight,
+scale.slider-control > trough > fill {
+  min-height: 8px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 999px;
+  background: @soft_overlay_92;
+  background-image: none;
+  box-shadow: none;
+}
+
+scale.slider-control slider,
+scale.slider-control > trough > slider,
+scale.slider-control:hover slider,
+scale.slider-control:hover > trough > slider,
+scale.slider-control:active slider,
+scale.slider-control:active > trough > slider {
+  min-width: 8px;
+  min-height: 8px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+  opacity: 0;
+}
+
+.slider-value {
+  min-width: 44px;
+  font-size: 14px;
+}
+
+.module-percent {
+  min-width: 32px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.volume-percent,
+.brightness-percent {
+  min-width: 34px;
+}
+
+button.audio-trigger.audio-popup-open,
+button.audio-trigger.audio-popup-open:hover,
+button.audio-trigger.audio-popup-open:active {
+  background: @active_bg;
+  background-image: none;
+}
+
+
+.inline-panel .brightness-icon {
+  font-size: 14px;
+}
+
+window.network-popup-window,
+window.network-popup-window.background,
+window.network-popup-window > box,
+window.bluetooth-popup-window,
+window.bluetooth-popup-window.background,
+window.bluetooth-popup-window > box,
+.network-list-capsule,
+.network-list-inner {
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.network-popup-window box.widget-popup-frame.network-popover-window,
+.network-popover-window,
+window.bluetooth-popup-window box.widget-popup-frame.bluetooth-popover-window,
+.bluetooth-popover-window {
+  padding: 12px;
+  color: @fg;
+  background: @popup_surface_bg;
+  background-color: @popup_surface_bg;
+  background-image: none;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+.network-popover {
+  min-width: 392px;
+}
+
+.network-header {
+  min-height: 34px;
+  padding: 2px 2px 6px 2px;
+  margin-bottom: 4px;
+}
+
+.network-header-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.network-header-meta {
+  font-size: 13px;
+  font-weight: 500;
+  color: alpha(@theme_fg_color,0.94);
+}
+
+.network-header-action-capsule {
+  padding: 2px;
+  border-radius: 11px;
+  background: @popup_list_bg;
+  border: 1px solid @panel_border;
+}
+
+button.network-vless-button.network-vless-active {
+  background: alpha(@theme_fg_color,0.14);
+  border: 1px solid alpha(@theme_fg_color,0.34);
+  box-shadow:
+    inset 0 1px 0 alpha(@theme_fg_color,0.14),
+    inset 0 -1px 0 @shadow_10;
+}
+
+button.network-vless-button.network-vless-active:hover {
+  background: alpha(@theme_fg_color,0.19);
+  border-color: alpha(@theme_fg_color,0.42);
+}
+
+button.network-vless-button.network-vless-active:active {
+  background: alpha(@theme_fg_color,0.22);
+  border-color: alpha(@theme_fg_color,0.46);
+}
+
+.network-action-icon,
+.network-row-icon,
+.network-row-status,
+.network-row-side-icon {
+  font-family: "Material Design Icons";
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+button.network-icon-button,
+button.network-icon-button:focus,
+button.network-row-side-button,
+button.network-row-side-button:focus {
+  min-width: 28px;
+  min-height: 28px;
+  margin: 0;
+  padding: 0;
+  border-radius: 9px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+button.network-icon-button:hover,
+button.network-row-side-button:hover {
+  background: @hover_bg;
+}
+
+button.network-icon-button:active,
+button.network-row-side-button:active {
+  background: @active_bg;
+}
+
+.network-action-icon,
+.network-row-side-icon {
+  font-size: 18px;
+}
+
+switch.network-wifi-switch {
+  min-width: 34px;
+  min-height: 18px;
+  margin-left: 2px;
+  padding: 2px;
+  border-radius: 999px;
+  background: alpha(@theme_fg_color,0.075);
+  background-image: none;
+  border: 1px solid alpha(@theme_fg_color,0.16);
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_08,
+    inset 0 -1px 0 @shadow_10;
+  color: @fg;
+  outline: none;
+  transition: background-color 180ms ease, border-color 180ms ease, opacity 180ms ease;
+}
+
+switch.network-wifi-switch:focus,
+switch.network-wifi-switch:focus-visible {
+  outline: none;
+}
+
+switch.network-wifi-switch:hover {
+  background: alpha(@theme_fg_color,0.11);
+  border-color: @soft_overlay_18;
+}
+
+switch.network-wifi-switch slider {
+  min-width: 13px;
+  min-height: 13px;
+  border-radius: 999px;
+  background: @soft_overlay_92;
+  background-image: none;
+  border: 1px solid alpha(@theme_fg_color,0.22);
+  box-shadow: inset 0 1px 0 alpha(@theme_fg_color,0.45), 0 2px 8px @shadow_10;
+}
+
+switch.network-wifi-switch:checked {
+  background: @soft_overlay_16;
+  background-image: none;
+  border-color: alpha(@theme_fg_color,0.28);
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_12,
+    inset 0 -1px 0 @shadow_08,
+    0 0 0 1px alpha(@theme_fg_color,0.03);
+}
+
+switch.network-wifi-switch:checked slider {
+  background: alpha(@theme_fg_color,0.98);
+  border-color: alpha(@theme_fg_color,0.42);
+}
+
+switch.network-wifi-switch:disabled {
+  opacity: 0.55;
+}
+
+.network-refresh-indicator {
+  min-width: 18px;
+  min-height: 18px;
+}
+
+.network-refresh-spinner {
+  min-width: 16px;
+  min-height: 16px;
+  color: @fg;
+  opacity: 0.88;
+}
+
+.network-section-title {
+  padding-top: 2px;
+  margin: 4px 0 4px 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: alpha(@theme_fg_color,0.92);
+}
+
+.network-list-scroller {
+  min-height: 96px;
+  margin: 4px 0;
+}
+
+.network-row-container {
+  min-height: 48px;
+  padding: 2px 8px 2px 10px;
+  margin: 3px 0;
+  border-radius: 12px;
+  background: @popup_card_bg;
+  border: 1px solid @panel_border;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_08,
+    inset 0 -1px 0 alpha(@theme_bg_color,0.05);
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.network-row-container:hover {
+  background: @popup_card_hover_bg;
+  border-color: @glass_border;
+}
+
+.network-row-container:active {
+  background: @popup_card_active_bg;
+  border-color: @soft_overlay_18;
+}
+
+
+button.network-row-main,
+button.network-row-main:hover,
+button.network-row-main:active,
+button.network-row-main:focus,
+button.network-row-main:focus-visible {
+  min-width: 0;
+  min-height: 48px;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 12px;
+  box-shadow: none;
+  outline: none;
+}
+
+.network-row-body {
+  min-width: 0;
+  min-height: 48px;
+}
+
+.network-row-content {
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.network-row-icon-frame {
+  min-width: 24px;
+  min-height: 48px;
+  padding: 0;
+  margin: 0;
+}
+
+.network-row-icon {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  margin: 0;
+  font-size: 18px;
+  opacity: 0.92;
+}
+
+.network-row-status {
+  min-width: 18px;
+  min-height: 22px;
+  padding: 0;
+  margin: 0;
+  font-size: 18px;
+}
+
+.network-row-title {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.network-row-meta {
+  font-size: 12px;
+  font-weight: 500;
+  color: alpha(@theme_fg_color,0.94);
+}
+
+.network-empty {
+  font-size: 13px;
+  font-weight: 500;
+  color: alpha(@theme_fg_color,0.92);
+}
+
+.network-password-box {
+  padding: 10px;
+  margin: 2px 0 4px 0;
+  border-radius: 12px;
+  background: @popup_list_bg;
+  border: 1px solid @panel_border;
+}
+
+.network-password-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+entry.network-password-entry,
+entry.network-password-entry:focus,
+entry.network-password-entry:focus-visible {
+  min-height: 34px;
+  color: @fg;
+  background: alpha(@panel_tint,0.62);
+  background-image: none;
+  border: 1px solid @panel_border;
+  border-radius: 8px;
+  box-shadow: none;
+  outline: none;
+  caret-color: @fg;
+}
+
+entry.network-password-entry:hover {
+  border-color: @glass_border;
+}
+
+entry.network-password-entry:focus,
+entry.network-password-entry:focus-visible {
+  background: alpha(@panel_tint,0.68);
+  border-color: alpha(@theme_fg_color,0.32);
+  box-shadow: inset 0 1px 0 @soft_overlay_08;
+}
+
+entry.network-password-entry selection,
+entry.network-password-entry > text > selection {
+  color: @fg;
+  background: alpha(@theme_fg_color,0.24);
+  background-color: alpha(@theme_fg_color,0.24);
+}
+
+button.network-password-action,
+button.network-password-action:focus {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 9px;
+  color: inherit;
+  background: alpha(@panel_tint,0.56);
+  background-image: none;
+  border: 1px solid @soft_overlay_08;
+  box-shadow: none;
+  outline: none;
+}
+
+button.network-password-action:hover {
+  background: @soft_overlay_08;
+  border-color: @glass_border;
+}
+
+button.network-password-action:active {
+  background: @soft_overlay_12;
+}
+
+.network-notice {
+  margin: 2px 4px 0 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: alpha(@theme_fg_color,0.94);
+}
+
+button.network-trigger.network-popup-open,
+button.network-trigger.network-popup-open:hover,
+button.bluetooth-trigger.bluetooth-popup-open,
+button.bluetooth-trigger.bluetooth-popup-open:hover {
+  background: @soft_overlay_08;
+}
+
+.bluetooth-off-state {
+  min-height: 42px;
+  padding: 8px 10px;
+  margin: 2px 0;
+}
+
+button.network-row-button.bluetooth-pair-button,
+button.network-row-button.bluetooth-pair-button:focus {
+  min-width: 56px;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 10px;
+  border-radius: 9px;
+  color: inherit;
+  background: @soft_overlay_08;
+  background-image: none;
+  border: 1px solid @soft_overlay_12;
+  box-shadow: none;
+  outline: none;
+}
+
+button.network-row-button.bluetooth-pair-button:hover {
+  background: @soft_overlay_12;
+  border-color: @soft_overlay_18;
+}
+
+button.network-row-button.bluetooth-pair-button:active {
+  background: alpha(@theme_fg_color,0.15);
+}
+
+button.network-row-button.bluetooth-pair-button:disabled {
+  opacity: 0.55;
+}
+
+.bluetooth-pair-button-label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.bluetooth-pairing-message {
+  margin-top: -2px;
+}
+
+.bluetooth-pairing-code {
+  min-height: 34px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  font-family: monospace;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  color: @fg;
+  background: alpha(@panel_tint,0.62);
+  border: 1px solid @panel_border;
+}
+
+window.launcher-popup-window,
+window.launcher-popup-window.background,
+window.launcher-popup-window > box,
+.launcher-panel,
+.launcher-popover,
+.launcher-list-wrap,
+.launcher-list-wrap viewport,
+.launcher-list-content,
+.launcher-view,
+.launcher-header,
+.launcher-app-row,
+.launcher-app-content,
+.launcher-app-icon-wrap {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.launcher-popover-window {
+  padding: 12px;
+  color: @fg;
+  background: @popup_surface_bg;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+.launcher-panel {
+  margin: 0;
+  padding: 0;
+  min-height: 28px;
+}
+
+button.app-launcher-trigger,
+button.app-launcher-trigger:focus {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0 3px;
+  border-radius: 9px;
+  color: inherit;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  transition: background-color 160ms ease, opacity 160ms ease;
+}
+
+button.app-launcher-trigger:hover {
+  background: @hover_bg;
+}
+
+button.app-launcher-trigger:active,
+button.app-launcher-trigger.launcher-popup-open {
+  background: @active_bg;
+}
+
+button.app-launcher-trigger:focus-visible {
+  outline: 1px solid alpha(@theme_fg_color,0.42);
+  outline-offset: -2px;
+}
+
+.launcher-material-icon {
+  font-family: "Material Design Icons";
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+.controls-container .launcher-trigger-icon {
+  padding: 0;
+}
+
+.launcher-search-container {
+  min-height: 38px;
+  padding: 0 10px;
+  border-radius: 14px;
+  background: alpha(@bar_tint,0.66);
+  border: 1px solid @soft_overlay_10;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_10,
+    inset 0 -1px 0 @shadow_08;
+}
+
+entry.launcher-search,
+entry.launcher-search:focus {
+  min-height: 34px;
+  margin: 0;
+  padding: 0;
+  color: @fg;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  outline: none;
+}
+
+entry.launcher-search > text {
+  background: transparent;
+  color: @fg;
+}
+
+.launcher-header {
+  padding: 0 2px;
+}
+
+.launcher-title,
+.launcher-app-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.audio-material-icon {
+  font-family: "Material Design Icons";
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+button.audio-hidden-toggle,
+button.audio-hidden-toggle:focus {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: 999px;
+  color: inherit;
+  background: @popup_card_bg;
+  border: 1px solid @section_border;
+  box-shadow: none;
+  outline: none;
+}
+
+button.audio-hidden-toggle:hover {
+  background: @popup_card_hover_bg;
+  border-color: @glass_border;
+}
+
+button.audio-hidden-toggle:active {
+  background: @popup_card_active_bg;
+  border-color: @accent_overlay_18;
+}
+
+.audio-hidden-toggle-label {
+  min-width: 20px;
+  min-height: 20px;
+  margin: 0;
+  padding: 0;
+  line-height: 20px;
+  font-size: 18px;
+  font-weight: 400;
+  opacity: 0.9;
+}
+
+button.launcher-hidden-toggle,
+button.launcher-hidden-toggle:focus {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: 999px;
+  color: inherit;
+  background: @popup_card_bg;
+  border: 1px solid @section_border;
+  box-shadow: none;
+  outline: none;
+}
+
+button.launcher-hidden-toggle:hover {
+  background: @popup_card_hover_bg;
+  border-color: @glass_border;
+}
+
+button.launcher-hidden-toggle:active {
+  background: @popup_card_active_bg;
+  border-color: @accent_overlay_18;
+}
+
+.launcher-hidden-toggle-label {
+  min-width: 20px;
+  min-height: 20px;
+  margin: 0;
+  padding: 0;
+  line-height: 20px;
+  font-size: 18px;
+  font-weight: 400;
+  opacity: 0.9;
+}
+
+@keyframes launcher-view-hidden-forward-in {
+  from {
+    opacity: 0;
+    transform: translate(18px, 0) scale(0.992);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+}
+
+@keyframes launcher-view-hidden-back-in {
+  from {
+    opacity: 0;
+    transform: translate(-18px, 0) scale(0.992);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+}
+
+@keyframes launcher-view-category-forward-in {
+  from {
+    opacity: 0;
+    transform: translate(12px, 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(0, 0);
+  }
+}
+
+@keyframes launcher-view-category-back-in {
+  from {
+    opacity: 0;
+    transform: translate(-12px, 0);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(0, 0);
+  }
+}
+
+.launcher-view.launcher-view-hidden-forward,
+.audio-view.audio-view-hidden-forward {
+  animation: launcher-view-hidden-forward-in 190ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.launcher-view.launcher-view-hidden-back,
+.audio-view.audio-view-hidden-back {
+  animation: launcher-view-hidden-back-in 190ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.launcher-view.launcher-view-category-forward {
+  animation: launcher-view-category-forward-in 190ms ease-out;
+}
+
+.launcher-view.launcher-view-category-back {
+  animation: launcher-view-category-back-in 190ms ease-out;
+}
+
+.launcher-list-wrap {
+  padding-right: 0;
+  margin: 4px 0;
+}
+
+.launcher-list-content {
+  padding-right: 12px;
+}
+
+.launcher-list-wrap scrollbar.vertical,
+.launcher-list-wrap scrollbar.vertical:hover,
+.launcher-list-wrap scrollbar.vertical:active {
+  min-width: 10px;
+  margin-left: 8px;
+  margin-right: 0;
+  background: transparent;
+}
+
+.launcher-list-wrap scrollbar.vertical trough {
+  min-width: 10px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.launcher-list-wrap scrollbar.vertical slider {
+  min-width: 4px;
+  margin: 0 3px;
+  border-radius: 10px;
+  background: @soft_overlay_10;
+  border: none;
+  box-shadow: none;
+}
+
+.launcher-category-bar {
+  min-height: 34px;
+  padding: 3px;
+  border-radius: 13px;
+  background: @popup_list_bg;
+  border: 1px solid @soft_overlay_08;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_08,
+    inset 0 -1px 0 @shadow_08;
+}
+
+button.launcher-category-button,
+button.launcher-category-button:focus {
+  min-height: 28px;
+  padding: 0 6px;
+  border-radius: 10px;
+  color: inherit;
+  background: transparent;
+  border: 1px solid transparent;
+  box-shadow: none;
+  outline: none;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+button.launcher-category-button:hover {
+  background: @soft_overlay_05;
+}
+
+button.launcher-category-button:checked {
+  background: @soft_overlay_16;
+  border-color: @glass_border;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_12,
+    inset 0 -1px 0 @shadow_08;
+}
+
+button.launcher-category-button:active {
+  background: @soft_overlay_18;
+  border-color: @glass_border;
+}
+
+.launcher-category-favorite-slot {
+  padding-right: 2px;
+}
+
+button.launcher-category-favorite-button {
+  min-width: 28px;
+  padding-left: 4px;
+  padding-right: 4px;
+}
+
+.launcher-category-label {
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 500;
+  opacity: 0.78;
+}
+
+button.launcher-category-button:hover .launcher-category-label {
+  opacity: 0.92;
+}
+
+button.launcher-category-button:checked .launcher-category-label {
+  opacity: 1;
+}
+
+.launcher-category-favorite-icon {
+  min-width: 18px;
+  min-height: 18px;
+  font-size: 17px;
+  line-height: 18px;
+}
+
+.launcher-app-card {
+  min-height: 56px;
+  padding: 0 6px 0 0;
+  border-radius: 12px;
+  background: @popup_card_bg;
+  border: 1px solid @panel_border;
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_10,
+    inset 0 -1px 0 @shadow_08;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+
+.launcher-app-card:hover {
+  background: @popup_card_hover_bg;
+  border-color: @glass_border;
+}
+
+button.launcher-app-main,
+button.launcher-app-main:hover,
+button.launcher-app-main:active,
+button.launcher-app-main:focus,
+button.launcher-app-main:focus-visible {
+  min-height: 56px;
+  padding: 4px 4px 4px 10px;
+  color: inherit;
+  background: transparent;
+  border: none;
+  border-radius: 12px;
+  box-shadow: none;
+  outline: none;
+}
+
+button.launcher-app-side-button,
+button.launcher-app-side-button:focus {
+  min-width: 36px;
+  min-height: 36px;
+  margin: 10px 0;
+  padding: 0;
+  border-radius: 10px;
+  color: inherit;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+button.launcher-app-side-button:hover {
+  background: @soft_overlay_10;
+}
+
+button.launcher-app-side-button:active {
+  background: @soft_overlay_16;
+}
+
+button.audio-hidden-toggle:focus-visible,
+button.launcher-hidden-toggle:focus-visible,
+button.launcher-category-button:focus-visible,
+button.launcher-app-main:focus-visible,
+button.launcher-app-side-button:focus-visible {
+  outline: 1px solid alpha(@theme_fg_color,0.42);
+  outline-offset: -2px;
+}
+
+.launcher-side-icon {
+  min-width: 20px;
+  min-height: 20px;
+  margin: 0;
+  padding: 0;
+  line-height: 20px;
+  font-size: 18px;
+  opacity: 0.92;
+}
+
+.launcher-app-row {
+  min-height: 54px;
+  margin: 0;
+}
+
+.launcher-app-icon-wrap {
+  min-width: 44px;
+  min-height: 44px;
+  margin: 0 6px 0 0;
+  padding: 0;
+}
+
+.launcher-app-icon-wrap image {
+  -gtk-icon-size: 40px;
+  margin: 0;
+  padding: 0;
+}
+
+.launcher-app-fallback {
+  min-width: 24px;
+  font-size: 24px;
+  opacity: 0.86;
+}
+
+.launcher-app-content {
+  padding: 0;
+  margin: 0;
+}
+
+.launcher-app-meta {
+  font-size: 11px;
+  opacity: 0.78;
+}
+
+.launcher-empty-title {
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 0.82;
+}
+
+.launcher-app-actions {
+  min-height: 56px;
+  margin: 0;
+  padding: 0;
+}
+
+button.launcher-favorite-button .launcher-favorite-icon {
+  opacity: 0.72;
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+button.launcher-favorite-button:hover .launcher-favorite-icon {
+  opacity: 1;
+  transform: scale(1.08);
+}
+
+button.launcher-favorite-button:active .launcher-favorite-icon {
+  transform: scale(0.92);
+}
+
+button.launcher-favorite-button .launcher-favorite-active {
+  opacity: 1;
+  color: @fg;
+}
+
+.tray-capsule {
+  padding: 0 4px;
+}
+
+menubutton.tray-item {
+  margin: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+menubutton.tray-item > button.toggle,
+menubutton.tray-item > button.toggle:focus {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0 4px;
+  margin: 0;
+  border-radius: 10px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  transition: background-color 160ms ease, opacity 160ms ease;
+}
+
+menubutton.tray-item > button.toggle:hover {
+  background: @hover_bg;
+}
+
+menubutton.tray-item > button.toggle:active,
+menubutton.tray-item > button.toggle:checked {
+  background: @active_bg;
+}
+
+menubutton.tray-item image {
+  -gtk-icon-size: 18px;
+  min-width: 18px;
+  min-height: 18px;
+  padding: 0;
+  margin: 0;
+}
+
+popover.tray-menu-popover-window,
+popover.tray-menu-popover-window.background,
+popover.tray-menu-popover-window.menu {
+  margin: 0;
+  padding: 0;
+  color: @fg;
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+popover.tray-menu-popover-window > arrow {
+  min-width: 0;
+  min-height: 0;
+  opacity: 0;
+  background: transparent;
+  border: none;
+}
+
+popover.tray-menu-popover-window contents {
+  padding: 8px;
+  color: @fg;
+  background: @popup_surface_bg;
+  background-color: @popup_surface_bg;
+  background-image: none;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+popover.tray-menu-popover-window contents box,
+popover.tray-menu-popover-window contents label,
+popover.tray-menu-popover-window contents image {
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+popover.tray-menu-popover-window menubutton.tray-menu-row {
+  margin: 2px 0;
+  padding: 0;
+  color: @fg;
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+popover.tray-menu-popover-window button.tray-menu-row,
+popover.tray-menu-popover-window menubutton.tray-menu-row > button.toggle {
+  min-height: 30px;
+  margin: 2px 0;
+  padding: 0 10px;
+  border-radius: 10px;
+  color: @fg;
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  text-shadow: none;
+}
+
+popover.tray-menu-popover-window menubutton.tray-menu-row > button.toggle {
+  margin: 0;
+}
+
+popover.tray-menu-popover-window button.tray-menu-row:hover,
+popover.tray-menu-popover-window button.tray-menu-row:active,
+popover.tray-menu-popover-window menubutton.tray-menu-row > button.toggle:hover,
+popover.tray-menu-popover-window menubutton.tray-menu-row > button.toggle:active,
+popover.tray-menu-popover-window menubutton.tray-menu-row > button.toggle:checked {
+  background: @hover_bg;
+  background-color: @hover_bg;
+  background-image: none;
+}
+
+popover.tray-menu-popover-window button.tray-menu-row:disabled,
+popover.tray-menu-popover-window menubutton.tray-menu-row:disabled,
+popover.tray-menu-popover-window menubutton.tray-menu-row > button.toggle:disabled {
+  opacity: 0.45;
+}
+
+popover.tray-menu-popover-window separator {
+  min-height: 1px;
+  margin: 6px 8px;
+  background: @popup_surface_border;
+  background-color: @popup_surface_border;
+  background-image: none;
+}
+
+.tray-menu-label {
+  font-size: 14px;
+  font-weight: 400;
+}
+
+.tray-menu-indicator,
+.tray-menu-arrow {
+  min-width: 12px;
+  font-size: 13px;
+}
+
+window.bar-tooltip-window,
+window.bar-tooltip-window.background,
+tooltip,
+tooltip.background {
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+tooltip > box,
+window.bar-tooltip-window > box.bar-tooltip-frame,
+window.bar-tooltip-window .bar-tooltip-frame,
+.bar-tooltip-frame {
+  padding: 6px 9px;
+  margin: 0;
+  min-height: 0;
+  color: @fg;
+  background: @popup_surface_bg;
+  background-color: @popup_surface_bg;
+  background-image: none;
+  border: 1px solid @popup_surface_border;
+  border-radius: 11px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+window.bar-tooltip-window > box.bar-tooltip-frame,
+window.bar-tooltip-window .bar-tooltip-frame,
+.bar-tooltip-frame {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+tooltip label,
+.bar-tooltip-label {
+  color: @fg;
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  font-size: 13px;
+  font-weight: 400;
+  text-shadow: none;
+}
+
+.bar-tooltip-label {
+  min-width: 1px;
+  min-height: 1px;
+  padding: 0;
+}
