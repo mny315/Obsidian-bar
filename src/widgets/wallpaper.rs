@@ -26,10 +26,10 @@ use super::tooltip::BarTooltipExt;
 use super::{
     BAR_POPUP_TOP_MARGIN, Generation, PopupReveal, SmoothScrollConfig, attach_bar_click_dismiss,
     attach_popup_focus_dismiss,
-    audio_spectrum::{AudioSpectrumController, AudioSpectrumView},
+    audio_spectrum::AudioSpectrumController,
     bar_features::{BarFeatureController, BarFeatureState},
-    build_refresh_button, clear_box, command, detach_application_window, install_smooth_scroll,
-    run_background, run_background_async, set_optional_label, set_spinner_active,
+    clear_box, command, detach_application_window, install_smooth_scroll, run_background,
+    run_background_async, set_optional_label, set_spinner_active,
 };
 
 const SETTINGS_GROUP: &str = "wallpaper";
@@ -40,6 +40,11 @@ static MPVPAPER: command::ExternalProgram = command::ExternalProgram::new(
     "OBSIDIAN_BAR_MPVPAPER_BIN",
     option_env!("OBSIDIAN_BAR_MPVPAPER_BIN"),
     "mpvpaper",
+);
+static SWAYBG: command::ExternalProgram = command::ExternalProgram::new(
+    "OBSIDIAN_BAR_SWAYBG_BIN",
+    option_env!("OBSIDIAN_BAR_SWAYBG_BIN"),
+    "swaybg",
 );
 static FFMPEG: command::ExternalProgram = command::ExternalProgram::new(
     "OBSIDIAN_BAR_FFMPEG_BIN",
@@ -249,6 +254,52 @@ impl Drop for OwnedMpvpaper {
     }
 }
 
+struct OwnedSwaybg {
+    process: gio::Subprocess,
+}
+
+impl OwnedSwaybg {
+    fn is_alive(&self) -> bool {
+        self.process.identifier().is_some()
+    }
+}
+
+impl Drop for OwnedSwaybg {
+    fn drop(&mut self) {
+        if self.process.identifier().is_some() {
+            self.process.force_exit();
+        }
+    }
+}
+
+enum OwnedWallpaperBackend {
+    Image(OwnedSwaybg),
+    Video(OwnedMpvpaper),
+}
+
+impl OwnedWallpaperBackend {
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::Image(process) => process.is_alive(),
+            Self::Video(process) => process.is_alive(),
+        }
+    }
+
+    fn matches_path_kind(&self, path: &Path) -> bool {
+        match self {
+            Self::Image(_) => is_image_wallpaper(path),
+            Self::Video(_) => is_video_wallpaper(path),
+        }
+    }
+
+    fn mpv_ipc_socket(&self) -> Option<&Path> {
+        match self {
+            Self::Video(process) => Some(&process.ipc_socket),
+            Self::Image(_) => None,
+        }
+    }
+}
+
 type ApplyErrorHandler = Rc<dyn Fn(&WallpaperError)>;
 
 struct PendingApply {
@@ -258,7 +309,7 @@ struct PendingApply {
 
 pub struct WallpaperController {
     settings: RefCell<WallpaperSettings>,
-    process: RefCell<Option<OwnedMpvpaper>>,
+    process: RefCell<Option<OwnedWallpaperBackend>>,
     application: RefCell<Option<gtk::Application>>,
     subscribers: RefCell<Vec<async_channel::Sender<WallpaperSnapshot>>>,
     sleep_subscription: RefCell<Option<gio::SignalSubscription>>,
@@ -551,12 +602,12 @@ impl WallpaperController {
         }
 
         let same_path = self.settings.borrow().current.as_deref() == Some(path.as_path());
-        let process_alive = self
+        let backend_matches = self
             .process
             .borrow()
             .as_ref()
-            .is_some_and(OwnedMpvpaper::is_alive);
-        if same_path && process_alive {
+            .is_some_and(|backend| backend.is_alive() && backend.matches_path_kind(&path));
+        if same_path && backend_matches {
             return Ok(());
         }
 
@@ -596,12 +647,16 @@ impl WallpaperController {
             }
         }
 
-        let reuse_socket = self
-            .process
-            .borrow()
-            .as_ref()
-            .filter(|process| process.is_alive())
-            .map(|process| process.ipc_socket.clone());
+        let reuse_socket = if is_video_wallpaper(&path) {
+            self.process
+                .borrow()
+                .as_ref()
+                .filter(|backend| backend.is_alive())
+                .and_then(|backend| backend.mpv_ipc_socket())
+                .map(Path::to_path_buf)
+        } else {
+            None
+        };
 
         if let Some(socket) = reuse_socket {
             if load_mpvpaper_file(socket, path.clone()).await {
@@ -633,7 +688,7 @@ impl WallpaperController {
             return Ok(());
         }
         let old_process = self.process.borrow_mut().take();
-        let process = match spawn_mpvpaper(&path) {
+        let process = match spawn_wallpaper_backend(&path) {
             Ok(process) => process,
             Err(error) => {
                 self.process.replace(old_process);
@@ -644,21 +699,41 @@ impl WallpaperController {
             }
         };
 
-        let ready = wait_for_mpvpaper_ready(process.ipc_socket.clone()).await;
-        if !self.lifecycle_is_current(lifecycle) {
-            return Ok(());
-        }
-        if process.process.identifier().is_none() {
-            self.process.replace(old_process);
-            if let Some(transition) = transition.as_ref() {
-                transition.close();
+        let mut backend_settled_before_swap = false;
+        if let OwnedWallpaperBackend::Video(video) = &process {
+            let ready = wait_for_mpvpaper_ready(video.ipc_socket.clone()).await;
+            if !self.lifecycle_is_current(lifecycle) {
+                return Ok(());
             }
-            return Err(WallpaperError::Transition(
-                "mpvpaper exited before its video output became ready".into(),
-            ));
-        }
-        if !ready {
-            warn!(path = %path.display(), "mpvpaper VO readiness timed out; using guarded transition hold");
+            if !video.is_alive() {
+                self.process.replace(old_process);
+                if let Some(transition) = transition.as_ref() {
+                    transition.close();
+                }
+                return Err(WallpaperError::Transition(
+                    "mpvpaper exited before its video output became ready".into(),
+                ));
+            }
+            if !ready {
+                warn!(path = %path.display(), "mpvpaper VO readiness timed out; using guarded transition hold");
+            }
+        } else {
+            if let Some(transition) = transition.as_ref() {
+                transition.wait_for_backend_settle().await;
+                backend_settled_before_swap = true;
+                if !self.lifecycle_is_current(lifecycle) {
+                    return Ok(());
+                }
+            }
+            if !process.is_alive() {
+                self.process.replace(old_process);
+                if let Some(transition) = transition.as_ref() {
+                    transition.close();
+                }
+                return Err(WallpaperError::Transition(
+                    "swaybg exited before the image wallpaper became ready".into(),
+                ));
+            }
         }
 
         if let Some(old_process) = old_process {
@@ -667,7 +742,11 @@ impl WallpaperController {
         self.process.replace(Some(process));
 
         let save_result = self.set_current_runtime(path.clone());
-        info!(path = %path.display(), "mpvpaper wallpaper started");
+        if is_video_wallpaper(&path) {
+            info!(path = %path.display(), "mpvpaper video wallpaper started");
+        } else {
+            info!(path = %path.display(), "swaybg image wallpaper started");
+        }
         if let Err(error) = save_result {
             if let Some(transition) = transition.as_ref() {
                 transition.close();
@@ -676,7 +755,11 @@ impl WallpaperController {
         }
 
         if let Some(transition) = transition.as_ref() {
-            transition.wait_for_backend_settle().await;
+            if backend_settled_before_swap {
+                transition.wait_frames(1).await;
+            } else {
+                transition.wait_for_backend_settle().await;
+            }
             transition.close();
         }
 
@@ -741,13 +824,17 @@ impl WallpaperController {
             return Err(WallpaperError::InvalidWallpaper(path));
         }
 
-        let process = spawn_mpvpaper(&path)?;
+        let process = spawn_wallpaper_backend(&path)?;
         let old_process = self.process.replace(Some(process));
         if let Some(old_process) = old_process {
             drop(old_process);
         }
 
-        info!(path = %path.display(), "mpvpaper wallpaper restored");
+        if is_video_wallpaper(&path) {
+            info!(path = %path.display(), "mpvpaper video wallpaper restored");
+        } else {
+            info!(path = %path.display(), "swaybg image wallpaper restored");
+        }
         self.broadcast();
         Ok(())
     }
@@ -1291,7 +1378,6 @@ pub struct WallpaperIndicator {
     _picker: gtk::ApplicationWindow,
     picker_reveal: PopupReveal,
     focus_armed: Rc<Cell<bool>>,
-    _visualizer: AudioSpectrumView,
 }
 
 impl Drop for WallpaperIndicator {
@@ -1309,8 +1395,6 @@ impl WallpaperIndicator {
         bar_features: &Rc<BarFeatureController>,
         audio_spectrum: &Rc<AudioSpectrumController>,
     ) -> Self {
-        let visualizer = AudioSpectrumView::new(application, monitor, audio_spectrum);
-
         let picker = gtk::ApplicationWindow::builder()
             .application(application)
             .decorated(false)
@@ -1442,7 +1526,6 @@ impl WallpaperIndicator {
             _picker: picker,
             picker_reveal,
             focus_armed,
-            _visualizer: visualizer,
         }
     }
 
@@ -1531,7 +1614,7 @@ fn build_gallery_page(
     path_actions.set_valign(gtk::Align::Center);
 
     let folder_button = header_button(ICON_FOLDER);
-    let (refresh_button, refresh_icon, refresh_spinner) = build_refresh_button(ICON_REFRESH);
+    let (refresh_button, refresh_icon, refresh_spinner) = wallpaper_refresh_button(ICON_REFRESH);
     let random_button = random_menu_button(controller);
     path_actions.append(&folder_button);
     path_actions.append(&refresh_button);
@@ -2918,6 +3001,7 @@ fn bar_feature_toggle(
 fn random_menu_button(controller: &Rc<WallpaperController>) -> gtk::MenuButton {
     let button = gtk::MenuButton::new();
     button.add_css_class("wallpaper-random-button");
+    button.set_valign(gtk::Align::Center);
 
     let icon = gtk::Label::new(Some(ICON_SHUFFLE));
     icon.add_css_class("wallpaper-refresh-icon");
@@ -2985,6 +3069,24 @@ fn random_menu_button(controller: &Rc<WallpaperController>) -> gtk::MenuButton {
     content.append(&interval_row);
     popover.set_child(Some(&content));
     button.set_popover(Some(&popover));
+
+    {
+        let right_click = gtk::GestureClick::new();
+        right_click.set_button(gdk::BUTTON_SECONDARY);
+        right_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let controller = Rc::clone(controller);
+        let weak_popover = popover.downgrade();
+        right_click.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            if let Some(popover) = weak_popover.upgrade() {
+                popover.popdown();
+            }
+            if let Err(error) = controller.apply_random_wallpaper() {
+                warn!(%error, "failed to apply random wallpaper");
+            }
+        });
+        button.add_controller(right_click);
+    }
 
     {
         let controller = Rc::clone(controller);
@@ -3075,10 +3177,37 @@ fn random_menu_button(controller: &Rc<WallpaperController>) -> gtk::MenuButton {
     button
 }
 
+fn wallpaper_refresh_button(icon_text: &str) -> (gtk::Button, gtk::Label, gtk::Spinner) {
+    let icon = gtk::Label::new(Some(icon_text));
+    icon.add_css_class("wallpaper-refresh-icon");
+
+    let spinner = gtk::Spinner::new();
+    spinner.add_css_class("wallpaper-refresh-spinner");
+    spinner.set_halign(gtk::Align::Center);
+    spinner.set_valign(gtk::Align::Center);
+    spinner.set_visible(false);
+
+    let indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    indicator.add_css_class("wallpaper-refresh-indicator");
+    indicator.set_halign(gtk::Align::Center);
+    indicator.set_valign(gtk::Align::Center);
+    indicator.append(&icon);
+    indicator.append(&spinner);
+
+    let button = gtk::Button::new();
+    button.add_css_class("wallpaper-refresh-button");
+    button.set_focus_on_click(false);
+    button.set_valign(gtk::Align::Center);
+    button.set_child(Some(&indicator));
+
+    (button, icon, spinner)
+}
+
 fn header_button(icon: &str) -> gtk::Button {
     let button = gtk::Button::new();
     button.add_css_class("wallpaper-refresh-button");
     button.set_focus_on_click(false);
+    button.set_valign(gtk::Align::Center);
 
     let label = gtk::Label::new(Some(icon));
     label.add_css_class("wallpaper-refresh-icon");
@@ -3316,6 +3445,35 @@ fn spawn_mpvpaper(path: &Path) -> Result<OwnedMpvpaper, WallpaperError> {
         process,
         ipc_socket,
     })
+}
+
+fn spawn_swaybg(path: &Path) -> Result<OwnedSwaybg, WallpaperError> {
+    let program = SWAYBG.get();
+    let mode = env::var_os("OBSIDIAN_BAR_SWAYBG_MODE")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("fill"));
+    let argv: [&OsStr; 5] = [
+        program,
+        OsStr::new("-m"),
+        mode.as_os_str(),
+        OsStr::new("-i"),
+        path.as_os_str(),
+    ];
+
+    let process = gio::Subprocess::newv(&argv, gio::SubprocessFlags::STDERR_SILENCE)
+        .map_err(WallpaperError::Glib)?;
+
+    Ok(OwnedSwaybg { process })
+}
+
+fn spawn_wallpaper_backend(path: &Path) -> Result<OwnedWallpaperBackend, WallpaperError> {
+    if is_image_wallpaper(path) {
+        return spawn_swaybg(path).map(OwnedWallpaperBackend::Image);
+    }
+    if is_video_wallpaper(path) {
+        return spawn_mpvpaper(path).map(OwnedWallpaperBackend::Video);
+    }
+    Err(WallpaperError::InvalidWallpaper(path.to_path_buf()))
 }
 
 fn mpvpaper_ipc_socket_path() -> PathBuf {

@@ -12,9 +12,14 @@ use crate::{
     niri::ipc,
     ui::bar::{Bar, BarDependencies},
     widgets::{
-        audio_spectrum::AudioSpectrumController, bar_features::BarFeatureController,
-        bluetooth::BluetoothAgent, launcher::LauncherCatalog, osd::OsdController,
-        player::PlayerController, tray::TrayController, wallpaper::WallpaperController,
+        audio_spectrum::{AudioSpectrumController, AudioSpectrumView},
+        bar_features::BarFeatureController,
+        bluetooth::BluetoothAgent,
+        launcher::LauncherCatalog,
+        osd::OsdController,
+        player::PlayerController,
+        tray::TrayController,
+        wallpaper::WallpaperController,
     },
 };
 
@@ -37,6 +42,7 @@ pub struct App {
     bluetooth_agent: BluetoothAgent,
     bar_features: Rc<BarFeatureController>,
     audio_spectrum: Rc<AudioSpectrumController>,
+    audio_spectrum_view: RefCell<Option<AudioSpectrumView>>,
     player: PlayerController,
     tray: TrayController,
     launcher_catalog: Rc<LauncherCatalog>,
@@ -64,6 +70,7 @@ impl App {
             bluetooth_agent: BluetoothAgent::default(),
             bar_features: BarFeatureController::new(),
             audio_spectrum: AudioSpectrumController::new(),
+            audio_spectrum_view: RefCell::new(None),
             player: PlayerController::new(),
             tray: TrayController::new(),
             launcher_catalog: LauncherCatalog::new(),
@@ -125,6 +132,15 @@ impl App {
             });
 
         let weak_self = Rc::downgrade(self);
+        self.audio_spectrum.subscribe_state(move |_| {
+            let Some(this) = weak_self.upgrade() else {
+                return false;
+            };
+            this.sync_audio_spectrum_view();
+            true
+        });
+
+        let weak_self = Rc::downgrade(self);
         self.application.connect_shutdown(move |_| {
             if let Some(this) = weak_self.upgrade() {
                 this.shutdown();
@@ -162,6 +178,40 @@ impl App {
         }
 
         self.sync_monitors(application);
+    }
+
+    fn sync_audio_spectrum_view(&self) {
+        let monitor = self
+            .monitor_model
+            .borrow()
+            .as_ref()
+            .and_then(|model| model.item(0))
+            .and_then(|item| item.downcast::<gdk::Monitor>().ok());
+
+        let mut view = self.audio_spectrum_view.borrow_mut();
+        if !self.audio_spectrum.enabled() {
+            drop(view.take());
+            return;
+        }
+
+        let Some(monitor) = monitor else {
+            drop(view.take());
+            return;
+        };
+
+        if view
+            .as_ref()
+            .is_some_and(|current| current.monitor() == &monitor)
+        {
+            return;
+        }
+
+        drop(view.take());
+        *view = Some(AudioSpectrumView::new(
+            &self.application,
+            &monitor,
+            &self.audio_spectrum,
+        ));
     }
 
     fn ensure_niri_listener(self: &Rc<Self>) {
@@ -283,6 +333,8 @@ impl App {
             }
         }
 
+        self.sync_audio_spectrum_view();
+
         if monitors.is_empty() {
             warn!("no monitors are currently available; waiting for hotplug");
         }
@@ -329,6 +381,7 @@ impl App {
             .set(self.fullscreen_sync_generation.get().wrapping_add(1));
 
         self.wallpaper.shutdown();
+        drop(self.audio_spectrum_view.borrow_mut().take());
         self.audio_spectrum.shutdown();
         if let Some(osd) = self.osd.borrow_mut().take() {
             osd.shutdown();

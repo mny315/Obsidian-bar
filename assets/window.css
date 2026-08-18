@@ -611,6 +611,7 @@ button.wallpaper-refresh-button:focus {
   min-width: 28px;
   min-height: 28px;
   padding: 0 5px;
+  margin: 0;
   border-radius: 9px;
   color: inherit;
   background: transparent;
@@ -626,9 +627,19 @@ button.wallpaper-refresh-button:focus {
   transform-origin: 50% 50%;
 }
 
+.wallpaper-refresh-indicator {
+  min-width: 16px;
+  min-height: 16px;
+}
+
+spinner.wallpaper-refresh-spinner {
+  min-width: 16px;
+  min-height: 16px;
+}
+
 button.wallpaper-refresh-button:hover,
 button.wallpaper-refresh-button:focus-visible {
-  background: @soft_overlay_05;
+  background: @hover_bg;
 }
 
 button.wallpaper-refresh-button:active {
@@ -645,7 +656,19 @@ button.wallpaper-feature-button:checked:focus-visible {
   background: @soft_overlay_18;
 }
 
-menubutton.wallpaper-random-button,
+menubutton.wallpaper-random-button {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
 menubutton.wallpaper-random-button > button.toggle,
 menubutton.wallpaper-random-button button.toggle {
   min-width: 28px;
@@ -665,7 +688,7 @@ menubutton.wallpaper-random-button > button.toggle:hover,
 menubutton.wallpaper-random-button > button.toggle:focus-visible,
 menubutton.wallpaper-random-button button.toggle:hover,
 menubutton.wallpaper-random-button button.toggle:focus-visible {
-  background: @soft_overlay_05;
+  background: @hover_bg;
 }
 
 menubutton.wallpaper-random-button > button.toggle:active,

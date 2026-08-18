@@ -25,8 +25,8 @@ const SETTINGS_FILE: &str = "audio-spectrum.ini";
 const NAMESPACE: &str = "desktop-audio-thread";
 
 const SPECTRUM_BANDS: usize = 72;
-const FFT_SIZE: usize = 4096;
-const ANALYZER_FPS: usize = 30;
+const FFT_SIZE: usize = 2048;
+const ANALYZER_FPS: usize = 48;
 const RENDER_FPS: usize = 60;
 const RENDER_FRAME_INTERVAL: Duration = Duration::from_micros(1_000_000 / RENDER_FPS as u64);
 const WORKER_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -237,6 +237,7 @@ impl AudioSpectrumController {
 
 pub struct AudioSpectrumView {
     window: gtk::ApplicationWindow,
+    monitor: gdk::Monitor,
 }
 
 impl AudioSpectrumView {
@@ -307,29 +308,16 @@ impl AudioSpectrumView {
             });
         }
 
-        {
-            let weak_window = window.downgrade();
-            let weak_area = area.downgrade();
-            let render_state = Rc::clone(&render_state);
-            controller.subscribe_state(move |enabled| {
-                let Some(window) = weak_window.upgrade() else {
-                    return false;
-                };
+        window.present();
 
-                if enabled {
-                    window.present();
-                } else {
-                    render_state.borrow_mut().reset();
-                    if let Some(area) = weak_area.upgrade() {
-                        area.queue_draw();
-                    }
-                    window.set_visible(false);
-                }
-                true
-            });
+        Self {
+            window,
+            monitor: monitor.clone(),
         }
+    }
 
-        Self { window }
+    pub fn monitor(&self) -> &gdk::Monitor {
+        &self.monitor
     }
 }
 

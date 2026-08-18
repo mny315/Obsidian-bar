@@ -22,6 +22,7 @@
             nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
             buildInputs = [ pkgs.gdk-pixbuf pkgs.gtk4 pkgs.gtk4-layer-shell pkgs.pipewire ];
             OBSIDIAN_BAR_MPVPAPER_BIN = "${pkgs.mpvpaper}/bin/mpvpaper";
+            OBSIDIAN_BAR_SWAYBG_BIN = "${pkgs.swaybg}/bin/swaybg";
             OBSIDIAN_BAR_FFMPEG_BIN = "${pkgs.ffmpeg}/bin/ffmpeg";
             OBSIDIAN_BAR_BRIGHTNESSCTL_BIN = "${pkgs.brightnessctl}/bin/brightnessctl";
             OBSIDIAN_BAR_DDCUTIL_BIN = "${pkgs.ddcutil}/bin/ddcutil";
@@ -52,6 +53,7 @@
             rustfmt
             clippy
             mpvpaper
+            swaybg
             ffmpeg
             brightnessctl
             ddcutil
