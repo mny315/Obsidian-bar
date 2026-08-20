@@ -1139,6 +1139,7 @@ impl WallpaperIndicator {
                     };
                     position_picker_at_trigger(&picker, button, &bar_window, &monitor);
                     focus_armed.set(false);
+                    picker_reveal.sync_top_anchor(&picker);
                     picker_reveal.show(&picker);
                 }
             });

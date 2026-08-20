@@ -1244,20 +1244,6 @@ window.audio-popup-window > box,
   box-shadow: none;
 }
 
-@keyframes widget-popup-open-motion {
-  from {
-    transform: translate(0, -8px) scale(0.975);
-  }
-
-  to {
-    transform: translate(0, 0) scale(1);
-  }
-}
-
-.widget-popup-revealer.widget-popup-opening {
-  animation: widget-popup-open-motion 240ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
 window.audio-popup-window box.widget-popup-frame.audio-popover-window,
 .audio-popover-window {
   padding: 12px;

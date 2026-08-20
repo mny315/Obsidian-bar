@@ -439,14 +439,19 @@ fn build_bar_popup_left(
     popup
 }
 
-const POPUP_FADE_OPEN_MS: f64 = 220.0;
-const POPUP_FADE_CLOSE_MS: f64 = 170.0;
-const POPUP_SAFE_OPACITY_FLOOR: f64 = 0.42;
-const POPUP_OPEN_MOTION_CLASS: &str = "widget-popup-opening";
+const POPUP_FADE_OPEN_MS: f64 = 260.0;
+const POPUP_FADE_CLOSE_MS: f64 = 180.0;
+const POPUP_OPEN_OFFSET: i32 = 9;
+const POPUP_CLOSE_OFFSET: i32 = 7;
+// Keep a clearly visible surface until the layer window is unmapped. If the
+// child reaches full transparency first, Niri can render one frame containing
+// only the blur region after the popup itself has seemingly disappeared.
+const POPUP_CLOSE_OPACITY_FLOOR: f64 = 0.58;
 
 struct PopupRevealState {
     generation: Generation,
     revealed: Cell<bool>,
+    rest_top_margin: Cell<Option<i32>>,
     root: gtk::Box,
     child: gtk::Widget,
 }
@@ -465,6 +470,7 @@ impl PopupReveal {
         Self(Rc::new(PopupRevealState {
             generation: Generation::default(),
             revealed: Cell::new(false),
+            rest_top_margin: Cell::new(None),
             root,
             child,
         }))
@@ -477,28 +483,34 @@ impl PopupReveal {
     fn show(&self, window: &gtk::ApplicationWindow) -> u64 {
         let generation = self.0.generation.bump();
         self.0.revealed.set(true);
-        self.0.root.remove_css_class(POPUP_OPEN_MOTION_CLASS);
+        let rest_top_margin = self
+            .0
+            .rest_top_margin
+            .get()
+            .unwrap_or_else(|| window.margin(Edge::Top));
+        self.0.rest_top_margin.set(Some(rest_top_margin));
 
         if !window.is_visible() {
-            // Start a newly mapped popup fully transparent.  The Niri-safe opacity
-            // floor is only a close-time cutoff: using it here makes the widget pop
-            // in at 42% before the frame-clock animation has even started.
+            // Move the layer surface itself so Niri's blur, the popup frame and
+            // its contents all begin at exactly the same position.
+            window.set_margin(Edge::Top, rest_top_margin - POPUP_OPEN_OFFSET);
             self.0.child.set_opacity(0.0);
             window.present();
         }
 
-        let weak_state = Rc::downgrade(&self.0);
-        glib::idle_add_local_once(move || {
-            let Some(state) = weak_state.upgrade() else {
-                return;
-            };
-            if state.generation.is_current(generation) && state.revealed.get() {
-                state.root.add_css_class(POPUP_OPEN_MOTION_CLASS);
-            }
-        });
-
-        self.animate_opacity(window, generation, 1.0, POPUP_FADE_OPEN_MS, false);
+        self.animate(
+            window,
+            generation,
+            1.0,
+            rest_top_margin,
+            POPUP_FADE_OPEN_MS,
+            false,
+        );
         generation
+    }
+
+    fn sync_top_anchor(&self, window: &gtk::ApplicationWindow) {
+        self.0.rest_top_margin.set(Some(window.margin(Edge::Top)));
     }
 
     fn hide(&self, window: &gtk::ApplicationWindow) {
@@ -509,18 +521,38 @@ impl PopupReveal {
 
         let generation = self.0.generation.bump();
         self.0.revealed.set(false);
-        self.animate_opacity(window, generation, 0.0, POPUP_FADE_CLOSE_MS, true);
+        if self.0.child.opacity() <= POPUP_CLOSE_OPACITY_FLOOR {
+            // An opening interrupted before reaching the safe floor must not
+            // brighten again or leave a mostly transparent blur-only surface.
+            window.set_visible(false);
+            return;
+        }
+        let rest_top_margin = self
+            .0
+            .rest_top_margin
+            .get()
+            .unwrap_or_else(|| window.margin(Edge::Top));
+        self.animate(
+            window,
+            generation,
+            POPUP_CLOSE_OPACITY_FLOOR,
+            rest_top_margin - POPUP_CLOSE_OFFSET,
+            POPUP_FADE_CLOSE_MS,
+            true,
+        );
     }
 
-    fn animate_opacity(
+    fn animate(
         &self,
         window: &gtk::ApplicationWindow,
         generation: u64,
-        target: f64,
+        target_opacity: f64,
+        target_top_margin: i32,
         duration_ms: f64,
         hide_on_finish: bool,
     ) {
         let start_opacity = self.0.child.opacity();
+        let start_top_margin = window.margin(Edge::Top);
         let weak_child = self.0.child.downgrade();
         let weak_window = window.downgrade();
         let weak_state = Rc::downgrade(&self.0);
@@ -545,32 +577,29 @@ impl PopupReveal {
 
             let elapsed_ms = (now_us - start_us).max(0) as f64 / 1_000.0;
             let t = (elapsed_ms / duration_ms).clamp(0.0, 1.0);
-            let eased = if hide_on_finish {
-                t * t * t
-            } else {
-                1.0 - (1.0 - t).powi(3)
-            };
-            let opacity = start_opacity + (target - start_opacity) * eased;
+            let eased = popup_animation_progress(t, hide_on_finish);
+            let opacity = start_opacity + (target_opacity - start_opacity) * eased;
+            let top_margin =
+                start_top_margin as f64 + (target_top_margin - start_top_margin) as f64 * eased;
 
-            let Some(child) = weak_child.upgrade() else {
+            let (Some(child), Some(window)) = (weak_child.upgrade(), weak_window.upgrade()) else {
                 return glib::ControlFlow::Break;
             };
-
-            if hide_on_finish && opacity <= POPUP_SAFE_OPACITY_FLOOR {
-                if !state.revealed.get()
-                    && let Some(window) = weak_window.upgrade()
-                {
-                    window.set_visible(false);
-                }
-                return glib::ControlFlow::Break;
-            }
 
             child.set_opacity(opacity.clamp(0.0, 1.0));
+            window.set_margin(Edge::Top, top_margin.round() as i32);
 
             if t < 1.0 {
                 glib::ControlFlow::Continue
             } else {
-                child.set_opacity(target);
+                child.set_opacity(target_opacity);
+                window.set_margin(Edge::Top, target_top_margin);
+                if hide_on_finish && !state.revealed.get() {
+                    // Do not clear opacity or reset the margin here. Keeping the last
+                    // rendered popup frame intact until unmap prevents Niri's
+                    // blur region from visually outliving the window contents.
+                    window.set_visible(false);
+                }
                 glib::ControlFlow::Break
             }
         });
@@ -579,8 +608,8 @@ impl PopupReveal {
     fn reset_hidden(&self) {
         self.0.generation.bump();
         self.0.revealed.set(false);
-        self.0.root.remove_css_class(POPUP_OPEN_MOTION_CLASS);
-        self.0.child.set_opacity(0.0);
+        // Visual state is intentionally preserved while GTK/Niri unmaps the
+        // surface. show() initializes the next opening while it is still hidden.
     }
 
     fn is_current(&self, generation: u64) -> bool {
@@ -589,6 +618,15 @@ impl PopupReveal {
 
     fn is_revealed(&self) -> bool {
         self.0.revealed.get()
+    }
+}
+
+fn popup_animation_progress(t: f64, closing: bool) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    if closing {
+        t * t * t
+    } else {
+        1.0 - (1.0 - t).powi(3)
     }
 }
 
@@ -746,7 +784,7 @@ pub mod workspace;
 
 #[cfg(test)]
 mod tests {
-    use super::Generation;
+    use super::{Generation, popup_animation_progress};
 
     #[test]
     fn generation_invalidates_older_values() {
@@ -757,5 +795,22 @@ mod tests {
         let second = generation.bump();
         assert!(!generation.is_current(first));
         assert!(generation.is_current(second));
+    }
+
+    #[test]
+    fn popup_easing_has_stable_endpoints() {
+        for closing in [false, true] {
+            assert_eq!(popup_animation_progress(0.0, closing), 0.0);
+            assert_eq!(popup_animation_progress(1.0, closing), 1.0);
+        }
+    }
+
+    #[test]
+    fn popup_opening_moves_early_and_closing_moves_late() {
+        let opening_halfway = popup_animation_progress(0.5, false);
+        let closing_halfway = popup_animation_progress(0.5, true);
+
+        assert_eq!(opening_halfway, 0.875);
+        assert_eq!(closing_halfway, 0.125);
     }
 }
