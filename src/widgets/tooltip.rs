@@ -9,6 +9,11 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(420);
 const TOOLTIP_GAP: i32 = 13;
+// The compact controls on the right are the visual baseline for bar tooltips.
+// Other bar buttons range from 22 to 30 px tall, so using each button's bottom
+// edge makes their tooltips land on different rows even though the controls are
+// vertically centered.
+const BAR_TOOLTIP_REFERENCE_TARGET_HEIGHT: f32 = 26.0;
 const SCREEN_PADDING: i32 = 12;
 const ATTACHED_CSS_CLASS: &str = "obsidian-bar-tooltip-source";
 
@@ -475,15 +480,18 @@ impl TooltipState {
         let tooltip_height = tooltip_height.max(1);
 
         let target_x = root_x as f32 + bounds.x();
-        let target_y = root_y as f32 + bounds.y();
         let target_width = bounds.width();
-        let target_height = bounds.height();
 
         let mut left = (target_x - geometry.x() as f32
             + (target_width - tooltip_width as f32) / 2.0)
             .round() as i32;
-        let mut top =
-            (target_y - geometry.y() as f32 + target_height + TOOLTIP_GAP as f32).round() as i32;
+        let anchor_bottom = tooltip_anchor_bottom(
+            root.has_css_class("bar-window"),
+            root_height as f32,
+            bounds.y(),
+            bounds.height(),
+        );
+        let mut top = (root_y - geometry.y()) + (anchor_bottom + TOOLTIP_GAP as f32).round() as i32;
 
         left = left.clamp(
             SCREEN_PADDING,
@@ -496,6 +504,19 @@ impl TooltipState {
 
         self.window.set_margin(Edge::Left, left);
         self.window.set_margin(Edge::Top, top);
+    }
+}
+
+fn tooltip_anchor_bottom(
+    is_bar_window: bool,
+    root_height: f32,
+    target_y: f32,
+    target_height: f32,
+) -> f32 {
+    if is_bar_window {
+        (root_height + BAR_TOOLTIP_REFERENCE_TARGET_HEIGHT) / 2.0
+    } else {
+        target_y + target_height
     }
 }
 
@@ -515,4 +536,25 @@ fn tooltip_content(widget: &gtk::Widget) -> Option<(String, bool)> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tooltip_anchor_bottom;
+
+    #[test]
+    fn bar_tooltips_share_one_vertical_anchor() {
+        let short_button = tooltip_anchor_bottom(true, 42.0, 10.0, 22.0);
+        let compact_button = tooltip_anchor_bottom(true, 42.0, 8.0, 26.0);
+        let tall_button = tooltip_anchor_bottom(true, 42.0, 6.0, 30.0);
+
+        assert_eq!(short_button, 34.0);
+        assert_eq!(compact_button, 34.0);
+        assert_eq!(tall_button, 34.0);
+    }
+
+    #[test]
+    fn popup_tooltips_stay_relative_to_their_target() {
+        assert_eq!(tooltip_anchor_bottom(false, 300.0, 48.0, 28.0), 76.0);
+    }
 }

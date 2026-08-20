@@ -17,7 +17,6 @@ use std::{
 
 use gdk_pixbuf::{InterpType, Pixbuf};
 use gio::prelude::*;
-use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tracing::{info, warn};
@@ -34,17 +33,22 @@ use super::{
 
 const SETTINGS_GROUP: &str = "wallpaper";
 const SETTINGS_FILE: &str = "wallpaper.ini";
-const DEFAULT_OUTPUT: &str = "ALL";
+const DEFAULT_MPVPAPER_OUTPUT: &str = "ALL";
 const DEFAULT_MPV_OPTIONS: &str = "config=no no-audio loop-file=inf image-display-duration=inf reset-on-next-file=pause hwdec=auto-safe panscan=1.0 terminal=no input-terminal=no input-default-bindings=no osc=no osd-level=0";
 static MPVPAPER: command::ExternalProgram = command::ExternalProgram::new(
     "OBSIDIAN_BAR_MPVPAPER_BIN",
     option_env!("OBSIDIAN_BAR_MPVPAPER_BIN"),
     "mpvpaper",
 );
-static SWAYBG: command::ExternalProgram = command::ExternalProgram::new(
-    "OBSIDIAN_BAR_SWAYBG_BIN",
-    option_env!("OBSIDIAN_BAR_SWAYBG_BIN"),
-    "swaybg",
+static AWWW: command::ExternalProgram = command::ExternalProgram::new(
+    "OBSIDIAN_BAR_AWWW_BIN",
+    option_env!("OBSIDIAN_BAR_AWWW_BIN"),
+    "awww",
+);
+static AWWW_DAEMON: command::ExternalProgram = command::ExternalProgram::new(
+    "OBSIDIAN_BAR_AWWW_DAEMON_BIN",
+    option_env!("OBSIDIAN_BAR_AWWW_DAEMON_BIN"),
+    "awww-daemon",
 );
 static FFMPEG: command::ExternalProgram = command::ExternalProgram::new(
     "OBSIDIAN_BAR_FFMPEG_BIN",
@@ -55,34 +59,33 @@ static FFMPEG: command::ExternalProgram = command::ExternalProgram::new(
 const GRID_COLUMNS: i32 = 3;
 const CARD_WIDTH: i32 = 144;
 const CARD_HEIGHT: i32 = 84;
-const GRID_GAP: u32 = 8;
-const GALLERY_WIDTH: i32 = CARD_WIDTH * GRID_COLUMNS + (GRID_GAP as i32) * (GRID_COLUMNS - 1);
-const GALLERY_HEIGHT: i32 = CARD_HEIGHT * 6 + (GRID_GAP as i32) * 5;
+const GRID_GAP: i32 = 8;
+const GALLERY_WIDTH: i32 = CARD_WIDTH * GRID_COLUMNS + GRID_GAP * (GRID_COLUMNS - 1);
+const GALLERY_HEIGHT: i32 = CARD_HEIGHT * 6 + GRID_GAP * 5;
 const SMOOTH_SCROLL: SmoothScrollConfig = SmoothScrollConfig::new(96.0, 130.0, 72.0);
 const DEFAULT_RANDOM_INTERVAL_MINUTES: u32 = 30;
 const MIN_RANDOM_INTERVAL_MINUTES: u32 = 1;
 const MAX_RANDOM_INTERVAL_MINUTES: u32 = 24 * 60;
 const THUMBNAIL_VERSION: &str = "cover-144x84-v2";
 const VIDEO_STILL_VERSION: &str = "video-still-v1";
-const TRANSITION_DURATION: Duration = Duration::from_millis(620);
+const AWWW_NAMESPACE: &str = "obsidian-bar";
+const AWWW_TRANSITION_DURATION: Duration = Duration::from_millis(1200);
+const AWWW_TRANSITION_FPS: &str = "255";
+const AWWW_TRANSITION_STEP: &str = "2";
+const AWWW_TRANSPARENT: &str = "00000000";
+const AWWW_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const AWWW_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+const AWWW_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const REFRESH_ANIMATION_MIN_DURATION: Duration = Duration::from_secs(2);
-const MPV_IPC_LOAD_TIMEOUT: Duration = Duration::from_millis(2500);
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
-const TRANSITION_SETTLE_FRAMES: u32 = 2;
-const TRANSITION_BACKEND_SETTLE_DELAY: Duration = Duration::from_millis(160);
 const RESUME_SUBSCRIPTION_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const RESUME_SUBSCRIPTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
-const TRANSITION_WARMUP_FRAMES: u32 = 2;
-const TRANSITION_WARMUP_PROGRESS: f64 = 0.000_001;
-const TRANSITION_FRAME_CLOCK_TIMEOUT: Duration = Duration::from_millis(1800);
-const MPVPAPER_READY_TIMEOUT: Duration = Duration::from_millis(1500);
+const MPVPAPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const MPV_REQUEST_VO_CONFIGURED: u64 = 1;
-const MPV_REQUEST_LOAD_FILE: u64 = 2;
-const MPV_REQUEST_UNPAUSE: u64 = 3;
+const MPVPAPER_SOCKET_PREFIX: &str = "obsidian-mpv-";
 const IMAGE_THUMBNAIL_WORKERS: usize = 2;
 const VIDEO_THUMBNAIL_WORKERS: usize = 2;
 const THUMBNAIL_QUEUE_CAPACITY: usize = 256;
-const TRANSITION_NAMESPACE: &str = "obsidian-wallpaper-transition";
 const PICKER_NAMESPACE: &str = "obsidian-bar-wallpaper";
 
 const ICON_WALLPAPER: &str = "\u{f0e09}";
@@ -152,8 +155,9 @@ impl WallpaperSettings {
             .integer(SETTINGS_GROUP, "random_interval_minutes")
             .ok()
             .and_then(|value| u32::try_from(value).ok())
-            .map(|value| value.clamp(MIN_RANDOM_INTERVAL_MINUTES, MAX_RANDOM_INTERVAL_MINUTES))
-            .unwrap_or(defaults.random_interval_minutes);
+            .map_or(defaults.random_interval_minutes, |value| {
+                value.clamp(MIN_RANDOM_INTERVAL_MINUTES, MAX_RANDOM_INTERVAL_MINUTES)
+            });
 
         Self {
             directory,
@@ -234,68 +238,117 @@ struct GalleryRenderWidgets<'a> {
     notice: &'a gtk::Label,
 }
 
-struct OwnedMpvpaper {
+struct ManagedSubprocess {
     process: gio::Subprocess,
+    running: Rc<Cell<bool>>,
+    stopping: Rc<Cell<bool>>,
+}
+
+impl ManagedSubprocess {
+    fn spawn(name: &'static str, argv: &[&OsStr]) -> Result<Self, WallpaperError> {
+        let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::NONE);
+        configure_child_lifetime(&launcher);
+        let process = launcher.spawn(argv).map_err(WallpaperError::Glib)?;
+        let running = Rc::new(Cell::new(true));
+        let stopping = Rc::new(Cell::new(false));
+        let running_after_exit = Rc::clone(&running);
+        let stopping_after_exit = Rc::clone(&stopping);
+        let observed_process = process.clone();
+        process.wait_async(None::<&gio::Cancellable>, move |result| {
+            if let Err(error) = result {
+                warn!(process = name, %error, "failed to monitor wallpaper subprocess");
+                return;
+            }
+            running_after_exit.set(false);
+            if !stopping_after_exit.get() {
+                warn!(
+                    process = name,
+                    status = observed_process.status(),
+                    "wallpaper subprocess exited unexpectedly"
+                );
+            }
+        });
+
+        Ok(Self {
+            process,
+            running,
+            stopping,
+        })
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.get()
+    }
+}
+
+impl Drop for ManagedSubprocess {
+    fn drop(&mut self) {
+        self.stopping.set(true);
+        if self.running.replace(false) {
+            self.process.force_exit();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_child_lifetime(launcher: &gio::SubprocessLauncher) {
+    let parent_pid = unsafe { libc::getpid() };
+    launcher.set_child_setup(move || unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 || libc::getppid() != parent_pid
+        {
+            libc::_exit(1);
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_child_lifetime(_launcher: &gio::SubprocessLauncher) {}
+
+struct OwnedMpvpaper {
+    process: ManagedSubprocess,
     ipc_socket: PathBuf,
 }
 
 impl OwnedMpvpaper {
     fn is_alive(&self) -> bool {
-        self.process.identifier().is_some()
+        self.process.is_running()
     }
 }
 
 impl Drop for OwnedMpvpaper {
     fn drop(&mut self) {
-        if self.process.identifier().is_some() {
-            self.process.force_exit();
-        }
         let _ = fs::remove_file(&self.ipc_socket);
     }
 }
 
-struct OwnedSwaybg {
-    process: gio::Subprocess,
+struct OwnedAwwwDaemon {
+    process: ManagedSubprocess,
 }
 
-impl OwnedSwaybg {
+impl OwnedAwwwDaemon {
     fn is_alive(&self) -> bool {
-        self.process.identifier().is_some()
+        self.process.is_running()
     }
 }
 
-impl Drop for OwnedSwaybg {
-    fn drop(&mut self) {
-        if self.process.identifier().is_some() {
-            self.process.force_exit();
-        }
-    }
+enum WallpaperBackend {
+    Image {
+        source: PathBuf,
+        frame: PathBuf,
+    },
+    Video {
+        source: PathBuf,
+        process: OwnedMpvpaper,
+    },
 }
 
-enum OwnedWallpaperBackend {
-    Image(OwnedSwaybg),
-    Video(OwnedMpvpaper),
-}
-
-impl OwnedWallpaperBackend {
-    fn is_alive(&self) -> bool {
+impl WallpaperBackend {
+    fn matches(&self, path: &Path) -> bool {
         match self {
-            Self::Image(process) => process.is_alive(),
-            Self::Video(process) => process.is_alive(),
-        }
-    }
-
-    fn matches_path_kind(&self, path: &Path) -> bool {
-        match self {
-            Self::Image(_) => is_image_wallpaper(path),
-            Self::Video(_) => is_video_wallpaper(path),
-        }
-    }
-
-    fn mpv_ipc_socket(&self) -> Option<&Path> {
-        match self {
-            Self::Video(process) => Some(&process.ipc_socket),
-            Self::Image(_) => None,
+            Self::Image { source, .. } => is_image_wallpaper(path) && source == path,
+            Self::Video { source, process } => {
+                is_video_wallpaper(path) && source == path && process.is_alive()
+            }
         }
     }
 }
@@ -304,13 +357,14 @@ type ApplyErrorHandler = Rc<dyn Fn(&WallpaperError)>;
 
 struct PendingApply {
     path: PathBuf,
+    force: bool,
     on_error: ApplyErrorHandler,
 }
 
 pub struct WallpaperController {
     settings: RefCell<WallpaperSettings>,
-    process: RefCell<Option<OwnedWallpaperBackend>>,
-    application: RefCell<Option<gtk::Application>>,
+    backend: RefCell<Option<WallpaperBackend>>,
+    awww_daemon: RefCell<Option<OwnedAwwwDaemon>>,
     subscribers: RefCell<Vec<async_channel::Sender<WallpaperSnapshot>>>,
     sleep_subscription: RefCell<Option<gio::SignalSubscription>>,
     sleep_subscription_pending: Cell<bool>,
@@ -323,16 +377,14 @@ pub struct WallpaperController {
     random_source: RefCell<Option<glib::SourceId>>,
     random_pick_busy: Cell<bool>,
     random_nonce: Cell<u64>,
-    transition_nonce: Cell<u64>,
-    last_transition: Cell<Option<WallpaperTransitionKind>>,
 }
 
 impl WallpaperController {
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
             settings: RefCell::new(WallpaperSettings::load()),
-            process: RefCell::new(None),
-            application: RefCell::new(None),
+            backend: RefCell::new(None),
+            awww_daemon: RefCell::new(None),
             subscribers: RefCell::new(Vec::new()),
             sleep_subscription: RefCell::new(None),
             sleep_subscription_pending: Cell::new(false),
@@ -345,19 +397,17 @@ impl WallpaperController {
             random_source: RefCell::new(None),
             random_pick_busy: Cell::new(false),
             random_nonce: Cell::new(0),
-            transition_nonce: Cell::new(0),
-            last_transition: Cell::new(None),
         })
     }
 
-    pub fn start(self: &Rc<Self>, application: &gtk::Application) {
-        self.application.replace(Some(application.clone()));
+    pub fn start(self: &Rc<Self>) {
         if self.started.replace(true) {
             return;
         }
         self.lifecycle_generation.bump();
+        cleanup_stale_mpvpaper_sockets();
 
-        if let Err(error) = self.restore_animated_at_startup() {
+        if let Err(error) = self.restore_at_startup() {
             warn!(%error, "failed to restore wallpaper at startup");
         }
         self.subscribe_to_resume();
@@ -374,8 +424,8 @@ impl WallpaperController {
         drop(self.sleep_subscription.borrow_mut().take());
         self.sleep_subscription_pending.set(false);
         self.sleep_subscription_retry_pending.set(false);
-        self.stop_owned_process();
-        drop(self.application.borrow_mut().take());
+        self.stop_wallpaper_backend();
+        drop(self.awww_daemon.borrow_mut().take());
         self.applying.set(false);
         self.random_pick_busy.set(false);
         drop(self.pending_apply.borrow_mut().take());
@@ -502,13 +552,18 @@ impl WallpaperController {
         let lifecycle = self.lifecycle_generation.current();
         let weak = Rc::downgrade(self);
         run_background(
-            move || choose_random_wallpaper(&directory, current.as_deref(), nonce),
-            move |result| {
+            move || {
+                let result = choose_random_wallpaper(&directory, current.as_deref(), nonce);
+                (directory, result)
+            },
+            move |(directory, result)| {
                 let Some(controller) = weak.upgrade() else {
                     return;
                 };
                 controller.random_pick_busy.set(false);
-                if !controller.lifecycle_is_current(lifecycle) {
+                if !controller.lifecycle_is_current(lifecycle)
+                    || controller.settings.borrow().directory != directory
+                {
                     return;
                 }
                 match result {
@@ -522,20 +577,34 @@ impl WallpaperController {
     }
 
     fn request_apply_silent(self: &Rc<Self>, path: PathBuf) {
-        self.request_apply(path, |_| {});
+        self.request_apply_with_options(path, false, Rc::new(|_| {}));
     }
 
     fn request_apply<F>(self: &Rc<Self>, path: PathBuf, on_error: F)
     where
         F: Fn(&WallpaperError) + 'static,
     {
+        self.request_apply_with_options(path, false, Rc::new(on_error));
+    }
+
+    fn request_force_apply_silent(self: &Rc<Self>, path: PathBuf) {
+        self.request_apply_with_options(path, true, Rc::new(|_| {}));
+    }
+
+    fn request_apply_with_options(
+        self: &Rc<Self>,
+        path: PathBuf,
+        force: bool,
+        on_error: ApplyErrorHandler,
+    ) {
         if !self.started.get() {
             return;
         }
 
         let request = PendingApply {
             path,
-            on_error: Rc::new(on_error),
+            force,
+            on_error,
         };
 
         if !self.try_begin_apply() {
@@ -552,7 +621,9 @@ impl WallpaperController {
                     break;
                 }
 
-                let result = controller.apply_animated(request.path, lifecycle).await;
+                let result = controller
+                    .apply_animated(request.path, request.force, lifecycle)
+                    .await;
                 if !controller.lifecycle_is_current(lifecycle) {
                     break;
                 }
@@ -593,7 +664,12 @@ impl WallpaperController {
         }
     }
 
-    async fn apply_animated(&self, path: PathBuf, lifecycle: u64) -> Result<(), WallpaperError> {
+    async fn apply_animated(
+        &self,
+        path: PathBuf,
+        force: bool,
+        lifecycle: u64,
+    ) -> Result<(), WallpaperError> {
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
@@ -602,248 +678,229 @@ impl WallpaperController {
         }
 
         let same_path = self.settings.borrow().current.as_deref() == Some(path.as_path());
-        let backend_matches = self
-            .process
-            .borrow()
-            .as_ref()
-            .is_some_and(|backend| backend.is_alive() && backend.matches_path_kind(&path));
-        if same_path && backend_matches {
+        if !force && same_path && self.backend_matches(&path) {
             return Ok(());
         }
 
-        let transition_frame = if is_video_wallpaper(&path) {
+        let awww_frame = if is_video_wallpaper(&path) {
             match cached_video_still_async(path.clone()).await {
-                Ok(still) if self.lifecycle_is_current(lifecycle) => Some(still),
+                Ok(still) if self.lifecycle_is_current(lifecycle) => still,
                 Ok(_) => return Ok(()),
-                Err(error) => {
-                    warn!(path = %path.display(), %error, "failed to prepare video transition frame");
-                    None
-                }
+                Err(error) => return Err(error),
             }
         } else {
-            Some(path.clone())
+            path.clone()
         };
 
-        let transition = match transition_frame.as_deref() {
-            Some(frame) => match self.create_random_transition(frame) {
-                Ok(transition) => Some(transition),
-                Err(error) => {
-                    warn!(%error, "native wallpaper transition unavailable; applying directly");
-                    None
-                }
-            },
-            None => None,
-        };
-
-        if let Some(transition) = transition.as_ref() {
-            transition.present();
-            transition.animate().await;
-            if !self.lifecycle_is_current(lifecycle) {
-                return Ok(());
-            }
-            transition.wait_frames(1).await;
-            if !self.lifecycle_is_current(lifecycle) {
-                return Ok(());
-            }
+        self.ensure_awww_daemon(lifecycle).await?;
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
         }
-
-        let reuse_socket = if is_video_wallpaper(&path) {
-            self.process
-                .borrow()
-                .as_ref()
-                .filter(|backend| backend.is_alive())
-                .and_then(|backend| backend.mpv_ipc_socket())
-                .map(Path::to_path_buf)
-        } else {
-            None
-        };
-
-        if let Some(socket) = reuse_socket {
-            if load_mpvpaper_file(socket, path.clone()).await {
-                if !self.lifecycle_is_current(lifecycle) {
-                    return Ok(());
-                }
-                let save_result = self.set_current_runtime(path.clone());
-                info!(path = %path.display(), "mpvpaper wallpaper changed through IPC");
-                if let Err(error) = save_result {
-                    if let Some(transition) = transition.as_ref() {
-                        transition.close();
-                    }
-                    return Err(error);
-                }
-                if let Some(transition) = transition.as_ref() {
-                    transition.wait_for_backend_settle().await;
-                    transition.close();
-                }
-                return Ok(());
-            }
-
-            warn!(
-                path = %path.display(),
-                "mpvpaper IPC switch failed; restarting wallpaper backend"
-            );
+        apply_awww_image(awww_frame.clone()).await?;
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
         }
+        wait_awww_transition().await;
 
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
-        let old_process = self.process.borrow_mut().take();
-        let process = match spawn_wallpaper_backend(&path) {
-            Ok(process) => process,
-            Err(error) => {
-                self.process.replace(old_process);
-                if let Some(transition) = transition.as_ref() {
-                    transition.close();
+        if is_video_wallpaper(&path) {
+            let video = match spawn_mpvpaper(&path) {
+                Ok(video) => video,
+                Err(error) => {
+                    self.restore_after_video_failure(&path, &awww_frame, lifecycle)
+                        .await;
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
-
-        let mut backend_settled_before_swap = false;
-        if let OwnedWallpaperBackend::Video(video) = &process {
+            };
             let ready = wait_for_mpvpaper_ready(video.ipc_socket.clone()).await;
             if !self.lifecycle_is_current(lifecycle) {
                 return Ok(());
             }
             if !video.is_alive() {
-                self.process.replace(old_process);
-                if let Some(transition) = transition.as_ref() {
-                    transition.close();
-                }
-                return Err(WallpaperError::Transition(
+                let error = WallpaperError::Backend(
                     "mpvpaper exited before its video output became ready".into(),
-                ));
+                );
+                drop(video);
+                self.restore_after_video_failure(&path, &awww_frame, lifecycle)
+                    .await;
+                return Err(error);
             }
             if !ready {
-                warn!(path = %path.display(), "mpvpaper VO readiness timed out; using guarded transition hold");
-            }
-        } else {
-            if let Some(transition) = transition.as_ref() {
-                transition.wait_for_backend_settle().await;
-                backend_settled_before_swap = true;
-                if !self.lifecycle_is_current(lifecycle) {
-                    return Ok(());
-                }
-            }
-            if !process.is_alive() {
-                self.process.replace(old_process);
-                if let Some(transition) = transition.as_ref() {
-                    transition.close();
-                }
-                return Err(WallpaperError::Transition(
-                    "swaybg exited before the image wallpaper became ready".into(),
+                let error = WallpaperError::Backend(format!(
+                    "mpvpaper video output did not become ready within {} ms",
+                    MPVPAPER_READY_TIMEOUT.as_millis()
                 ));
+                drop(video);
+                self.restore_after_video_failure(&path, &awww_frame, lifecycle)
+                    .await;
+                return Err(error);
             }
-        }
-
-        if let Some(old_process) = old_process {
-            drop(old_process);
-        }
-        self.process.replace(Some(process));
-
-        let save_result = self.set_current_runtime(path.clone());
-        if is_video_wallpaper(&path) {
-            info!(path = %path.display(), "mpvpaper video wallpaper started");
+            if let Err(error) = make_awww_transparent().await {
+                drop(video);
+                self.restore_after_video_failure(&path, &awww_frame, lifecycle)
+                    .await;
+                return Err(error);
+            }
+            if !self.lifecycle_is_current(lifecycle) {
+                return Ok(());
+            }
+            self.backend.replace(Some(WallpaperBackend::Video {
+                source: path.clone(),
+                process: video,
+            }));
+            info!(path = %path.display(), "mpvpaper video wallpaper started after awww transition");
         } else {
-            info!(path = %path.display(), "swaybg image wallpaper started");
-        }
-        if let Err(error) = save_result {
-            if let Some(transition) = transition.as_ref() {
-                transition.close();
-            }
-            return Err(error);
+            self.backend.replace(Some(WallpaperBackend::Image {
+                source: path.clone(),
+                frame: path.clone(),
+            }));
+            info!(path = %path.display(), "awww image wallpaper applied");
         }
 
-        if let Some(transition) = transition.as_ref() {
-            if backend_settled_before_swap {
-                transition.wait_frames(1).await;
-            } else {
-                transition.wait_for_backend_settle().await;
-            }
-            transition.close();
+        self.set_current_runtime(path)
+    }
+
+    async fn ensure_awww_daemon(&self, lifecycle: u64) -> Result<(), WallpaperError> {
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
+        }
+        if self
+            .awww_daemon
+            .borrow()
+            .as_ref()
+            .is_some_and(|daemon| !daemon.is_alive())
+        {
+            drop(self.awww_daemon.borrow_mut().take());
+        }
+        if awww_is_ready().await {
+            return Ok(());
+        }
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
         }
 
+        drop(self.awww_daemon.borrow_mut().take());
+        self.awww_daemon.replace(Some(spawn_awww_daemon()?));
+
+        let ready = wait_for_awww_ready().await;
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
+        }
+        if ready {
+            info!(namespace = AWWW_NAMESPACE, "awww daemon started");
+            Ok(())
+        } else {
+            drop(self.awww_daemon.borrow_mut().take());
+            Err(WallpaperError::Backend(
+                "awww daemon did not become ready in time".into(),
+            ))
+        }
+    }
+
+    fn restore_at_startup(self: &Rc<Self>) -> Result<(), WallpaperError> {
+        if let Some(path) = self.saved_wallpaper()? {
+            self.request_apply_silent(path);
+        }
         Ok(())
     }
 
-    fn create_random_transition(
+    fn restore(self: &Rc<Self>) -> Result<(), WallpaperError> {
+        if self.applying.get() {
+            return Ok(());
+        }
+        if let Some(path) = self.saved_wallpaper()? {
+            self.request_force_apply_silent(path);
+        }
+        Ok(())
+    }
+
+    fn saved_wallpaper(&self) -> Result<Option<PathBuf>, WallpaperError> {
+        if !self.started.get() {
+            return Ok(None);
+        }
+
+        let Some(path) = self.settings.borrow().current.clone() else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            warn!(path = %path.display(), "saved wallpaper no longer exists");
+            return Ok(None);
+        }
+        if !path.is_absolute() || !is_supported_wallpaper(&path) {
+            return Err(WallpaperError::InvalidWallpaper(path));
+        }
+        Ok(Some(path))
+    }
+
+    fn backend_matches(&self, path: &Path) -> bool {
+        match self.backend.borrow().as_ref() {
+            Some(backend @ WallpaperBackend::Image { .. }) => {
+                backend.matches(path)
+                    && self
+                        .awww_daemon
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(OwnedAwwwDaemon::is_alive)
+            }
+            Some(backend @ WallpaperBackend::Video { .. }) => backend.matches(path),
+            None => false,
+        }
+    }
+
+    async fn restore_after_video_failure(
         &self,
-        frame: &Path,
-    ) -> Result<WallpaperTransition, WallpaperError> {
-        let application =
-            self.application.borrow().clone().ok_or_else(|| {
-                WallpaperError::Transition("GTK application is unavailable".into())
-            })?;
-
-        let nonce = self.transition_nonce.get().wrapping_add(1);
-        self.transition_nonce.set(nonce);
-        let kind = choose_transition_kind(self.last_transition.get(), nonce);
-        self.last_transition.set(Some(kind));
-        info!(transition = kind.name(), "selected wallpaper transition");
-
-        WallpaperTransition::new(&application, frame, kind)
-    }
-
-    fn restore_animated_at_startup(self: &Rc<Self>) -> Result<(), WallpaperError> {
-        if !self.started.get() {
-            return Ok(());
-        }
-
-        let Some(path) = self.settings.borrow().current.clone() else {
-            return Ok(());
-        };
-
-        if !path.is_file() {
-            warn!(path = %path.display(), "saved wallpaper no longer exists");
-            return Ok(());
-        }
-
-        if !path.is_absolute() || !is_supported_wallpaper(&path) {
-            return Err(WallpaperError::InvalidWallpaper(path));
-        }
-
-        self.request_apply_silent(path);
-        Ok(())
-    }
-
-    fn restore(&self) -> Result<(), WallpaperError> {
-        if !self.started.get() {
-            return Ok(());
-        }
-
-        let Some(path) = self.settings.borrow().current.clone() else {
-            return Ok(());
-        };
-
-        if !path.is_file() {
-            warn!(path = %path.display(), "saved wallpaper no longer exists");
-            return Ok(());
-        }
-
-        if !path.is_absolute() || !is_supported_wallpaper(&path) {
-            return Err(WallpaperError::InvalidWallpaper(path));
-        }
-
-        let process = spawn_wallpaper_backend(&path)?;
-        let old_process = self.process.replace(Some(process));
-        if let Some(old_process) = old_process {
-            drop(old_process);
-        }
-
-        if is_video_wallpaper(&path) {
-            info!(path = %path.display(), "mpvpaper video wallpaper restored");
-        } else {
-            info!(path = %path.display(), "swaybg image wallpaper restored");
-        }
-        self.broadcast();
-        Ok(())
-    }
-
-    fn stop_owned_process(&self) {
-        let Some(process) = self.process.borrow_mut().take() else {
+        failed_path: &Path,
+        failed_frame: &Path,
+        lifecycle: u64,
+    ) {
+        if !self.lifecycle_is_current(lifecycle) {
             return;
+        }
+        enum RestoreAction {
+            Image(PathBuf),
+            Video,
+            KeepFallback,
+        }
+
+        let action = match self.backend.borrow().as_ref() {
+            Some(WallpaperBackend::Image { frame, .. }) => RestoreAction::Image(frame.clone()),
+            Some(WallpaperBackend::Video { .. }) => RestoreAction::Video,
+            None => RestoreAction::KeepFallback,
         };
-        drop(process);
+        let keep_fallback = matches!(&action, RestoreAction::KeepFallback);
+        let restore_result = match action {
+            RestoreAction::Image(source) => {
+                let result = apply_awww_image(source).await;
+                if result.is_ok() {
+                    wait_awww_transition().await;
+                }
+                result
+            }
+            RestoreAction::Video => make_awww_transparent().await,
+            RestoreAction::KeepFallback => Ok(()),
+        };
+        if !self.lifecycle_is_current(lifecycle) {
+            return;
+        }
+
+        if let Err(error) = restore_result {
+            warn!(%error, "failed to restore previous wallpaper after video backend failure");
+            self.backend.replace(Some(WallpaperBackend::Image {
+                source: failed_path.to_path_buf(),
+                frame: failed_frame.to_path_buf(),
+            }));
+        } else if keep_fallback {
+            self.backend.replace(Some(WallpaperBackend::Image {
+                source: failed_path.to_path_buf(),
+                frame: failed_frame.to_path_buf(),
+            }));
+        }
+    }
+
+    fn stop_wallpaper_backend(&self) {
+        drop(self.backend.borrow_mut().take());
     }
 
     fn subscribe_to_resume(self: &Rc<Self>) {
@@ -939,450 +996,16 @@ impl WallpaperController {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WallpaperTransitionKind {
-    Circle,
-    HorizontalWipe,
-    VerticalWipe,
-    DiagonalWipe,
-    Blinds,
-}
-
-impl WallpaperTransitionKind {
-    const ALL: [Self; 5] = [
-        Self::Circle,
-        Self::HorizontalWipe,
-        Self::VerticalWipe,
-        Self::DiagonalWipe,
-        Self::Blinds,
-    ];
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Circle => "circle",
-            Self::HorizontalWipe => "horizontal-wipe",
-            Self::VerticalWipe => "vertical-wipe",
-            Self::DiagonalWipe => "diagonal-wipe",
-            Self::Blinds => "blinds",
-        }
-    }
-}
-
-struct WallpaperTransition {
-    windows: Vec<gtk::ApplicationWindow>,
-    canvases: Vec<gtk::DrawingArea>,
-    progress: Rc<Cell<f64>>,
-}
-
-impl WallpaperTransition {
-    fn new(
-        application: &gtk::Application,
-        frame: &Path,
-        kind: WallpaperTransitionKind,
-    ) -> Result<Self, WallpaperError> {
-        if !gtk4_layer_shell::is_supported() {
-            return Err(WallpaperError::Transition(
-                "the compositor does not support layer-shell".into(),
-            ));
-        }
-
-        let display = gdk::Display::default()
-            .ok_or_else(|| WallpaperError::Transition("GTK display is unavailable".into()))?;
-        let model = display.monitors();
-        let progress = Rc::new(Cell::new(0.0_f64));
-        let mut windows = Vec::new();
-        let mut canvases = Vec::new();
-
-        for index in 0..model.n_items() {
-            let Some(item) = model.item(index) else {
-                continue;
-            };
-            let Ok(monitor) = item.downcast::<gdk::Monitor>() else {
-                continue;
-            };
-
-            let geometry = monitor.geometry();
-            let width = geometry.width().max(1);
-            let height = geometry.height().max(1);
-            let pixbuf = transition_pixbuf(frame, width, height)?;
-            // Converting a large Pixbuf to Cairo's native surface can otherwise happen
-            // lazily in the first visible draw.  That one-time conversion is expensive
-            // enough to make the first wallpaper transition miss a frame or two.
-            let surface = transition_surface(&pixbuf)?;
-
-            let canvas = gtk::DrawingArea::new();
-            canvas.add_css_class("wallpaper-transition-canvas");
-            canvas.set_hexpand(true);
-            canvas.set_vexpand(true);
-            canvas.set_can_target(false);
-
-            let draw_progress = Rc::clone(&progress);
-            canvas.set_draw_func(move |_, context, draw_width, draw_height| {
-                let reveal = ease_out_cubic(draw_progress.get().clamp(0.0, 1.0));
-                if reveal <= 0.0 {
-                    return;
-                }
-
-                let width = f64::from(draw_width.max(1));
-                let height = f64::from(draw_height.max(1));
-
-                let _ = context.save();
-                apply_transition_clip(context, kind, reveal, width, height);
-                context.clip();
-                let _ = context.set_source_surface(&surface, 0.0, 0.0);
-                let _ = context.paint();
-                let _ = context.restore();
-            });
-
-            let window = gtk::ApplicationWindow::builder().decorated(false).build();
-            window.set_focusable(false);
-            window.add_css_class("wallpaper-transition-window");
-            window.init_layer_shell();
-            window.set_namespace(Some(TRANSITION_NAMESPACE));
-            window.set_layer(Layer::Background);
-            window.set_keyboard_mode(KeyboardMode::None);
-            window.set_monitor(Some(&monitor));
-            window.set_anchor(Edge::Top, true);
-            window.set_anchor(Edge::Bottom, true);
-            window.set_anchor(Edge::Left, true);
-            window.set_anchor(Edge::Right, true);
-            window.set_exclusive_zone(-1);
-            window.set_child(Some(&canvas));
-
-            canvases.push(canvas);
-            windows.push(window);
-        }
-
-        if windows.is_empty() {
-            return Err(WallpaperError::Transition(
-                "no monitors are available".into(),
-            ));
-        }
-
-        for window in &windows {
-            window.set_application(Some(application));
-        }
-
-        Ok(Self {
-            windows,
-            canvases,
-            progress,
-        })
-    }
-
-    fn present(&self) {
-        self.progress.set(0.0);
-        for window in &self.windows {
-            window.set_opacity(1.0);
-            window.present();
-        }
-    }
-
-    async fn animate(&self) {
-        let Some(clock_canvas) = self.canvases.first() else {
-            return;
-        };
-
-        let progress = Rc::clone(&self.progress);
-        let canvases = self
-            .canvases
-            .iter()
-            .map(|canvas| canvas.downgrade())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = async_channel::bounded(1);
-        let completed = Rc::new(Cell::new(false));
-        let timeout_sender = sender.clone();
-        let timeout_completed = Rc::clone(&completed);
-        glib::timeout_add_local_once(TRANSITION_FRAME_CLOCK_TIMEOUT, move || {
-            if !timeout_completed.replace(true) {
-                let _ = timeout_sender.try_send(());
-            }
-        });
-        let warmup_frames = Cell::new(TRANSITION_WARMUP_FRAMES);
-        let started_at = Cell::new(None::<i64>);
-        let tick_completed = Rc::clone(&completed);
-
-        clock_canvas.add_tick_callback(move |_, frame_clock| {
-            if tick_completed.get() {
-                return glib::ControlFlow::Break;
-            }
-
-            let remaining = warmup_frames.get();
-            if remaining > 0 {
-                warmup_frames.set(remaining - 1);
-
-                progress.set(TRANSITION_WARMUP_PROGRESS);
-                for weak_canvas in &canvases {
-                    if let Some(canvas) = weak_canvas.upgrade() {
-                        canvas.queue_draw();
-                    }
-                }
-                return glib::ControlFlow::Continue;
-            }
-
-            let now = frame_clock.frame_time();
-            let started = match started_at.get() {
-                Some(started) => started,
-                None => {
-                    started_at.set(Some(now));
-                    now
-                }
-            };
-            let elapsed = (now - started).max(0) as f64 / 1_000_000.0;
-            let duration = TRANSITION_DURATION.as_secs_f64().max(f64::EPSILON);
-            let next = (elapsed / duration).clamp(0.0, 1.0);
-            progress.set(next);
-
-            for weak_canvas in &canvases {
-                if let Some(canvas) = weak_canvas.upgrade() {
-                    canvas.queue_draw();
-                }
-            }
-
-            if next >= 1.0 {
-                if !tick_completed.replace(true) {
-                    let _ = sender.try_send(());
-                }
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
-        });
-
-        let _ = receiver.recv().await;
-    }
-
-    async fn wait_for_backend_settle(&self) {
-        let (sender, receiver) = async_channel::bounded(1);
-        glib::timeout_add_local_once(TRANSITION_BACKEND_SETTLE_DELAY, move || {
-            let _ = sender.try_send(());
-        });
-        let _ = receiver.recv().await;
-        self.wait_frames(TRANSITION_SETTLE_FRAMES).await;
-    }
-
-    async fn wait_frames(&self, frame_count: u32) {
-        if frame_count == 0 {
-            return;
-        }
-
-        let Some(clock_canvas) = self.canvases.first() else {
-            return;
-        };
-
-        let (sender, receiver) = async_channel::bounded(1);
-        let completed = Rc::new(Cell::new(false));
-        let timeout_sender = sender.clone();
-        let timeout_completed = Rc::clone(&completed);
-        glib::timeout_add_local_once(TRANSITION_FRAME_CLOCK_TIMEOUT, move || {
-            if !timeout_completed.replace(true) {
-                let _ = timeout_sender.try_send(());
-            }
-        });
-        let remaining = Cell::new(frame_count);
-        let tick_completed = Rc::clone(&completed);
-        clock_canvas.add_tick_callback(move |_, _| {
-            if tick_completed.get() {
-                return glib::ControlFlow::Break;
-            }
-
-            let next = remaining.get().saturating_sub(1);
-            remaining.set(next);
-            if next == 0 {
-                if !tick_completed.replace(true) {
-                    let _ = sender.try_send(());
-                }
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
-        });
-
-        let _ = receiver.recv().await;
-    }
-
-    fn close(&self) {
-        for window in &self.windows {
-            detach_application_window(window);
-        }
-    }
-}
-
-impl Drop for WallpaperTransition {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-fn apply_transition_clip(
-    context: &gtk::cairo::Context,
-    kind: WallpaperTransitionKind,
-    reveal: f64,
-    width: f64,
-    height: f64,
-) {
-    match kind {
-        WallpaperTransitionKind::Circle => {
-            let center_x = width / 2.0;
-            let center_y = height / 2.0;
-            let max_radius = center_x.hypot(center_y);
-            context.arc(
-                center_x,
-                center_y,
-                max_radius * reveal,
-                0.0,
-                std::f64::consts::TAU,
-            );
-        }
-        WallpaperTransitionKind::HorizontalWipe => {
-            context.rectangle(0.0, 0.0, width * reveal, height);
-        }
-        WallpaperTransitionKind::VerticalWipe => {
-            context.rectangle(0.0, 0.0, width, height * reveal);
-        }
-        WallpaperTransitionKind::DiagonalWipe => {
-            let extent = width + height;
-            let edge = extent * reveal;
-            context.move_to(-extent, -extent);
-            context.line_to(edge + extent, -extent);
-            context.line_to(-extent, edge + extent);
-            context.close_path();
-        }
-        WallpaperTransitionKind::Blinds => {
-            const STRIP_COUNT: usize = 12;
-            const STAGGER: f64 = 0.38;
-
-            let strip_height = height / STRIP_COUNT as f64;
-            for index in 0..STRIP_COUNT {
-                let delay = index as f64 / (STRIP_COUNT - 1) as f64 * STAGGER;
-                let local = ((reveal - delay) / (1.0 - STAGGER)).clamp(0.0, 1.0);
-                if local <= 0.0 {
-                    continue;
-                }
-
-                let revealed_width = width * local;
-                let x = if index % 2 == 0 {
-                    0.0
-                } else {
-                    width - revealed_width
-                };
-                let y = index as f64 * strip_height;
-                let actual_height = if index + 1 == STRIP_COUNT {
-                    height - y
-                } else {
-                    strip_height + 0.5
-                };
-                context.rectangle(x, y, revealed_width, actual_height);
-            }
-        }
-    }
-}
-
-fn choose_transition_kind(
-    previous: Option<WallpaperTransitionKind>,
-    nonce: u64,
-) -> WallpaperTransitionKind {
-    let time_seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    choose_transition_kind_from_seed(previous, time_seed ^ mix_nonce(nonce))
-}
-
-fn choose_transition_kind_from_seed(
-    previous: Option<WallpaperTransitionKind>,
-    seed: u64,
-) -> WallpaperTransitionKind {
-    let choices = WallpaperTransitionKind::ALL;
-    let mut index = (seed as usize) % choices.len();
-
-    if choices.len() > 1
-        && let Some(previous) = previous
-        && choices[index] == previous
-    {
-        index = (index + 1 + ((seed >> 32) as usize % (choices.len() - 1))) % choices.len();
-    }
-
-    choices[index]
-}
-
-fn mix_nonce(nonce: u64) -> u64 {
-    let mut value = nonce.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
-fn transition_pixbuf(source: &Path, width: i32, height: i32) -> Result<Pixbuf, WallpaperError> {
-    let (_, source_width, source_height) = Pixbuf::file_info(source)
-        .ok_or_else(|| WallpaperError::InvalidWallpaper(source.to_path_buf()))?;
-    if source_width <= 0 || source_height <= 0 || width <= 0 || height <= 0 {
-        return Err(WallpaperError::InvalidWallpaper(source.to_path_buf()));
-    }
-
-    let source_aspect = source_width as f64 / source_height as f64;
-    let target_aspect = width as f64 / height as f64;
-    let (scaled_width, scaled_height) = if source_aspect >= target_aspect {
-        (
-            ((height as f64 * source_aspect).ceil() as i32).max(width),
-            height,
-        )
-    } else {
-        (
-            width,
-            ((width as f64 / source_aspect).ceil() as i32).max(height),
-        )
-    };
-
-    let scaled = Pixbuf::from_file_at_scale(source, scaled_width, scaled_height, false)
-        .map_err(WallpaperError::Glib)?;
-    let crop_x = ((scaled.width() - width) / 2).max(0);
-    let crop_y = ((scaled.height() - height) / 2).max(0);
-    let crop_width = width.min(scaled.width());
-    let crop_height = height.min(scaled.height());
-    let cropped = scaled.new_subpixbuf(crop_x, crop_y, crop_width, crop_height);
-
-    if crop_width == width && crop_height == height {
-        Ok(cropped)
-    } else {
-        cropped
-            .scale_simple(width, height, InterpType::Bilinear)
-            .ok_or_else(|| WallpaperError::Thumbnail(source.to_path_buf()))
-    }
-}
-
-fn transition_surface(pixbuf: &Pixbuf) -> Result<gtk::cairo::ImageSurface, WallpaperError> {
-    let surface = gtk::cairo::ImageSurface::create(
-        gtk::cairo::Format::ARgb32,
-        pixbuf.width(),
-        pixbuf.height(),
-    )
-    .map_err(|error| WallpaperError::Transition(error.to_string()))?;
-    let context = gtk::cairo::Context::new(&surface)
-        .map_err(|error| WallpaperError::Transition(error.to_string()))?;
-    context.set_source_pixbuf(pixbuf, 0.0, 0.0);
-    context
-        .paint()
-        .map_err(|error| WallpaperError::Transition(error.to_string()))?;
-    drop(context);
-    surface.flush();
-    Ok(surface)
-}
-
-fn ease_out_cubic(value: f64) -> f64 {
-    1.0 - (1.0 - value).powi(3)
-}
-
 pub struct WallpaperIndicator {
     button: gtk::Button,
-    _picker: gtk::ApplicationWindow,
+    picker: gtk::ApplicationWindow,
     picker_reveal: PopupReveal,
     focus_armed: Rc<Cell<bool>>,
 }
 
 impl Drop for WallpaperIndicator {
     fn drop(&mut self) {
-        detach_application_window(&self._picker);
+        detach_application_window(&self.picker);
     }
 }
 
@@ -1423,7 +1046,7 @@ impl WallpaperIndicator {
 
         let popup_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         surface.append(&popup_content);
-        let picker_reveal = PopupReveal::masked(surface.clone().upcast::<gtk::Widget>());
+        let picker_reveal = PopupReveal::masked(surface.upcast::<gtk::Widget>());
         picker_root.append(picker_reveal.widget());
         picker.set_child(Some(&picker_root));
 
@@ -1523,7 +1146,7 @@ impl WallpaperIndicator {
 
         Self {
             button,
-            _picker: picker,
+            picker,
             picker_reveal,
             focus_armed,
         }
@@ -1535,7 +1158,7 @@ impl WallpaperIndicator {
 
     pub fn dismiss(&self) {
         self.focus_armed.set(false);
-        self.picker_reveal.hide(&self._picker);
+        self.picker_reveal.hide(&self.picker);
     }
 }
 
@@ -1661,7 +1284,7 @@ fn build_gallery_page(
         list_item.set_selectable(false);
         list_item.set_activatable(false);
 
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, GRID_GAP as i32);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, GRID_GAP);
         row.add_css_class("wallpaper-grid-row");
         row.set_size_request(GALLERY_WIDTH, CARD_HEIGHT);
         row.set_halign(gtk::Align::Start);
@@ -1701,7 +1324,7 @@ fn build_gallery_page(
             }
 
             let has_next_row = list_item.position().saturating_add(1) < model.n_items();
-            row.set_margin_bottom(if has_next_row { GRID_GAP as i32 } else { 0 });
+            row.set_margin_bottom(if has_next_row { GRID_GAP } else { 0 });
         });
     }
 
@@ -1727,7 +1350,7 @@ fn build_gallery_page(
 
     let empty = gtk::Box::new(gtk::Orientation::Vertical, 4);
     empty.add_css_class("wallpaper-empty");
-    empty.set_size_request(GALLERY_WIDTH, CARD_HEIGHT * 2 + GRID_GAP as i32);
+    empty.set_size_request(GALLERY_WIDTH, CARD_HEIGHT * 2 + GRID_GAP);
     empty.set_halign(gtk::Align::Center);
     empty.set_valign(gtk::Align::Center);
 
@@ -1777,6 +1400,7 @@ struct DirectoryPage {
 #[derive(Clone)]
 struct DirectoryBrowser {
     current: Rc<RefCell<PathBuf>>,
+    render_generation: Rc<Generation>,
     list: glib::WeakRef<gtk::Box>,
     path_label: glib::WeakRef<gtk::Label>,
     notice: glib::WeakRef<gtk::Label>,
@@ -1787,6 +1411,7 @@ impl DirectoryBrowser {
         page.path_label.set_label(&initial.to_string_lossy());
         Self {
             current: Rc::new(RefCell::new(initial)),
+            render_generation: Rc::new(Generation::default()),
             list: page.list.downgrade(),
             path_label: page.path_label.downgrade(),
             notice: page.notice.downgrade(),
@@ -1797,12 +1422,8 @@ impl DirectoryBrowser {
         self.current.borrow().clone()
     }
 
-    fn replace_if_changed(&self, path: PathBuf) -> bool {
-        if self.current.borrow().as_path() == path.as_path() {
-            return false;
-        }
+    fn set_path(&self, path: PathBuf) {
         self.current.replace(path);
-        true
     }
 
     fn navigate_to(&self, path: PathBuf) {
@@ -1825,7 +1446,32 @@ impl DirectoryBrowser {
         ) else {
             return;
         };
-        render_directory_browser(self, &list, &path_label, &notice);
+        let generation = self.render_generation.bump();
+        let directory = self.path();
+        clear_box(&list);
+        path_label.set_label(&directory.to_string_lossy());
+        set_optional_label(&notice, Some("Loading folders…"));
+
+        let browser = self.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = run_background_async({
+                let directory = directory.clone();
+                move || list_directories(&directory).map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|| Err("directory scan worker stopped".to_owned()));
+
+            if !browser.render_generation.is_current(generation)
+                || browser.current.borrow().as_path() != directory.as_path()
+            {
+                return;
+            }
+            let (Some(list), Some(notice)) = (browser.list.upgrade(), browser.notice.upgrade())
+            else {
+                return;
+            };
+            render_directory_items(&browser, &list, &notice, result);
+        });
     }
 }
 
@@ -1940,8 +1586,6 @@ fn build_picker_content(
 
     let initial_snapshot = controller.snapshot();
     let browser = DirectoryBrowser::new(initial_snapshot.directory.clone(), &directory_page);
-    let directory_loaded = Rc::new(Cell::new(false));
-
     let rendered = Rc::new(RefCell::new(RenderedGallery {
         directory: initial_snapshot.directory.clone(),
         current: initial_snapshot.current.clone(),
@@ -1984,19 +1628,13 @@ fn build_picker_content(
         let controller = Rc::clone(controller);
         let browser = browser.clone();
         let weak_stack = stack.downgrade();
-        let directory_loaded = Rc::clone(&directory_loaded);
         folder_button.connect_clicked(move |_| {
             let Some(stack) = weak_stack.upgrade() else {
                 return;
             };
 
-            let directory_changed = browser.replace_if_changed(controller.snapshot().directory);
-            if directory_changed {
-                directory_loaded.set(false);
-            }
-            if !directory_loaded.replace(true) {
-                browser.render();
-            }
+            browser.set_path(controller.snapshot().directory);
+            browser.render();
 
             stack.set_visible_child_name("directories");
         });
@@ -2047,7 +1685,6 @@ fn build_picker_content(
 
     {
         let controller = Rc::clone(controller);
-        let gallery_view = gallery_view.clone();
         refresh_button.connect_clicked(move |_| {
             gallery_view.refresh(controller.snapshot(), true);
         });
@@ -2056,24 +1693,20 @@ fn build_picker_content(
     root
 }
 
-fn render_directory_browser(
+fn render_directory_items(
     browser: &DirectoryBrowser,
     directory_list: &gtk::Box,
-    path_label: &gtk::Label,
     notice: &gtk::Label,
+    result: Result<Vec<PathBuf>, String>,
 ) {
     clear_box(directory_list);
-
-    let directory = browser.path();
-    path_label.set_label(&directory.to_string_lossy());
-
-    let directories = match list_directories(&directory) {
+    let directories = match result {
         Ok(directories) => {
             set_optional_label(notice, None);
             directories
         }
         Err(error) => {
-            set_optional_label(notice, Some(&error.to_string()));
+            set_optional_label(notice, Some(&error));
             return;
         }
     };
@@ -2358,7 +1991,7 @@ fn set_live_wallpaper_card_active(
     let overlay = live_wallpaper_cards
         .borrow()
         .get(path)
-        .and_then(|weak| weak.upgrade());
+        .and_then(glib::WeakRef::upgrade);
 
     let Some(overlay) = overlay else {
         return;
@@ -2509,7 +2142,7 @@ fn thumbnail_waiters() -> &'static Mutex<ThumbnailWaiters> {
 fn thumbnail_job_needed(source: &Path) -> bool {
     thumbnail_waiters()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(source)
         .is_some_and(|waiters| waiters.iter().any(|waiter| !waiter.is_closed()))
 }
@@ -2517,7 +2150,7 @@ fn thumbnail_job_needed(source: &Path) -> bool {
 fn finish_thumbnail_job(source: &Path, result: ThumbnailResult) {
     let waiters = thumbnail_waiters()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(source)
         .unwrap_or_default();
     for waiter in waiters {
@@ -2527,6 +2160,7 @@ fn finish_thumbnail_job(source: &Path, result: ThumbnailResult) {
 
 fn thumbnail_worker_queue(
     queue: &'static OnceLock<async_channel::Sender<ThumbnailJob>>,
+    queue_name: &'static str,
     worker_count: usize,
     build: fn(&Path) -> Result<PathBuf, WallpaperError>,
 ) -> &'static async_channel::Sender<ThumbnailJob> {
@@ -2535,7 +2169,7 @@ fn thumbnail_worker_queue(
         for worker_index in 0..worker_count {
             let receiver = receiver.clone();
             let spawn_result = thread::Builder::new()
-                .name(format!("wallpaper-thumb-{worker_index}"))
+                .name(format!("wallpaper-{queue_name}-thumb-{worker_index}"))
                 .spawn(move || {
                     while let Ok(job) = receiver.recv_blocking() {
                         if !thumbnail_job_needed(&job.source) {
@@ -2559,12 +2193,17 @@ fn thumbnail_worker_queue(
 
 fn image_thumbnail_queue() -> &'static async_channel::Sender<ThumbnailJob> {
     static QUEUE: OnceLock<async_channel::Sender<ThumbnailJob>> = OnceLock::new();
-    thumbnail_worker_queue(&QUEUE, IMAGE_THUMBNAIL_WORKERS, cached_thumbnail)
+    thumbnail_worker_queue(&QUEUE, "image", IMAGE_THUMBNAIL_WORKERS, cached_thumbnail)
 }
 
 fn video_thumbnail_queue() -> &'static async_channel::Sender<ThumbnailJob> {
     static QUEUE: OnceLock<async_channel::Sender<ThumbnailJob>> = OnceLock::new();
-    thumbnail_worker_queue(&QUEUE, VIDEO_THUMBNAIL_WORKERS, cached_video_thumbnail)
+    thumbnail_worker_queue(
+        &QUEUE,
+        "video",
+        VIDEO_THUMBNAIL_WORKERS,
+        cached_video_thumbnail,
+    )
 }
 
 fn queue_thumbnail(
@@ -2578,7 +2217,7 @@ fn queue_thumbnail(
     let should_queue = {
         let mut waiters = thumbnail_waiters()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match waiters.entry(source.clone()) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().push(sender);
@@ -2617,7 +2256,7 @@ fn queue_thumbnail(
                 overlay.set_child(Some(&thumbnail_picture(&thumbnail_path)));
             }
             Err(error) => {
-                warn!(thumbnail_kind = kind, %error, "failed to build wallpaper thumbnail")
+                warn!(thumbnail_kind = kind, %error, "failed to build wallpaper thumbnail");
             }
         }
     });
@@ -2833,15 +2472,28 @@ fn cache_fingerprint(source: &Path, version: &str) -> Result<String, WallpaperEr
 }
 
 fn cover_dimensions(source_width: i32, source_height: i32) -> (i32, i32) {
-    let source_aspect = source_width as f64 / source_height as f64;
-    let target_aspect = CARD_WIDTH as f64 / CARD_HEIGHT as f64;
+    if source_width <= 0 || source_height <= 0 {
+        return (CARD_WIDTH, CARD_HEIGHT);
+    }
 
-    if source_aspect >= target_aspect {
-        let width = ((CARD_HEIGHT as f64 * source_aspect).ceil() as i32).max(CARD_WIDTH);
-        (width, CARD_HEIGHT)
+    let source_width = i64::from(source_width);
+    let source_height = i64::from(source_height);
+    let card_width = i64::from(CARD_WIDTH);
+    let card_height = i64::from(CARD_HEIGHT);
+    let ceil_div = |numerator: i64, denominator: i64| {
+        ((numerator + denominator - 1) / denominator).clamp(1, i64::from(i32::MAX)) as i32
+    };
+
+    if source_width * card_height >= card_width * source_height {
+        (
+            ceil_div(card_height * source_width, source_height).max(CARD_WIDTH),
+            CARD_HEIGHT,
+        )
     } else {
-        let height = ((CARD_WIDTH as f64 / source_aspect).ceil() as i32).max(CARD_HEIGHT);
-        (CARD_WIDTH, height)
+        (
+            CARD_WIDTH,
+            ceil_div(card_width * source_height, source_width).max(CARD_HEIGHT),
+        )
     }
 }
 
@@ -3164,7 +2816,9 @@ fn random_menu_button(controller: &Rc<WallpaperController>) -> gtk::MenuButton {
                 return;
             }
 
-            let minutes = spin.value_as_int().max(MIN_RANDOM_INTERVAL_MINUTES as i32) as u32;
+            let minutes = u32::try_from(spin.value_as_int())
+                .unwrap_or(MIN_RANDOM_INTERVAL_MINUTES)
+                .max(MIN_RANDOM_INTERVAL_MINUTES);
             if let Err(error) = controller.set_random_interval_minutes(minutes) {
                 warn!(%error, "failed to save random wallpaper interval");
                 let (_, saved) = controller.random_config();
@@ -3230,12 +2884,14 @@ fn choose_random_wallpaper(
         return Ok(None);
     }
 
-    let time_seed = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+        .unwrap_or_default();
+    let time_seed = now.as_secs() ^ u64::from(now.subsec_nanos()).rotate_left(32);
     let seed = time_seed ^ nonce.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    Ok(items.get((seed as usize) % items.len()).cloned())
+    let item_count = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    let index = usize::try_from(seed % item_count).unwrap_or(0);
+    Ok(items.get(index).cloned())
 }
 
 fn list_wallpapers(directory: &Path) -> Result<Vec<PathBuf>, WallpaperError> {
@@ -3297,18 +2953,11 @@ fn default_wallpaper_directory() -> PathBuf {
         .unwrap_or_else(glib::home_dir)
 }
 
-async fn load_mpvpaper_file(socket: PathBuf, path: PathBuf) -> bool {
-    run_background_async(move || load_mpvpaper_file_blocking(&socket, &path))
-        .await
-        .unwrap_or(false)
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct MpvIpcMessage {
     request_id: Option<u64>,
     error: Option<String>,
     data: Option<serde_json::Value>,
-    event: Option<String>,
 }
 
 fn write_mpv_request(
@@ -3324,101 +2973,11 @@ fn write_mpv_request(
     writer.write_all(b"\n")
 }
 
-#[cfg(unix)]
-fn load_mpvpaper_file_blocking(socket: &Path, path: &Path) -> bool {
-    use std::{io::ErrorKind, os::unix::net::UnixStream};
-
-    let Ok(mut stream) = UnixStream::connect(socket) else {
-        return false;
-    };
-    if stream
-        .set_write_timeout(Some(Duration::from_millis(250)))
-        .is_err()
-    {
-        return false;
-    }
-
-    let command = serde_json::json!(["loadfile", path.to_string_lossy().into_owned(), "replace"]);
-    if write_mpv_request(&mut stream, MPV_REQUEST_LOAD_FILE, command).is_err() {
-        return false;
-    }
-
-    let mut reader = BufReader::new(stream);
-    let started_at = Instant::now();
-    let mut accepted = false;
-    let mut file_loaded = false;
-    let mut playback_restarted = false;
-    let mut unpause_sent = false;
-    let mut unpause_accepted = false;
-
-    loop {
-        let remaining = MPV_IPC_LOAD_TIMEOUT.saturating_sub(started_at.elapsed());
-        if remaining.is_zero() || reader.get_mut().set_read_timeout(Some(remaining)).is_err() {
-            return false;
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let Ok(message) = serde_json::from_str::<MpvIpcMessage>(&line) else {
-                    return false;
-                };
-
-                if message.request_id == Some(MPV_REQUEST_LOAD_FILE) {
-                    if message.error.as_deref() != Some("success") {
-                        return false;
-                    }
-                    accepted = true;
-                }
-
-                if message.request_id == Some(MPV_REQUEST_UNPAUSE) {
-                    if message.error.as_deref() != Some("success") {
-                        return false;
-                    }
-                    unpause_accepted = true;
-                }
-
-                if message.event.as_deref() == Some("file-loaded") {
-                    file_loaded = true;
-                }
-
-                if accepted && file_loaded && !unpause_sent {
-                    let command = serde_json::json!(["set_property", "pause", false]);
-                    if write_mpv_request(reader.get_mut(), MPV_REQUEST_UNPAUSE, command).is_err() {
-                        return false;
-                    }
-                    unpause_sent = true;
-                }
-
-                if accepted && file_loaded && message.event.as_deref() == Some("playback-restart") {
-                    playback_restarted = true;
-                }
-
-                if accepted && file_loaded && unpause_accepted && playback_restarted {
-                    return true;
-                }
-            }
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return false;
-            }
-            Err(_) => return false,
-        }
-    }
-
-    false
-}
-
-#[cfg(not(unix))]
-fn load_mpvpaper_file_blocking(_socket: &Path, _path: &Path) -> bool {
-    false
-}
-
 fn spawn_mpvpaper(path: &Path) -> Result<OwnedMpvpaper, WallpaperError> {
     let program = MPVPAPER.get();
     let output = env::var_os("OBSIDIAN_BAR_MPVPAPER_OUTPUT")
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| OsString::from(DEFAULT_OUTPUT));
+        .unwrap_or_else(|| OsString::from(DEFAULT_MPVPAPER_OUTPUT));
     let base_options = env::var_os("OBSIDIAN_BAR_MPVPAPER_OPTIONS")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsString::from(DEFAULT_MPV_OPTIONS));
@@ -3438,8 +2997,7 @@ fn spawn_mpvpaper(path: &Path) -> Result<OwnedMpvpaper, WallpaperError> {
         path.as_os_str(),
     ];
 
-    let process =
-        gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE).map_err(WallpaperError::Glib)?;
+    let process = ManagedSubprocess::spawn("mpvpaper", &argv)?;
 
     Ok(OwnedMpvpaper {
         process,
@@ -3447,46 +3005,161 @@ fn spawn_mpvpaper(path: &Path) -> Result<OwnedMpvpaper, WallpaperError> {
     })
 }
 
-fn spawn_swaybg(path: &Path) -> Result<OwnedSwaybg, WallpaperError> {
-    let program = SWAYBG.get();
-    let mode = env::var_os("OBSIDIAN_BAR_SWAYBG_MODE")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| OsString::from("fill"));
+fn spawn_awww_daemon() -> Result<OwnedAwwwDaemon, WallpaperError> {
     let argv: [&OsStr; 5] = [
-        program,
-        OsStr::new("-m"),
-        mode.as_os_str(),
-        OsStr::new("-i"),
-        path.as_os_str(),
+        AWWW_DAEMON.get(),
+        OsStr::new("--namespace"),
+        OsStr::new(AWWW_NAMESPACE),
+        OsStr::new("--no-cache"),
+        OsStr::new("--quiet"),
     ];
-
-    let process = gio::Subprocess::newv(&argv, gio::SubprocessFlags::STDERR_SILENCE)
-        .map_err(WallpaperError::Glib)?;
-
-    Ok(OwnedSwaybg { process })
+    let process = ManagedSubprocess::spawn("awww-daemon", &argv)?;
+    Ok(OwnedAwwwDaemon { process })
 }
 
-fn spawn_wallpaper_backend(path: &Path) -> Result<OwnedWallpaperBackend, WallpaperError> {
-    if is_image_wallpaper(path) {
-        return spawn_swaybg(path).map(OwnedWallpaperBackend::Image);
+async fn awww_is_ready() -> bool {
+    run_background_async(awww_is_ready_blocking)
+        .await
+        .unwrap_or(false)
+}
+
+async fn wait_for_awww_ready() -> bool {
+    run_background_async(|| {
+        let started_at = Instant::now();
+        while started_at.elapsed() < AWWW_READY_TIMEOUT {
+            if awww_is_ready_blocking() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn awww_is_ready_blocking() -> bool {
+    command::status(
+        AWWW.get(),
+        &["query", "--namespace", AWWW_NAMESPACE],
+        AWWW_QUERY_TIMEOUT,
+    )
+    .is_ok()
+}
+
+async fn apply_awww_image(path: PathBuf) -> Result<(), WallpaperError> {
+    let mut args = vec![
+        OsString::from("img"),
+        OsString::from("--namespace"),
+        OsString::from(AWWW_NAMESPACE),
+        OsString::from("--transition-type"),
+        OsString::from("random"),
+        OsString::from("--transition-duration"),
+        OsString::from(AWWW_TRANSITION_DURATION.as_secs_f64().to_string()),
+        OsString::from("--transition-fps"),
+        OsString::from(AWWW_TRANSITION_FPS),
+        OsString::from("--transition-step"),
+        OsString::from(AWWW_TRANSITION_STEP),
+    ];
+    append_awww_outputs(&mut args);
+    args.push(path.into_os_string());
+    run_awww_command(args, "img").await
+}
+
+async fn make_awww_transparent() -> Result<(), WallpaperError> {
+    let mut args = vec![
+        OsString::from("clear"),
+        OsString::from("--namespace"),
+        OsString::from(AWWW_NAMESPACE),
+    ];
+    append_awww_outputs(&mut args);
+    args.push(OsString::from(AWWW_TRANSPARENT));
+    run_awww_command(args, "clear").await
+}
+
+fn append_awww_outputs(args: &mut Vec<OsString>) {
+    if let Some(outputs) =
+        env::var_os("OBSIDIAN_BAR_AWWW_OUTPUTS").filter(|value| !value.is_empty())
+    {
+        args.push(OsString::from("--outputs"));
+        args.push(outputs);
     }
-    if is_video_wallpaper(path) {
-        return spawn_mpvpaper(path).map(OwnedWallpaperBackend::Video);
-    }
-    Err(WallpaperError::InvalidWallpaper(path.to_path_buf()))
+}
+
+async fn run_awww_command(
+    args: Vec<OsString>,
+    command_name: &'static str,
+) -> Result<(), WallpaperError> {
+    let result = run_background_async(move || {
+        command::status_inherited(AWWW.get(), &args, AWWW_COMMAND_TIMEOUT).map_err(|error| {
+            match error {
+                command::StatusError::Io(error) => format!("failed to start awww: {error}"),
+                command::StatusError::TimedOut => format!(
+                    "awww {command_name} timed out after {} ms",
+                    AWWW_COMMAND_TIMEOUT.as_millis()
+                ),
+                command::StatusError::Failed => {
+                    format!("awww {command_name} exited unsuccessfully")
+                }
+            }
+        })
+    })
+    .await
+    .ok_or_else(|| WallpaperError::Worker(format!("awww {command_name} was cancelled")))?;
+
+    result.map_err(WallpaperError::Backend)
+}
+
+async fn wait_awww_transition() {
+    let (sender, receiver) = async_channel::bounded(1);
+    glib::timeout_add_local_once(AWWW_TRANSITION_DURATION, move || {
+        let _ = sender.try_send(());
+    });
+    let _ = receiver.recv().await;
 }
 
 fn mpvpaper_ipc_socket_path() -> PathBuf {
-    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR").map_or_else(env::temp_dir, PathBuf::from);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
 
-    runtime_dir.join(format!("obsidian-mpv-{}-{nonce}.sock", std::process::id()))
+    runtime_dir.join(format!(
+        "{MPVPAPER_SOCKET_PREFIX}{}-{nonce}.sock",
+        std::process::id()
+    ))
 }
+
+fn mpvpaper_socket_owner(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix(MPVPAPER_SOCKET_PREFIX)?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_mpvpaper_sockets() {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR").map_or_else(env::temp_dir, PathBuf::from);
+    let Ok(entries) = fs::read_dir(runtime_dir) else {
+        return;
+    };
+
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let Some(owner) = mpvpaper_socket_owner(&path) else {
+            continue;
+        };
+        if !Path::new("/proc").join(owner.to_string()).exists() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cleanup_stale_mpvpaper_sockets() {}
 
 async fn wait_for_mpvpaper_ready(socket: PathBuf) -> bool {
     run_background_async(move || wait_for_mpvpaper_ready_blocking(&socket))
@@ -3557,7 +3230,7 @@ enum WallpaperError {
     Thumbnail(PathBuf),
     Ffmpeg(PathBuf),
     Worker(String),
-    Transition(String),
+    Backend(String),
     AppliedButNotSaved(PathBuf, String),
 }
 
@@ -3580,7 +3253,7 @@ impl fmt::Display for WallpaperError {
                 path.display()
             ),
             Self::Worker(error) => write!(f, "wallpaper worker error: {error}"),
-            Self::Transition(error) => write!(f, "wallpaper transition error: {error}"),
+            Self::Backend(error) => write!(f, "wallpaper backend error: {error}"),
             Self::AppliedButNotSaved(path, error) => write!(
                 f,
                 "wallpaper was applied but could not be saved for the next start ({}): {error}",
@@ -3594,7 +3267,90 @@ impl std::error::Error for WallpaperError {}
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::process::{Command, Stdio};
+
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    const PDEATH_HELPER_FILE: &str = "OBSIDIAN_BAR_PDEATH_HELPER_FILE";
+
+    #[cfg(target_os = "linux")]
+    fn process_exists(pid: i32) -> bool {
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_subprocess_dies_with_parent_helper() {
+        let Some(pid_file) = std::env::var_os(PDEATH_HELPER_FILE).map(PathBuf::from) else {
+            return;
+        };
+        let process =
+            ManagedSubprocess::spawn("pdeath-test", &[OsStr::new("sleep"), OsStr::new("30")])
+                .expect("test subprocess should start");
+        let pid = process
+            .process
+            .identifier()
+            .expect("test subprocess should have a pid");
+        fs::write(pid_file, pid.as_bytes()).expect("child pid should be published");
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_subprocess_dies_when_parent_is_killed() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "obsidian-pdeath-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut helper = Command::new(std::env::current_exe().expect("test binary should exist"))
+            .args([
+                "--exact",
+                "widgets::wallpaper::tests::managed_subprocess_dies_with_parent_helper",
+            ])
+            .env(PDEATH_HELPER_FILE, &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("parent helper should start");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let child_pid = loop {
+            if let Ok(value) = fs::read_to_string(&pid_file)
+                && let Ok(pid) = value.parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "parent helper did not publish its child pid"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let kill_result = unsafe { libc::kill(helper.id().cast_signed(), libc::SIGKILL) };
+        assert_eq!(kill_result, 0, "parent helper should be killable");
+        let _ = helper.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_exists(child_pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if process_exists(child_pid) {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+            panic!("managed subprocess survived its parent");
+        }
+        let _ = fs::remove_file(pid_file);
+    }
 
     #[test]
     fn random_wallpaper_avoids_the_current_item_when_possible() {
@@ -3628,24 +3384,31 @@ mod tests {
     }
 
     #[test]
-    fn transition_selection_reaches_every_kind() {
-        let selected = (0..WallpaperTransitionKind::ALL.len() as u64)
-            .map(|seed| choose_transition_kind_from_seed(None, seed))
-            .collect::<Vec<_>>();
+    fn image_backend_matches_only_its_exact_source() {
+        let backend = WallpaperBackend::Image {
+            source: PathBuf::from("/tmp/current.png"),
+            frame: PathBuf::from("/tmp/current.png"),
+        };
 
-        assert_eq!(selected.as_slice(), &WallpaperTransitionKind::ALL);
+        assert!(backend.matches(Path::new("/tmp/current.png")));
+        assert!(!backend.matches(Path::new("/tmp/other.png")));
+        assert!(!backend.matches(Path::new("/tmp/current.mp4")));
     }
 
     #[test]
-    fn transition_selection_does_not_repeat_the_previous_kind() {
-        for previous in WallpaperTransitionKind::ALL {
-            for seed in 0..128 {
-                assert_ne!(
-                    choose_transition_kind_from_seed(Some(previous), seed),
-                    previous
-                );
-            }
-        }
+    fn mpvpaper_socket_owner_rejects_unrelated_names() {
+        assert_eq!(
+            mpvpaper_socket_owner(Path::new("/run/user/1000/obsidian-mpv-42-99.sock")),
+            Some(42)
+        );
+        assert_eq!(
+            mpvpaper_socket_owner(Path::new("/run/user/1000/mpv-42.sock")),
+            None
+        );
+        assert_eq!(
+            mpvpaper_socket_owner(Path::new("/run/user/1000/obsidian-mpv-nope-99.sock")),
+            None
+        );
     }
 
     #[test]
@@ -3653,29 +3416,29 @@ mod tests {
         assert_eq!(cover_dimensions(1920, 1080), (150, 84));
         assert_eq!(cover_dimensions(1080, 1920), (144, 256));
         assert_eq!(cover_dimensions(144, 84), (144, 84));
+        assert_eq!(cover_dimensions(0, 1080), (144, 84));
+        assert_eq!(cover_dimensions(i32::MAX, 1), (i32::MAX, 84));
     }
 
     #[test]
     fn mpv_request_serialization_preserves_command_arguments() {
         let mut output = Vec::new();
-        let command = serde_json::json!(["loadfile", "/tmp/a file \"quoted\".png", "replace"]);
+        let command = serde_json::json!(["get_property", "vo-configured"]);
 
-        write_mpv_request(&mut output, MPV_REQUEST_LOAD_FILE, command.clone()).unwrap();
+        write_mpv_request(&mut output, MPV_REQUEST_VO_CONFIGURED, command.clone()).unwrap();
 
         let request: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(request["command"], command);
-        assert_eq!(request["request_id"], MPV_REQUEST_LOAD_FILE);
+        assert_eq!(request["request_id"], MPV_REQUEST_VO_CONFIGURED);
     }
 
     #[test]
     fn mpv_response_parser_keeps_structured_fields() {
-        let response: MpvIpcMessage = serde_json::from_str(
-            r#"{"request_id":2,"error":"success","data":"value with spaces"}"#,
-        )
-        .unwrap();
+        let response: MpvIpcMessage =
+            serde_json::from_str(r#"{"request_id":1,"error":"success","data":true}"#).unwrap();
 
-        assert_eq!(response.request_id, Some(MPV_REQUEST_LOAD_FILE));
+        assert_eq!(response.request_id, Some(MPV_REQUEST_VO_CONFIGURED));
         assert_eq!(response.error.as_deref(), Some("success"));
-        assert_eq!(response.data, Some(serde_json::json!("value with spaces")));
+        assert_eq!(response.data, Some(serde_json::Value::Bool(true)));
     }
 }

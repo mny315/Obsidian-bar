@@ -9,6 +9,7 @@ gdk-pixbuf = "0.22"
 async-channel = "2"
 gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
 gtk4-layer-shell = "0.8"
+libc = "0.2"
 niri-ipc = "=26.4.0"
 pipewire = "0.10"
 serde = { version = "1", features = ["derive"] }

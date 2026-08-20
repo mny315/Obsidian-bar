@@ -105,16 +105,6 @@ scale.slider-control.osd-slider {
   min-width: 268px;
 }
 
-window.wallpaper-transition-window,
-window.wallpaper-transition-window.background,
-.wallpaper-transition-canvas {
-  background: transparent;
-  background-color: transparent;
-  background-image: none;
-  box-shadow: none;
-  border: none;
-}
-
 window.bar-window > box.bar-content,
 .bar-content {
   color: @fg;

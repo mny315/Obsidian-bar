@@ -159,7 +159,7 @@ impl App {
             return;
         };
 
-        self.wallpaper.start(application);
+        self.wallpaper.start();
         self.audio_spectrum.start();
         self.ensure_niri_listener();
 
