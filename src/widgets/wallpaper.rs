@@ -29,6 +29,7 @@ use super::{
     bar_features::{BarFeatureController, BarFeatureState},
     clear_box, command, detach_application_window, install_smooth_scroll, run_background,
     run_background_async, set_optional_label, set_spinner_active,
+    system_monitor::SystemMonitorController,
 };
 
 const SETTINGS_GROUP: &str = "wallpaper";
@@ -72,25 +73,24 @@ const MAX_RANDOM_INTERVAL_MINUTES: u32 = 24 * 60;
 const THUMBNAIL_VERSION: &str = "cover-144x84-v2";
 const VIDEO_STILL_VERSION: &str = "video-still-v1";
 const AWWW_NAMESPACE: &str = "obsidian-bar";
+const AWWW_TRANSITION_NAMESPACE: &str = "obsidian-bar-transition";
 const AWWW_LAYER: &str = "background";
 const MPVPAPER_LAYER: &str = "background";
 const AWWW_TRANSITION_DURATION: Duration = Duration::from_millis(1200);
-const AWWW_TRANSITION_SETTLE: Duration = Duration::from_millis(100);
-const AWWW_TRANSITION_FPS: &str = "255";
-const AWWW_TRANSITION_STEP: &str = "90";
+const AWWW_TRANSITION_FPS: &str = "120";
+const AWWW_TRANSITION_STEP: &str = "45";
 const AWWW_TRANSPARENT: &str = "00000000";
+const AWWW_TRANSITIONS: [&str; 7] = ["left", "right", "top", "bottom", "wipe", "wave", "grow"];
 const AWWW_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const AWWW_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const AWWW_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const MANAGED_SUBPROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const REFRESH_ANIMATION_MIN_DURATION: Duration = Duration::from_secs(2);
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
 const RESUME_SUBSCRIPTION_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const RESUME_SUBSCRIPTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const MPVPAPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const MPV_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const MPV_REQUEST_VO_CONFIGURED: u64 = 1;
-const MPV_REQUEST_PAUSE_STATE: u64 = 2;
-const MPV_REQUEST_PAUSE: u64 = 3;
 const MPVPAPER_SOCKET_PREFIX: &str = "obsidian-mpv-";
 const IMAGE_THUMBNAIL_WORKERS: usize = 2;
 const VIDEO_THUMBNAIL_WORKERS: usize = 2;
@@ -109,6 +109,7 @@ const ICON_PLAYER_ENABLED: &str = "󰎇";
 const ICON_PLAYER_DISABLED: &str = "󰎈";
 const ICON_WORKSPACE: &str = "󰕰";
 const ICON_EQUALIZER: &str = "󰺢";
+const ICON_SYSTEM_MONITOR: &str = "\u{f0379}";
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "mov", "m4v", "avi"];
@@ -248,6 +249,7 @@ struct GalleryRenderWidgets<'a> {
 }
 
 struct ManagedSubprocess {
+    name: &'static str,
     process: gio::Subprocess,
     running: Rc<Cell<bool>>,
     stopping: Rc<Cell<bool>>,
@@ -279,6 +281,7 @@ impl ManagedSubprocess {
         });
 
         Ok(Self {
+            name,
             process,
             running,
             stopping,
@@ -288,14 +291,32 @@ impl ManagedSubprocess {
     fn is_running(&self) -> bool {
         self.running.get()
     }
+
+    fn request_stop(&self) {
+        self.stopping.set(true);
+        if self.running.get() {
+            self.process.force_exit();
+        }
+    }
+
+    async fn stop(&self) {
+        self.request_stop();
+        let started_at = Instant::now();
+        while self.running.get() && started_at.elapsed() < MANAGED_SUBPROCESS_STOP_TIMEOUT {
+            wait_local(Duration::from_millis(10)).await;
+        }
+        if self.running.get() {
+            warn!(
+                process = self.name,
+                "wallpaper subprocess did not exit before the stop timeout"
+            );
+        }
+    }
 }
 
 impl Drop for ManagedSubprocess {
     fn drop(&mut self) {
-        self.stopping.set(true);
-        if self.running.replace(false) {
-            self.process.force_exit();
-        }
+        self.request_stop();
     }
 }
 
@@ -322,21 +343,16 @@ impl OwnedMpvpaper {
     fn is_alive(&self) -> bool {
         self.process.is_running()
     }
+
+    async fn stop(&self) {
+        self.process.stop().await;
+    }
 }
 
 impl Drop for OwnedMpvpaper {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.ipc_socket);
     }
-}
-
-struct ActiveVideoBackend {
-    ipc_socket: PathBuf,
-}
-
-struct PausedVideoPlayback {
-    ipc_socket: PathBuf,
-    was_paused: bool,
 }
 
 struct OwnedAwwwDaemon {
@@ -346,6 +362,10 @@ struct OwnedAwwwDaemon {
 impl OwnedAwwwDaemon {
     fn is_alive(&self) -> bool {
         self.process.is_running()
+    }
+
+    async fn stop(&self) {
+        self.process.stop().await;
     }
 }
 
@@ -364,9 +384,9 @@ impl WallpaperBackend {
     fn matches(&self, path: &Path) -> bool {
         match self {
             Self::Image { source, .. } => is_image_wallpaper(path) && source == path,
-            Self::Video { source, process } => {
-                is_video_wallpaper(path) && source == path && process.is_alive()
-            }
+            Self::Video {
+                source, process, ..
+            } => is_video_wallpaper(path) && source == path && process.is_alive(),
         }
     }
 }
@@ -714,22 +734,21 @@ impl WallpaperController {
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
-        let paused_video = if let Some(video) = self.active_video_backend() {
-            let paused = pause_mpvpaper_playback(video).await?;
-            if !self.lifecycle_is_current(lifecycle) {
-                return Ok(());
-            }
-            Some(paused)
+        let transition_daemon = if self.has_active_video_backend() {
+            Some(self.start_awww_transition_daemon(lifecycle).await?)
         } else {
             None
         };
-
-        if let Err(error) = apply_awww_image(awww_frame.clone()).await {
-            if let Some(paused) = paused_video.as_ref() {
-                restore_paused_video_playback(paused).await;
-            }
-            return Err(error);
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
         }
+        let transition_namespace = if transition_daemon.is_some() {
+            AWWW_TRANSITION_NAMESPACE
+        } else {
+            AWWW_NAMESPACE
+        };
+
+        apply_awww_image(awww_frame.clone(), transition_namespace).await?;
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
@@ -738,13 +757,26 @@ impl WallpaperController {
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
+        if transition_daemon.is_some() {
+            apply_awww_image_immediate(awww_frame.clone(), AWWW_NAMESPACE).await?;
+            if !wait_for_awww_image(AWWW_NAMESPACE, awww_frame.clone()).await {
+                return Err(WallpaperError::Backend(
+                    "main awww daemon did not present the synchronized wallpaper in time".into(),
+                ));
+            }
+            if !self.lifecycle_is_current(lifecycle) {
+                return Ok(());
+            }
+            self.stop_active_video_backend().await;
+            if !self.lifecycle_is_current(lifecycle) {
+                return Ok(());
+            }
+        }
+
         if is_video_wallpaper(&path) {
             if let Err(error) = self.start_video_backend(path.clone(), lifecycle).await {
                 self.restore_after_video_failure(&path, &awww_frame, lifecycle)
                     .await;
-                if let Some(paused) = paused_video.as_ref() {
-                    restore_paused_video_playback(paused).await;
-                }
                 return Err(error);
             }
             if !self.lifecycle_is_current(lifecycle) {
@@ -758,17 +790,27 @@ impl WallpaperController {
             info!(path = %path.display(), "awww image wallpaper applied");
         }
 
+        if let Some(daemon) = transition_daemon.as_ref() {
+            daemon.stop().await;
+        }
+        drop(transition_daemon);
         self.set_current_runtime(path)
     }
 
-    fn active_video_backend(&self) -> Option<ActiveVideoBackend> {
-        match self.backend.borrow().as_ref() {
-            Some(WallpaperBackend::Video { process, .. }) if process.is_alive() => {
-                Some(ActiveVideoBackend {
-                    ipc_socket: process.ipc_socket.clone(),
-                })
+    fn has_active_video_backend(&self) -> bool {
+        matches!(
+            self.backend.borrow().as_ref(),
+            Some(WallpaperBackend::Video { process, .. }) if process.is_alive()
+        )
+    }
+
+    async fn stop_active_video_backend(&self) {
+        let backend = self.backend.borrow_mut().take();
+        match backend {
+            Some(WallpaperBackend::Video { process, .. }) => process.stop().await,
+            backend => {
+                self.backend.replace(backend);
             }
-            _ => None,
         }
     }
 
@@ -793,7 +835,7 @@ impl WallpaperController {
                 MPVPAPER_READY_TIMEOUT.as_millis()
             )));
         }
-        make_awww_transparent().await?;
+        make_awww_transparent(AWWW_NAMESPACE).await?;
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
@@ -826,7 +868,7 @@ impl WallpaperController {
         {
             return Ok(());
         }
-        if awww_is_ready().await {
+        if awww_is_ready(AWWW_NAMESPACE).await {
             return Ok(());
         }
         if !self.lifecycle_is_current(lifecycle) {
@@ -834,9 +876,10 @@ impl WallpaperController {
         }
 
         drop(self.awww_daemon.borrow_mut().take());
-        self.awww_daemon.replace(Some(spawn_awww_daemon()?));
+        self.awww_daemon
+            .replace(Some(spawn_awww_daemon(AWWW_NAMESPACE)?));
 
-        let ready = wait_for_awww_ready().await;
+        let ready = wait_for_awww_ready(AWWW_NAMESPACE).await;
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
@@ -849,6 +892,37 @@ impl WallpaperController {
                 "awww daemon did not become ready in time".into(),
             ))
         }
+    }
+
+    async fn start_awww_transition_daemon(
+        &self,
+        lifecycle: u64,
+    ) -> Result<OwnedAwwwDaemon, WallpaperError> {
+        if awww_is_ready(AWWW_TRANSITION_NAMESPACE).await {
+            let _ = stop_awww_daemon(AWWW_TRANSITION_NAMESPACE).await;
+            if !wait_for_awww_stopped(AWWW_TRANSITION_NAMESPACE).await {
+                return Err(WallpaperError::Backend(
+                    "previous awww transition daemon did not stop in time".into(),
+                ));
+            }
+        }
+        if !self.lifecycle_is_current(lifecycle) {
+            return Err(WallpaperError::Worker(
+                "awww video transition was cancelled".into(),
+            ));
+        }
+
+        let daemon = spawn_awww_daemon(AWWW_TRANSITION_NAMESPACE)?;
+        if !wait_for_awww_ready(AWWW_TRANSITION_NAMESPACE).await {
+            return Err(WallpaperError::Backend(
+                "awww transition daemon did not become ready in time".into(),
+            ));
+        }
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(daemon);
+        }
+        make_awww_transparent(AWWW_TRANSITION_NAMESPACE).await?;
+        Ok(daemon)
     }
 
     fn restore_at_startup(self: &Rc<Self>) -> Result<(), WallpaperError> {
@@ -924,13 +998,13 @@ impl WallpaperController {
         let keep_fallback = matches!(&action, RestoreAction::KeepFallback);
         let restore_result = match action {
             RestoreAction::Image(source) => {
-                let result = apply_awww_image(source).await;
+                let result = apply_awww_image(source, AWWW_NAMESPACE).await;
                 if result.is_ok() {
                     wait_awww_transition().await;
                 }
                 result
             }
-            RestoreAction::RevealVideo => make_awww_transparent().await,
+            RestoreAction::RevealVideo => make_awww_transparent(AWWW_NAMESPACE).await,
             RestoreAction::KeepFallback => Ok(()),
         };
         if !self.lifecycle_is_current(lifecycle) {
@@ -1069,6 +1143,7 @@ impl WallpaperIndicator {
         controller: &Rc<WallpaperController>,
         bar_features: &Rc<BarFeatureController>,
         audio_spectrum: &Rc<AudioSpectrumController>,
+        system_monitor: &Rc<SystemMonitorController>,
     ) -> Self {
         let picker = gtk::ApplicationWindow::builder()
             .application(application)
@@ -1106,6 +1181,7 @@ impl WallpaperIndicator {
             controller,
             bar_features,
             audio_spectrum,
+            system_monitor,
         ));
 
         let button = gtk::Button::new();
@@ -1271,6 +1347,7 @@ fn build_gallery_page(
     controller: &Rc<WallpaperController>,
     bar_features: &Rc<BarFeatureController>,
     audio_spectrum: &Rc<AudioSpectrumController>,
+    system_monitor: &Rc<SystemMonitorController>,
 ) -> GalleryPage {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.add_css_class("wallpaper-selector-page");
@@ -1314,7 +1391,7 @@ fn build_gallery_page(
     title_column.append(&title_row);
     title_column.append(&path_actions);
 
-    let feature_actions = bar_feature_actions(bar_features, audio_spectrum);
+    let feature_actions = bar_feature_actions(bar_features, audio_spectrum, system_monitor);
     header.append(&title_column);
     header.append(&feature_actions);
 
@@ -1634,6 +1711,7 @@ fn build_picker_content(
     controller: &Rc<WallpaperController>,
     bar_features: &Rc<BarFeatureController>,
     audio_spectrum: &Rc<AudioSpectrumController>,
+    system_monitor: &Rc<SystemMonitorController>,
 ) -> gtk::Box {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("wallpaper-picker");
@@ -1659,7 +1737,7 @@ fn build_picker_content(
         refresh_button,
         refresh_icon,
         refresh_spinner,
-    } = build_gallery_page(controller, bar_features, audio_spectrum);
+    } = build_gallery_page(controller, bar_features, audio_spectrum, system_monitor);
     let directory_page = build_directory_page();
 
     stack.add_named(&selector_page, Some("wallpapers"));
@@ -2654,12 +2732,14 @@ impl BarFeature {
 fn bar_feature_actions(
     controller: &Rc<BarFeatureController>,
     audio_spectrum: &Rc<AudioSpectrumController>,
+    system_monitor: &Rc<SystemMonitorController>,
 ) -> gtk::Box {
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     actions.add_css_class("wallpaper-header-actions");
     actions.set_halign(gtk::Align::End);
     actions.set_valign(gtk::Align::Start);
 
+    actions.append(&system_monitor_toggle(system_monitor));
     actions.append(&bar_feature_toggle(
         controller,
         BarFeature::Player,
@@ -2676,6 +2756,53 @@ fn bar_feature_actions(
     actions.append(&audio_spectrum_toggle(audio_spectrum));
 
     actions
+}
+
+fn system_monitor_toggle(controller: &Rc<SystemMonitorController>) -> gtk::ToggleButton {
+    let button = gtk::ToggleButton::new();
+    button.add_css_class("wallpaper-refresh-button");
+    button.add_css_class("wallpaper-feature-button");
+    button.set_focus_on_click(false);
+    button.set_tooltip_text(Some("Enable or disable system monitoring"));
+
+    let icon = gtk::Label::new(Some(ICON_SYSTEM_MONITOR));
+    icon.add_css_class("wallpaper-refresh-icon");
+    button.set_child(Some(&icon));
+
+    let syncing = Rc::new(Cell::new(false));
+    button.set_active(controller.enabled());
+    {
+        let weak_button = button.downgrade();
+        let syncing = Rc::clone(&syncing);
+        controller.subscribe_state(move |enabled| {
+            let Some(button) = weak_button.upgrade() else {
+                return false;
+            };
+            syncing.set(true);
+            button.set_active(enabled);
+            syncing.set(false);
+            true
+        });
+    }
+
+    {
+        let controller = Rc::clone(controller);
+        let syncing = Rc::clone(&syncing);
+        button.connect_toggled(move |button| {
+            if syncing.get() {
+                return;
+            }
+            let requested = button.is_active();
+            if controller.set_enabled(requested) {
+                return;
+            }
+            syncing.set(true);
+            button.set_active(controller.enabled());
+            syncing.set(false);
+        });
+    }
+
+    button
 }
 
 fn audio_spectrum_toggle(controller: &Rc<AudioSpectrumController>) -> gtk::ToggleButton {
@@ -3105,101 +3232,6 @@ fn write_mpv_request(
     writer.write_all(b"\n")
 }
 
-async fn pause_mpvpaper_playback(
-    video: ActiveVideoBackend,
-) -> Result<PausedVideoPlayback, WallpaperError> {
-    run_background_async(move || pause_mpvpaper_playback_blocking(video))
-        .await
-        .ok_or_else(|| WallpaperError::Worker("video pause worker stopped".into()))?
-        .map_err(WallpaperError::Backend)
-}
-
-async fn restore_paused_video_playback(paused: &PausedVideoPlayback) {
-    if paused.was_paused {
-        return;
-    }
-
-    let socket = paused.ipc_socket.clone();
-    match run_background_async(move || set_mpv_pause_blocking(&socket, false)).await {
-        Some(Ok(())) => {}
-        Some(Err(error)) => {
-            warn!(%error, "failed to resume previous video after wallpaper transition error");
-        }
-        None => warn!("video resume worker stopped"),
-    }
-}
-
-#[cfg(unix)]
-fn pause_mpvpaper_playback_blocking(
-    video: ActiveVideoBackend,
-) -> Result<PausedVideoPlayback, String> {
-    let pause_state = mpv_ipc_request_blocking(
-        &video.ipc_socket,
-        MPV_REQUEST_PAUSE_STATE,
-        serde_json::json!(["get_property", "pause"]),
-        MPV_IPC_TIMEOUT,
-    )?;
-    ensure_mpv_success(&pause_state, "query pause state")?;
-    let was_paused = pause_state
-        .data
-        .as_ref()
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| "mpv returned an invalid pause state".to_owned())?;
-
-    if !was_paused {
-        set_mpv_pause_blocking(&video.ipc_socket, true)?;
-    }
-
-    Ok(PausedVideoPlayback {
-        ipc_socket: video.ipc_socket,
-        was_paused,
-    })
-}
-
-#[cfg(not(unix))]
-fn pause_mpvpaper_playback_blocking(
-    _video: ActiveVideoBackend,
-) -> Result<PausedVideoPlayback, String> {
-    Err("pausing mpvpaper playback requires Unix IPC".to_owned())
-}
-
-#[cfg(unix)]
-fn set_mpv_pause_blocking(socket: &Path, paused: bool) -> Result<(), String> {
-    let response = mpv_ipc_request_blocking(
-        socket,
-        MPV_REQUEST_PAUSE,
-        serde_json::json!(["set_property", "pause", paused]),
-        MPV_IPC_TIMEOUT,
-    )?;
-    ensure_mpv_success(
-        &response,
-        if paused {
-            "pause video"
-        } else {
-            "resume video"
-        },
-    )
-}
-
-#[cfg(not(unix))]
-fn set_mpv_pause_blocking(_socket: &Path, _paused: bool) -> Result<(), String> {
-    Err("controlling mpvpaper playback requires Unix IPC".to_owned())
-}
-
-fn ensure_mpv_success(response: &MpvIpcMessage, operation: &str) -> Result<(), String> {
-    if response.error.as_deref() == Some("success") {
-        Ok(())
-    } else {
-        Err(format!(
-            "mpv failed to {operation}: {}",
-            response
-                .error
-                .as_deref()
-                .unwrap_or("missing response status")
-        ))
-    }
-}
-
 #[cfg(unix)]
 fn mpv_ipc_request_blocking(
     socket: &Path,
@@ -3288,17 +3320,17 @@ fn mpvpaper_argv<'a>(
     ]
 }
 
-fn spawn_awww_daemon() -> Result<OwnedAwwwDaemon, WallpaperError> {
-    let argv = awww_daemon_argv(AWWW_DAEMON.get());
+fn spawn_awww_daemon(namespace: &'static str) -> Result<OwnedAwwwDaemon, WallpaperError> {
+    let argv = awww_daemon_argv(AWWW_DAEMON.get(), OsStr::new(namespace));
     let process = ManagedSubprocess::spawn("awww-daemon", &argv)?;
     Ok(OwnedAwwwDaemon { process })
 }
 
-fn awww_daemon_argv(program: &OsStr) -> [&OsStr; 7] {
+fn awww_daemon_argv<'a>(program: &'a OsStr, namespace: &'a OsStr) -> [&'a OsStr; 7] {
     [
         program,
         OsStr::new("--namespace"),
-        OsStr::new(AWWW_NAMESPACE),
+        namespace,
         OsStr::new("--layer"),
         OsStr::new(AWWW_LAYER),
         OsStr::new("--no-cache"),
@@ -3306,17 +3338,17 @@ fn awww_daemon_argv(program: &OsStr) -> [&OsStr; 7] {
     ]
 }
 
-async fn awww_is_ready() -> bool {
-    run_background_async(awww_is_ready_blocking)
+async fn awww_is_ready(namespace: &'static str) -> bool {
+    run_background_async(move || awww_is_ready_blocking(namespace))
         .await
         .unwrap_or(false)
 }
 
-async fn wait_for_awww_ready() -> bool {
-    run_background_async(|| {
+async fn wait_for_awww_ready(namespace: &'static str) -> bool {
+    run_background_async(move || {
         let started_at = Instant::now();
         while started_at.elapsed() < AWWW_READY_TIMEOUT {
-            if awww_is_ready_blocking() {
+            if awww_is_ready_blocking(namespace) {
                 return true;
             }
             thread::sleep(Duration::from_millis(20));
@@ -3327,21 +3359,79 @@ async fn wait_for_awww_ready() -> bool {
     .unwrap_or(false)
 }
 
-fn awww_is_ready_blocking() -> bool {
+async fn wait_for_awww_stopped(namespace: &'static str) -> bool {
+    run_background_async(move || {
+        let started_at = Instant::now();
+        while started_at.elapsed() < AWWW_READY_TIMEOUT {
+            if !awww_is_ready_blocking(namespace) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn wait_for_awww_image(namespace: &'static str, path: PathBuf) -> bool {
+    run_background_async(move || {
+        let started_at = Instant::now();
+        while started_at.elapsed() < AWWW_READY_TIMEOUT {
+            if awww_displays_image_blocking(namespace, &path) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn awww_is_ready_blocking(namespace: &str) -> bool {
     command::status(
         AWWW.get(),
-        &["query", "--namespace", AWWW_NAMESPACE],
+        &["query", "--namespace", namespace],
         AWWW_QUERY_TIMEOUT,
     )
     .is_ok()
 }
 
-async fn apply_awww_image(path: PathBuf) -> Result<(), WallpaperError> {
+fn awww_displays_image_blocking(namespace: &str, path: &Path) -> bool {
+    let Ok(output) = command::output(
+        AWWW.get(),
+        &["query", "--namespace", namespace],
+        AWWW_QUERY_TIMEOUT,
+    ) else {
+        return false;
+    };
+    awww_query_displays_image(&output, path)
+}
+
+fn awww_query_displays_image(output: &str, path: &Path) -> bool {
+    const IMAGE_MARKER: &str = "currently displaying: image: ";
+
+    let expected = path.to_string_lossy();
+    let mut found_output = false;
+    for line in output.lines() {
+        let Some((_, displayed)) = line.split_once(IMAGE_MARKER) else {
+            continue;
+        };
+        found_output = true;
+        if displayed.trim() != expected {
+            return false;
+        }
+    }
+    found_output
+}
+
+async fn apply_awww_image(path: PathBuf, namespace: &'static str) -> Result<(), WallpaperError> {
     let transition = next_awww_transition();
     let mut args = vec![
         OsString::from("img"),
         OsString::from("--namespace"),
-        OsString::from(AWWW_NAMESPACE),
+        OsString::from(namespace),
         OsString::from("--transition-type"),
         OsString::from(transition),
         OsString::from("--transition-duration"),
@@ -3350,6 +3440,24 @@ async fn apply_awww_image(path: PathBuf) -> Result<(), WallpaperError> {
         OsString::from(AWWW_TRANSITION_FPS),
         OsString::from("--transition-step"),
         OsString::from(AWWW_TRANSITION_STEP),
+    ];
+    append_awww_outputs(&mut args);
+    args.push(path.into_os_string());
+    run_awww_command(args, "img").await
+}
+
+async fn apply_awww_image_immediate(
+    path: PathBuf,
+    namespace: &'static str,
+) -> Result<(), WallpaperError> {
+    let mut args = vec![
+        OsString::from("img"),
+        OsString::from("--namespace"),
+        OsString::from(namespace),
+        OsString::from("--transition-type"),
+        OsString::from("simple"),
+        OsString::from("--transition-step"),
+        OsString::from("255"),
     ];
     append_awww_outputs(&mut args);
     args.push(path.into_os_string());
@@ -3370,22 +3478,30 @@ fn next_awww_transition() -> &'static str {
 }
 
 fn awww_transition_for_seed(seed: u64) -> &'static str {
-    match seed % 3 {
-        0 => "wave",
-        1 => "grow",
-        _ => "outer",
-    }
+    AWWW_TRANSITIONS[(seed % AWWW_TRANSITIONS.len() as u64) as usize]
 }
 
-async fn make_awww_transparent() -> Result<(), WallpaperError> {
+async fn make_awww_transparent(namespace: &'static str) -> Result<(), WallpaperError> {
     let mut args = vec![
         OsString::from("clear"),
         OsString::from("--namespace"),
-        OsString::from(AWWW_NAMESPACE),
+        OsString::from(namespace),
     ];
     append_awww_outputs(&mut args);
     args.push(OsString::from(AWWW_TRANSPARENT));
     run_awww_command(args, "clear").await
+}
+
+async fn stop_awww_daemon(namespace: &'static str) -> Result<(), WallpaperError> {
+    run_awww_command(
+        vec![
+            OsString::from("kill"),
+            OsString::from("--namespace"),
+            OsString::from(namespace),
+        ],
+        "kill",
+    )
+    .await
 }
 
 fn append_awww_outputs(args: &mut Vec<OsString>) {
@@ -3422,7 +3538,7 @@ async fn run_awww_command(
 }
 
 async fn wait_awww_transition() {
-    wait_local(AWWW_TRANSITION_DURATION.saturating_add(AWWW_TRANSITION_SETTLE)).await;
+    wait_local(AWWW_TRANSITION_DURATION).await;
 }
 
 async fn wait_local(duration: Duration) {
@@ -3673,13 +3789,48 @@ mod tests {
     }
 
     #[test]
-    fn random_transition_pool_contains_only_visible_effects() {
-        for seed in 0..12 {
-            assert!(matches!(
-                awww_transition_for_seed(seed),
-                "wave" | "grow" | "outer"
-            ));
-        }
+    fn random_transition_pool_is_varied_without_circle_bias() {
+        let transitions = (0..AWWW_TRANSITIONS.len() as u64)
+            .map(awww_transition_for_seed)
+            .collect::<Vec<_>>();
+
+        assert_eq!(transitions.as_slice(), AWWW_TRANSITIONS.as_slice());
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| !matches!(*transition, "none" | "simple" | "fade"))
+        );
+        assert_eq!(
+            transitions
+                .into_iter()
+                .filter(|transition| matches!(*transition, "grow" | "outer"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn awww_query_requires_every_output_to_show_the_synchronized_image() {
+        let target = Path::new("/tmp/new wallpaper.jpg");
+        let synchronized = concat!(
+            "obsidian-bar: DP-1: 1920x1080, scale: 1, currently displaying: image: ",
+            "/tmp/new wallpaper.jpg\n",
+            "obsidian-bar: HDMI-A-1: 2560x1440, scale: 1, currently displaying: image: ",
+            "/tmp/new wallpaper.jpg\n",
+        );
+        let stale = concat!(
+            "obsidian-bar: DP-1: 1920x1080, scale: 1, currently displaying: image: ",
+            "/tmp/new wallpaper.jpg\n",
+            "obsidian-bar: HDMI-A-1: 2560x1440, scale: 1, currently displaying: image: ",
+            "/tmp/old.jpg\n",
+        );
+
+        assert!(awww_query_displays_image(synchronized, target));
+        assert!(!awww_query_displays_image(stale, target));
+        assert!(!awww_query_displays_image(
+            "obsidian-bar: no outputs",
+            target
+        ));
     }
 
     #[test]
@@ -3689,7 +3840,11 @@ mod tests {
                 .any(|pair| pair[0] == OsStr::new(flag) && pair[1] == OsStr::new(value))
         }
 
-        let awww = awww_daemon_argv(OsStr::new("awww-daemon"));
+        let awww = awww_daemon_argv(OsStr::new("awww-daemon"), OsStr::new(AWWW_NAMESPACE));
+        let transition_awww = awww_daemon_argv(
+            OsStr::new("awww-daemon"),
+            OsStr::new(AWWW_TRANSITION_NAMESPACE),
+        );
         let mpvpaper = mpvpaper_argv(
             OsStr::new("mpvpaper"),
             OsStr::new("options"),
@@ -3698,6 +3853,12 @@ mod tests {
         );
 
         assert!(contains_pair(&awww, "--layer", "background"));
+        assert!(contains_pair(&transition_awww, "--layer", "background"));
+        assert!(contains_pair(
+            &transition_awww,
+            "--namespace",
+            AWWW_TRANSITION_NAMESPACE
+        ));
         assert!(contains_pair(&mpvpaper, "--layer", "background"));
     }
 
@@ -3758,83 +3919,5 @@ mod tests {
         assert_eq!(response.request_id, Some(MPV_REQUEST_VO_CONFIGURED));
         assert_eq!(response.error.as_deref(), Some("success"));
         assert_eq!(response.data, Some(serde_json::Value::Bool(true)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pauses_the_current_mpv_frame_before_a_video_transition() {
-        use std::os::unix::net::UnixListener;
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let base = env::temp_dir().join(format!(
-            "obsidian-mpv-pause-test-{}-{nonce}",
-            std::process::id()
-        ));
-        let socket = base.with_extension("sock");
-        let _ = fs::remove_file(&socket);
-
-        let listener = UnixListener::bind(&socket).expect("test mpv socket should bind");
-        let server = thread::spawn(move || {
-            for step in 0..2 {
-                let (stream, _) = listener.accept().expect("test mpv client should connect");
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                reader
-                    .read_line(&mut line)
-                    .expect("test mpv request should be readable");
-                let request: serde_json::Value =
-                    serde_json::from_str(&line).expect("test mpv request should be valid JSON");
-
-                match step {
-                    0 => {
-                        assert_eq!(request["request_id"], MPV_REQUEST_PAUSE_STATE);
-                        assert_eq!(
-                            request["command"],
-                            serde_json::json!(["get_property", "pause"])
-                        );
-                    }
-                    1 => {
-                        assert_eq!(request["request_id"], MPV_REQUEST_PAUSE);
-                        assert_eq!(
-                            request["command"],
-                            serde_json::json!(["set_property", "pause", true])
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-
-                let response = if step == 0 {
-                    serde_json::json!({
-                        "request_id": request["request_id"],
-                        "error": "success",
-                        "data": false,
-                    })
-                } else {
-                    serde_json::json!({
-                        "request_id": request["request_id"],
-                        "error": "success",
-                    })
-                };
-                serde_json::to_writer(reader.get_mut(), &response)
-                    .expect("test mpv response should serialize");
-                reader
-                    .get_mut()
-                    .write_all(b"\n")
-                    .expect("test mpv response should be written");
-            }
-        });
-
-        let paused = pause_mpvpaper_playback_blocking(ActiveVideoBackend {
-            ipc_socket: socket.clone(),
-        })
-        .expect("current video frame should be paused");
-
-        server.join().expect("test mpv server should finish");
-        assert_eq!(paused.ipc_socket, socket);
-        assert!(!paused.was_paused);
-        let _ = fs::remove_file(socket);
     }
 }

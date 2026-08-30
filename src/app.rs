@@ -18,6 +18,7 @@ use crate::{
         launcher::LauncherCatalog,
         osd::OsdController,
         player::PlayerController,
+        system_monitor::{SystemMonitorController, SystemMonitorView},
         tray::TrayController,
         wallpaper::WallpaperController,
     },
@@ -43,6 +44,9 @@ pub struct App {
     bar_features: Rc<BarFeatureController>,
     audio_spectrum: Rc<AudioSpectrumController>,
     audio_spectrum_view: RefCell<Option<AudioSpectrumView>>,
+    system_monitor: Rc<SystemMonitorController>,
+    system_monitor_view: RefCell<Option<SystemMonitorView>>,
+    system_monitor_sync_pending: Cell<bool>,
     player: PlayerController,
     tray: TrayController,
     launcher_catalog: Rc<LauncherCatalog>,
@@ -71,6 +75,9 @@ impl App {
             bar_features: BarFeatureController::new(),
             audio_spectrum: AudioSpectrumController::new(),
             audio_spectrum_view: RefCell::new(None),
+            system_monitor: SystemMonitorController::new(),
+            system_monitor_view: RefCell::new(None),
+            system_monitor_sync_pending: Cell::new(false),
             player: PlayerController::new(),
             tray: TrayController::new(),
             launcher_catalog: LauncherCatalog::new(),
@@ -141,6 +148,27 @@ impl App {
         });
 
         let weak_self = Rc::downgrade(self);
+        self.system_monitor.subscribe_state(move |_| {
+            let Some(this) = weak_self.upgrade() else {
+                return false;
+            };
+            if this.system_monitor_sync_pending.replace(true) {
+                return true;
+            }
+            let weak_self = Rc::downgrade(&this);
+            glib::idle_add_local_once(move || {
+                let Some(this) = weak_self.upgrade() else {
+                    return;
+                };
+                this.system_monitor_sync_pending.set(false);
+                if !this.shutting_down.get() {
+                    this.sync_system_monitor_view();
+                }
+            });
+            true
+        });
+
+        let weak_self = Rc::downgrade(self);
         self.application.connect_shutdown(move |_| {
             if let Some(this) = weak_self.upgrade() {
                 this.shutdown();
@@ -161,6 +189,7 @@ impl App {
 
         self.wallpaper.start();
         self.audio_spectrum.start();
+        self.system_monitor.start();
         self.ensure_niri_listener();
 
         if self.monitor_model.borrow().is_none() {
@@ -211,6 +240,38 @@ impl App {
             &self.application,
             &monitor,
             &self.audio_spectrum,
+        ));
+    }
+
+    fn sync_system_monitor_view(&self) {
+        let monitor = self
+            .monitor_model
+            .borrow()
+            .as_ref()
+            .and_then(|model| model.item(0))
+            .and_then(|item| item.downcast::<gdk::Monitor>().ok());
+
+        let mut view = self.system_monitor_view.borrow_mut();
+        if !self.system_monitor.enabled() {
+            drop(view.take());
+            return;
+        }
+        let Some(monitor) = monitor else {
+            drop(view.take());
+            return;
+        };
+        if view
+            .as_ref()
+            .is_some_and(|current| current.monitor() == &monitor)
+        {
+            return;
+        }
+
+        drop(view.take());
+        *view = Some(SystemMonitorView::new(
+            &self.application,
+            &monitor,
+            &self.system_monitor,
         ));
     }
 
@@ -309,6 +370,7 @@ impl App {
                             bluetooth_agent: &self.bluetooth_agent,
                             bar_features: &self.bar_features,
                             audio_spectrum: &self.audio_spectrum,
+                            system_monitor: &self.system_monitor,
                             launcher_catalog: &self.launcher_catalog,
                             player_controller: &self.player,
                             tray_controller: &self.tray,
@@ -334,6 +396,7 @@ impl App {
         }
 
         self.sync_audio_spectrum_view();
+        self.sync_system_monitor_view();
 
         if monitors.is_empty() {
             warn!("no monitors are currently available; waiting for hotplug");
@@ -379,10 +442,13 @@ impl App {
         }
         self.fullscreen_sync_generation
             .set(self.fullscreen_sync_generation.get().wrapping_add(1));
+        self.system_monitor_sync_pending.set(false);
 
         self.wallpaper.shutdown();
         drop(self.audio_spectrum_view.borrow_mut().take());
         self.audio_spectrum.shutdown();
+        drop(self.system_monitor_view.borrow_mut().take());
+        self.system_monitor.shutdown();
         if let Some(osd) = self.osd.borrow_mut().take() {
             osd.shutdown();
         }

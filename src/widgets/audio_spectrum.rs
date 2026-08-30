@@ -24,7 +24,7 @@ const SETTINGS_GROUP: &str = "visualizer";
 const SETTINGS_FILE: &str = "audio-spectrum.ini";
 const NAMESPACE: &str = "desktop-audio-thread";
 
-const SPECTRUM_BANDS: usize = 72;
+const SPECTRUM_BANDS: usize = 144;
 const FFT_SIZE: usize = 2048;
 const ANALYZER_FPS: usize = 48;
 const RENDER_FPS: usize = 60;
@@ -36,9 +36,22 @@ const MAX_FREQUENCY_HZ: f32 = 16_000.0;
 const SILENCE_RMS: f32 = 0.000_35;
 const SPECTRUM_NOISE_FLOOR: f32 = 0.000_012;
 const MIN_AUTO_PEAK: f32 = 0.002_5;
-const LEVEL_ATTACK: f32 = 0.26;
-const LEVEL_RELEASE: f32 = 0.13;
+const LEVEL_ATTACK: f32 = 0.18;
+const LEVEL_RELEASE: f32 = 0.075;
 const LEVEL_EPSILON: f32 = 0.003;
+const TARGET_TILE_SPACING: f64 = 4.0;
+const MIN_RENDER_TILES: usize = 256;
+const MAX_RENDER_TILES: usize = 768;
+const TILE_WIDTH_RATIO: f64 = 0.62;
+const TILE_HEIGHT_RATIO: f64 = 0.48;
+const TILE_MIN_WIDTH: f64 = 1.5;
+const TILE_MAX_WIDTH: f64 = 5.0;
+const TILE_MIN_HEIGHT: f64 = 1.5;
+const TILE_MAX_HEIGHT: f64 = 3.5;
+const TILE_BOTTOM_MARGIN: f64 = 2.0;
+const TILE_TRAVEL_FRACTION: f64 = 0.88;
+const TILE_IDLE_OPACITY: f64 = 0.32;
+const TILE_ACTIVE_OPACITY: f64 = 0.88;
 const MIN_WINDOW_HEIGHT: i32 = 120;
 const WINDOW_HEIGHT_FRACTION: f64 = 0.20;
 
@@ -281,7 +294,7 @@ impl AudioSpectrumView {
         {
             let render_state = Rc::clone(&render_state);
             area.set_draw_func(move |area, context, width, height| {
-                draw_spectrum(area, context, width, height, &mut render_state.borrow_mut());
+                draw_spectrum(area, context, width, height, &render_state.borrow());
             });
         }
         window.set_child(Some(&area));
@@ -330,8 +343,6 @@ impl Drop for AudioSpectrumView {
 struct RenderState {
     target: [f32; SPECTRUM_BANDS],
     current: [f32; SPECTRUM_BANDS],
-    smoothed: [f32; SPECTRUM_BANDS],
-    curve_y: [f64; SPECTRUM_BANDS],
 }
 
 impl Default for RenderState {
@@ -339,8 +350,6 @@ impl Default for RenderState {
         Self {
             target: [0.0; SPECTRUM_BANDS],
             current: [0.0; SPECTRUM_BANDS],
-            smoothed: [0.0; SPECTRUM_BANDS],
-            curve_y: [0.0; SPECTRUM_BANDS],
         }
     }
 }
@@ -349,8 +358,6 @@ impl RenderState {
     fn reset(&mut self) {
         self.target.fill(0.0);
         self.current.fill(0.0);
-        self.smoothed.fill(0.0);
-        self.curve_y.fill(0.0);
     }
 
     fn step(&mut self) -> bool {
@@ -374,21 +381,6 @@ impl RenderState {
             self.reset();
         }
         active
-    }
-
-    fn update_curve(&mut self, height: f64) {
-        for index in 0..SPECTRUM_BANDS {
-            let value = self.current[index];
-            let previous = self.current[index.saturating_sub(1)];
-            let next = self.current[(index + 1).min(SPECTRUM_BANDS - 1)];
-            self.smoothed[index] = previous * 0.12 + value * 0.76 + next * 0.12;
-        }
-
-        let baseline = height - 1.0;
-        let amplitude = height * 0.88;
-        for (y, level) in self.curve_y.iter_mut().zip(self.smoothed) {
-            *y = baseline - f64::from(level.clamp(0.0, 1.0)) * amplitude;
-        }
     }
 }
 
@@ -428,7 +420,7 @@ fn draw_spectrum(
     context: &gtk::cairo::Context,
     width: i32,
     height: i32,
-    state: &mut RenderState,
+    state: &RenderState,
 ) {
     if width <= 2 || height <= 2 {
         return;
@@ -436,58 +428,65 @@ fn draw_spectrum(
 
     let width = f64::from(width);
     let height = f64::from(height);
-    state.update_curve(height);
-    if state
-        .current
-        .into_iter()
-        .all(|level| level <= LEVEL_EPSILON)
-    {
-        return;
-    }
+    let active = state.current.into_iter().any(|level| level > LEVEL_EPSILON);
     let color = area.color();
+    let tile_count =
+        ((width / TARGET_TILE_SPACING).round() as usize).clamp(MIN_RENDER_TILES, MAX_RENDER_TILES);
+    let slot_width = width / tile_count as f64;
+    let tile_width = (slot_width * TILE_WIDTH_RATIO).clamp(TILE_MIN_WIDTH, TILE_MAX_WIDTH);
+    let tile_height = (tile_width * TILE_HEIGHT_RATIO).clamp(TILE_MIN_HEIGHT, TILE_MAX_HEIGHT);
+    let baseline = (height - tile_height - TILE_BOTTOM_MARGIN).max(0.0);
+    let travel = (height * TILE_TRAVEL_FRACTION - tile_height).max(0.0);
 
     let _ = context.save();
-    context.set_line_join(gtk::cairo::LineJoin::Round);
-    context.set_line_cap(gtk::cairo::LineCap::Round);
-
-    append_curve(context, width, &state.curve_y);
     context.set_source_rgba(
         f64::from(color.red()),
         f64::from(color.green()),
         f64::from(color.blue()),
-        f64::from(color.alpha()) * 0.86,
+        f64::from(color.alpha())
+            * if active {
+                TILE_ACTIVE_OPACITY
+            } else {
+                TILE_IDLE_OPACITY
+            },
     );
-    context.set_line_width(2.1);
-    let _ = context.stroke();
+    for index in 0..tile_count {
+        let spectrum_position = mirrored_spectrum_position(index, tile_count);
+        let level = smoothed_spectrum_level(&state.current, spectrum_position);
+        let center_x = (index as f64 + 0.5) * slot_width;
+        let x = center_x - tile_width * 0.5;
+        let y = baseline - f64::from(level.clamp(0.0, 1.0)) * travel;
+        context.rectangle(x, y, tile_width, tile_height);
+    }
+    let _ = context.fill();
     let _ = context.restore();
 }
 
-fn append_curve(context: &gtk::cairo::Context, width: f64, y: &[f64; SPECTRUM_BANDS]) {
-    let x_step = width / (SPECTRUM_BANDS - 1) as f64;
-    context.move_to(0.0, y[0]);
+fn mirrored_spectrum_position(tile: usize, tile_count: usize) -> f32 {
+    let normalized = (tile as f32 + 0.5) / tile_count.max(1) as f32;
+    (normalized - 0.5).abs() * 2.0 * (SPECTRUM_BANDS - 1) as f32
+}
 
-    for index in 0..SPECTRUM_BANDS - 1 {
-        let p0 = index.saturating_sub(1);
-        let p1 = index;
-        let p2 = index + 1;
-        let p3 = (index + 2).min(SPECTRUM_BANDS - 1);
+fn smoothed_spectrum_level(levels: &[f32; SPECTRUM_BANDS], position: f32) -> f32 {
+    const SAMPLES: [(f32, f32); 5] = [
+        (-2.0, 0.0625),
+        (-1.0, 0.25),
+        (0.0, 0.375),
+        (1.0, 0.25),
+        (2.0, 0.0625),
+    ];
 
-        let p1x = index as f64 * x_step;
-        let p2x = (index + 1) as f64 * x_step;
-        let control_1_x = p1x + (p2x - p0 as f64 * x_step) / 6.0;
-        let control_1_y = y[p1] + (y[p2] - y[p0]) / 6.0;
-        let control_2_x = p2x - (p3 as f64 * x_step - p1x) / 6.0;
-        let control_2_y = y[p2] - (y[p3] - y[p1]) / 6.0;
+    SAMPLES
+        .into_iter()
+        .map(|(offset, weight)| interpolated_spectrum_level(levels, position + offset) * weight)
+        .sum()
+}
 
-        context.curve_to(
-            control_1_x,
-            control_1_y,
-            control_2_x,
-            control_2_y,
-            p2x,
-            y[p2],
-        );
-    }
+fn interpolated_spectrum_level(levels: &[f32; SPECTRUM_BANDS], position: f32) -> f32 {
+    let position = position.clamp(0.0, (SPECTRUM_BANDS - 1) as f32);
+    let lower = position.floor() as usize;
+    let upper = (lower + 1).min(SPECTRUM_BANDS - 1);
+    levels[lower] + (levels[upper] - levels[lower]) * position.fract()
 }
 
 struct SpectrumWorker {
@@ -797,7 +796,7 @@ impl SpectrumAnalyzer {
             let end = ((high * FFT_SIZE as f32 / sample_rate as f32).ceil() as usize)
                 .clamp(start + 1, FFT_SIZE / 2);
             let position = index as f32 / (SPECTRUM_BANDS - 1) as f32;
-            let weight = 1.04 - position * 0.08;
+            let weight = 0.92 + position * 0.88;
             *band = BandRange { start, end, weight };
         }
     }
@@ -938,5 +937,20 @@ mod tests {
         let frame = frame.expect("analyzer should emit a spectrum frame");
         let peak = frame.levels.into_iter().fold(0.0_f32, f32::max);
         assert!(peak > 0.5, "unexpectedly weak peak: {peak}");
+    }
+
+    #[test]
+    fn rendered_spectrum_is_mirrored_across_the_screen() {
+        let tile_count = 512;
+        for tile in 0..tile_count {
+            let opposite = tile_count - 1 - tile;
+            let difference = (mirrored_spectrum_position(tile, tile_count)
+                - mirrored_spectrum_position(opposite, tile_count))
+            .abs();
+            assert!(difference < f32::EPSILON, "asymmetric tile {tile}");
+        }
+
+        assert!(mirrored_spectrum_position(tile_count / 2, tile_count) < 1.0);
+        assert!(mirrored_spectrum_position(0, tile_count) > (SPECTRUM_BANDS - 2) as f32);
     }
 }

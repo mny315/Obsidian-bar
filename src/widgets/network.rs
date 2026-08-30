@@ -594,6 +594,10 @@ impl NetworkController {
     }
 
     fn schedule_signal_refresh(self: &Rc<Self>) {
+        // A NetworkManager signal is authoritative. Invalidate before
+        // coalescing so an already-running read cannot repopulate the short
+        // cache with the state from before the signal.
+        self.backend.invalidate_snapshot_cache();
         if self.signal_refresh_pending.replace(true) {
             return;
         }

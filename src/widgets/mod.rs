@@ -777,6 +777,7 @@ mod smooth_scroll;
 use smooth_scroll::{SmoothScrollConfig, install_smooth_scroll};
 pub mod player;
 pub mod power;
+pub mod system_monitor;
 pub mod tooltip;
 pub mod tray;
 pub mod wallpaper;

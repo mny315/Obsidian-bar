@@ -39,6 +39,16 @@ window.osd-window,
 window.osd-window.background,
 window.audio-spectrum-window,
 window.audio-spectrum-window.background,
+window.system-monitor-window,
+window.system-monitor-window.background,
+window.system-monitor-trigger-window,
+window.system-monitor-trigger-window.background,
+window.system-monitor-handle-window,
+window.system-monitor-handle-window.background,
+window.system-monitor-height-handle-window,
+window.system-monitor-height-handle-window.background,
+window.system-monitor-settings-window,
+window.system-monitor-settings-window.background,
 .audio-spectrum-canvas,
 .osd-placement {
   background: transparent;
@@ -46,6 +56,318 @@ window.audio-spectrum-window.background,
   background-image: none;
   box-shadow: none;
   border: none;
+}
+
+.system-monitor-surface {
+  color: @fg;
+  background: linear-gradient(
+    90deg,
+    alpha(@theme_bg_color,0.68),
+    alpha(@theme_bg_color,0.34) 74%,
+    transparent
+  );
+  border: none;
+  border-radius: 1.09em;
+  box-shadow: none;
+  padding: 0.82em 1em 0.91em 0.82em;
+}
+
+.system-monitor-section {
+  background: transparent;
+  background-image: none;
+}
+
+separator.system-monitor-divider {
+  min-height: 0.09em;
+  margin: 0.09em 0 0.36em 0;
+  background: linear-gradient(
+    90deg,
+    alpha(@theme_fg_color,0.78),
+    alpha(@theme_fg_color,0.34) 54%,
+    transparent
+  );
+  border: none;
+}
+
+.system-monitor-row {
+  min-height: 1.45em;
+  color: @fg;
+  background: transparent;
+  text-shadow: 0 1px 3px alpha(@theme_bg_color,0.92);
+}
+
+.system-monitor-row-accent {
+  min-width: 0.18em;
+  min-height: 1em;
+  margin: 0.18em 0;
+  border-radius: 99px;
+  background: alpha(@theme_fg_color,0.82);
+  box-shadow: 0 0 5px alpha(@theme_fg_color,0.14);
+}
+
+.system-monitor-label,
+.system-monitor-value {
+  font-size: 1em;
+  font-weight: 500;
+}
+
+.system-monitor-label {
+  opacity: 0.92;
+}
+
+.system-monitor-value {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.98;
+}
+
+.system-monitor-network-graph {
+  min-height: 6.55em;
+  color: @fg;
+  margin: 0 0 0.18em 0.64em;
+  background: linear-gradient(
+    180deg,
+    alpha(@panel_tint,0.05),
+    transparent
+  );
+}
+
+.system-monitor-empty {
+  min-height: 6.55em;
+  padding: 1em 0.73em 0.82em 0.73em;
+  color: @fg;
+  background: transparent;
+}
+
+.system-monitor-empty-icon {
+  font-family: "Material Design Icons";
+  font-size: 1.73em;
+  opacity: 0.62;
+}
+
+.system-monitor-empty-title {
+  font-size: 1.09em;
+  font-weight: 600;
+  opacity: 0.90;
+}
+
+.system-monitor-empty-hint {
+  font-size: 0.91em;
+  opacity: 0.58;
+}
+
+.system-monitor-meter {
+  min-height: 0.27em;
+  margin: 0.45em 0.73em 0.09em 0.82em;
+  padding: 0;
+  color: @fg;
+  background: transparent;
+}
+
+button.system-monitor-settings-trigger,
+button.system-monitor-settings-trigger:focus {
+  min-width: 2.91em;
+  min-height: 2.91em;
+  padding: 0;
+  margin: 0.18em;
+  border: 1px solid transparent;
+  border-radius: 0.91em;
+  color: @fg;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+  outline: none;
+  opacity: 0.04;
+  transition: opacity 170ms ease, background-color 170ms ease, border-color 170ms ease;
+}
+
+button.system-monitor-settings-trigger:hover,
+button.system-monitor-settings-trigger:focus-visible {
+  opacity: 1;
+  background: alpha(@theme_bg_color,0.58);
+  border-color: alpha(@theme_fg_color,0.18);
+  box-shadow:
+    inset 0 1px 0 @soft_overlay_10,
+    0 4px 12px @shadow_10;
+}
+
+button.system-monitor-settings-trigger:active {
+  background: @active_bg;
+}
+
+.system-monitor-settings-trigger-icon,
+.system-monitor-settings-icon,
+.system-monitor-settings-button-icon {
+  font-family: "Material Design Icons";
+  font-style: normal;
+  font-weight: 400;
+  font-feature-settings: normal;
+  letter-spacing: 0;
+}
+
+.system-monitor-settings-trigger-icon {
+  font-size: 1.55em;
+}
+
+.system-monitor-drag-handle {
+  min-width: 1.64em;
+  min-height: 10.91em;
+  background: transparent;
+}
+
+.system-monitor-width-resize-zone,
+.system-monitor-height-handle {
+  background: transparent;
+}
+
+.system-monitor-height-handle {
+  min-width: 10.91em;
+  min-height: 1.64em;
+}
+
+.system-monitor-resize-corner {
+  min-width: 1.64em;
+  min-height: 1.64em;
+  margin: 0 0.09em 0.09em 0;
+  border-right: 0.18em solid alpha(@theme_fg_color,0.10);
+  border-bottom: 0.18em solid alpha(@theme_fg_color,0.10);
+  border-radius: 0 0 0.36em 0;
+  background: transparent;
+  opacity: 0.34;
+  transition: opacity 160ms ease, border-color 160ms ease;
+}
+
+.system-monitor-resize-corner:hover {
+  border-color: alpha(@theme_fg_color,0.78);
+  opacity: 1;
+}
+
+.system-monitor-drag-handle.system-monitor-dragging .system-monitor-resize-corner,
+.system-monitor-drag-handle.system-monitor-width-resizing .system-monitor-resize-corner,
+.system-monitor-drag-handle.system-monitor-height-resizing .system-monitor-resize-corner,
+.system-monitor-drag-handle.system-monitor-resizing .system-monitor-resize-corner {
+  opacity: 0;
+}
+
+.system-monitor-settings-surface {
+  padding: 12px;
+  color: @fg;
+  background: alpha(@theme_bg_color,0.92);
+  background-image: none;
+  border: 1px solid alpha(@theme_fg_color,0.16);
+  border-radius: 18px;
+  background-clip: padding-box;
+  box-shadow: none;
+}
+
+.system-monitor-settings-panel {
+  min-width: 306px;
+}
+
+.system-monitor-settings-header {
+  min-height: 28px;
+}
+
+.system-monitor-settings-icon {
+  min-width: 20px;
+  font-size: 18px;
+  opacity: 0.92;
+}
+
+.system-monitor-settings-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.system-monitor-settings-row {
+  padding: 7px 9px;
+  border: 1px solid @soft_overlay_12;
+  border-radius: 11px;
+  background: alpha(@theme_fg_color,0.045);
+}
+
+.system-monitor-settings-section-title {
+  margin: 0 2px;
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.76;
+}
+
+.system-monitor-settings-row {
+  min-height: 35px;
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+
+.system-monitor-settings-row:hover {
+  background: @soft_overlay_08;
+  border-color: @soft_overlay_18;
+}
+
+.system-monitor-settings-row-title {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.system-monitor-settings-row-meta,
+.system-monitor-settings-hint {
+  font-size: 10px;
+  opacity: 0.58;
+}
+
+.system-monitor-settings-row-unavailable {
+  opacity: 0.42;
+}
+
+button.system-monitor-settings-move,
+button.system-monitor-settings-visibility,
+button.system-monitor-settings-move:focus,
+button.system-monitor-settings-visibility:focus {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+  outline: none;
+}
+
+button.system-monitor-settings-move:hover,
+button.system-monitor-settings-visibility:hover,
+button.system-monitor-settings-move:focus-visible,
+button.system-monitor-settings-visibility:focus-visible {
+  background: @hover_bg;
+}
+
+button.system-monitor-settings-move:active,
+button.system-monitor-settings-visibility:active {
+  background: @active_bg;
+}
+
+button.system-monitor-settings-visibility:checked,
+button.system-monitor-settings-visibility:checked:hover,
+button.system-monitor-settings-visibility:checked:focus {
+  color: @fg;
+  background: @soft_overlay_16;
+  background-image: none;
+  box-shadow: none;
+}
+
+button.system-monitor-settings-move:disabled {
+  opacity: 0.24;
+}
+
+.system-monitor-settings-button-icon {
+  font-size: 15px;
+}
+
+.system-monitor-settings-footer {
+  min-height: 34px;
+}
+
+.system-monitor-settings-hint {
+  margin-left: 2px;
 }
 
 .audio-spectrum-canvas {
@@ -159,7 +481,9 @@ button.workspace-chip {
   border-radius: 999px;
   border: none;
   background: transparent;
+  background-image: none;
   box-shadow: none;
+  outline: none;
   opacity: 0.96;
   transition: background-color 160ms ease, transform 160ms ease, opacity 160ms ease;
 }
@@ -179,6 +503,11 @@ button.workspace-chip.focused {
 
 button.workspace-chip.urgent {
   background: @urgent_bg;
+}
+
+button.workspace-chip.urgent.urgent-blink-on {
+  background: alpha(@fg,0.20);
+  box-shadow: none;
 }
 
 .workspace-chip-core {
@@ -215,9 +544,16 @@ button.workspace-chip.urgent {
 }
 
 .workspace-chip-core.urgent {
+  min-width: 8px;
+  min-height: 8px;
   background: @urgent_core;
   box-shadow: none;
   opacity: 1;
+}
+
+.workspace-chip-core.urgent.urgent-blink-on {
+  background: @fg;
+  box-shadow: none;
 }
 
 button.clock-button,

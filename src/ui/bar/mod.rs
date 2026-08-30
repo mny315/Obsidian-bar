@@ -17,6 +17,7 @@ use crate::widgets::{
     osd::OsdController,
     player::{PlayerController, PlayerIndicator},
     power::PowerIndicator,
+    system_monitor::SystemMonitorController,
     tooltip::BarTooltip,
     tray::{TrayController, TrayIndicator},
     wallpaper::{WallpaperController, WallpaperIndicator},
@@ -49,6 +50,7 @@ pub struct BarDependencies<'a> {
     pub(crate) bluetooth_agent: &'a BluetoothAgent,
     pub(crate) bar_features: &'a Rc<BarFeatureController>,
     pub(crate) audio_spectrum: &'a Rc<AudioSpectrumController>,
+    pub(crate) system_monitor: &'a Rc<SystemMonitorController>,
     pub(crate) launcher_catalog: &'a Rc<LauncherCatalog>,
     pub(crate) player_controller: &'a PlayerController,
     pub(crate) tray_controller: &'a TrayController,
@@ -124,6 +126,7 @@ impl Bar {
             dependencies.wallpaper_controller,
             dependencies.bar_features,
             dependencies.audio_spectrum,
+            dependencies.system_monitor,
         );
         let launcher =
             LauncherIndicator::new(application, &window, monitor, dependencies.launcher_catalog);

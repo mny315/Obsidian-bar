@@ -48,6 +48,15 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+          OBSIDIAN_BAR_MPVPAPER_BIN = "${pkgs.mpvpaper}/bin/mpvpaper";
+          OBSIDIAN_BAR_AWWW_BIN = "${pkgs.awww}/bin/awww";
+          OBSIDIAN_BAR_AWWW_DAEMON_BIN = "${pkgs.awww}/bin/awww-daemon";
+          OBSIDIAN_BAR_FFMPEG_BIN = "${pkgs.ffmpeg}/bin/ffmpeg";
+          OBSIDIAN_BAR_BRIGHTNESSCTL_BIN = "${pkgs.brightnessctl}/bin/brightnessctl";
+          OBSIDIAN_BAR_DDCUTIL_BIN = "${pkgs.ddcutil}/bin/ddcutil";
+          OBSIDIAN_BAR_PW_DUMP_BIN = "${pkgs.pipewire}/bin/pw-dump";
+          OBSIDIAN_BAR_WPCTL_BIN = "${pkgs.wireplumber}/bin/wpctl";
+          OBSIDIAN_BAR_KILL_BIN = "${pkgs.coreutils}/bin/kill";
           packages = with pkgs; [
             cargo
             rustc

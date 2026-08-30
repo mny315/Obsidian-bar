@@ -1,7 +1,10 @@
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -41,6 +44,7 @@ const NETWORK_CACHE_TTL: Duration = Duration::from_millis(500);
 static NETWORK_SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 static NETWORK_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static NETWORK_SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, WifiSnapshot)>>> = OnceLock::new();
+static NETWORK_SNAPSHOT_REVISION: AtomicU64 = AtomicU64::new(0);
 static SAVED_WIFI_CACHE: OnceLock<Arc<Mutex<SavedWifiCache>>> = OnceLock::new();
 const WRITE_CALL_FLAGS: gio::DBusCallFlags = gio::DBusCallFlags::ALLOW_INTERACTIVE_AUTHORIZATION;
 
@@ -152,12 +156,19 @@ impl NetworkBackend {
             return Ok(snapshot);
         }
 
+        let revision = NETWORK_SNAPSHOT_REVISION.load(Ordering::Acquire);
         let snapshot = self.read_snapshot()?;
-        *network_snapshot_cache()
+        let mut cache = network_snapshot_cache()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((Instant::now(), snapshot.clone()));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if NETWORK_SNAPSHOT_REVISION.load(Ordering::Acquire) == revision {
+            *cache = Some((Instant::now(), snapshot.clone()));
+        }
         Ok(snapshot)
+    }
+
+    pub fn invalidate_snapshot_cache(&self) {
+        invalidate_network_snapshot_cache();
     }
 
     fn read_snapshot(&self) -> Result<WifiSnapshot, String> {
@@ -490,6 +501,7 @@ fn cached_network_snapshot() -> Option<WifiSnapshot> {
 }
 
 fn invalidate_network_snapshot_cache() {
+    NETWORK_SNAPSHOT_REVISION.fetch_add(1, Ordering::AcqRel);
     *network_snapshot_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;

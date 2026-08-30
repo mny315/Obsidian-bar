@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -18,6 +21,8 @@ static VOLUME_READ_LOCK: Mutex<()> = Mutex::new(());
 static SINK_READ_LOCK: Mutex<()> = Mutex::new(());
 static VOLUME_CACHE: TimedCache<VolumeState> = OnceLock::new();
 static SINK_CACHE: TimedCache<Vec<SinkInfo>> = OnceLock::new();
+static VOLUME_CACHE_REVISION: AtomicU64 = AtomicU64::new(0);
+static SINK_CACHE_REVISION: AtomicU64 = AtomicU64::new(0);
 static WPCTL: command::ExternalProgram = command::ExternalProgram::new(
     "OBSIDIAN_BAR_WPCTL_BIN",
     option_env!("OBSIDIAN_BAR_WPCTL_BIN"),
@@ -78,11 +83,15 @@ impl AudioBackend for WpctlBackend {
             return Ok(state);
         }
 
+        let revision = VOLUME_CACHE_REVISION.load(Ordering::Acquire);
         let output = command::output(WPCTL.get(), &["get-volume", DEFAULT_SINK], WPCTL_TIMEOUT)?;
         let state = parse_volume(&output)?;
-        *volume_cache()
+        let mut cache = volume_cache()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), state));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if VOLUME_CACHE_REVISION.load(Ordering::Acquire) == revision {
+            *cache = Some((Instant::now(), state));
+        }
         Ok(state)
     }
 
@@ -97,17 +106,20 @@ impl AudioBackend for WpctlBackend {
             return Ok(sinks);
         }
 
+        let revision = SINK_CACHE_REVISION.load(Ordering::Acquire);
         let snapshot = command::output(PW_DUMP.get(), &["-N"], PW_DUMP_TIMEOUT)?;
         let sinks = parse_sinks(&snapshot)?;
-        *sink_cache()
+        let mut cache = sink_cache()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((Instant::now(), sinks.clone()));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if SINK_CACHE_REVISION.load(Ordering::Acquire) == revision {
+            *cache = Some((Instant::now(), sinks.clone()));
+        }
         Ok(sinks)
     }
 
     fn set_volume(&self, value: f64) -> Result<(), String> {
-        let _write_guard = audio_write_guard()?;
+        let _write_guard = audio_write_guard();
         let value = format!("{:.2}", value.clamp(0.0, 1.0));
         let result = command::status(
             WPCTL.get(),
@@ -119,7 +131,7 @@ impl AudioBackend for WpctlBackend {
     }
 
     fn set_mute(&self, muted: bool) -> Result<(), String> {
-        let _write_guard = audio_write_guard()?;
+        let _write_guard = audio_write_guard();
         let result = command::status(
             WPCTL.get(),
             &["set-mute", DEFAULT_SINK, if muted { "1" } else { "0" }],
@@ -130,7 +142,7 @@ impl AudioBackend for WpctlBackend {
     }
 
     fn set_default_sink(&self, sink_id: &str) -> Result<(), String> {
-        let _write_guard = audio_write_guard()?;
+        let _write_guard = audio_write_guard();
         let result = command::status(WPCTL.get(), &["set-default", sink_id], WPCTL_TIMEOUT);
         invalidate_volume_cache();
         invalidate_sink_cache();
@@ -138,14 +150,10 @@ impl AudioBackend for WpctlBackend {
     }
 }
 
-fn audio_write_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    match AUDIO_WRITE_LOCK.try_lock() {
-        Ok(guard) => Ok(guard),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            Err("another audio change is already in progress".to_owned())
-        }
-    }
+fn audio_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    AUDIO_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn volume_cache() -> &'static Mutex<Option<(Instant, VolumeState)>> {
@@ -175,12 +183,14 @@ fn cached_sinks() -> Option<Vec<SinkInfo>> {
 }
 
 fn invalidate_volume_cache() {
+    VOLUME_CACHE_REVISION.fetch_add(1, Ordering::AcqRel);
     *volume_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 fn invalidate_sink_cache() {
+    SINK_CACHE_REVISION.fetch_add(1, Ordering::AcqRel);
     *sink_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;

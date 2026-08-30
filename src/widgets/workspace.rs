@@ -2,15 +2,18 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
+    time::Duration,
 };
 
-use gtk::{gdk, prelude::*};
+use gtk::{gdk, glib, prelude::*};
 use niri_ipc::Workspace;
 
 use super::run_background;
 use crate::{niri::ipc, widgets::bar_features::BarFeatureController};
 
 const STATE_CLASSES: &[&str] = &["occupied", "active", "focused", "urgent"];
+const URGENT_BLINK_CLASS: &str = "urgent-blink-on";
+const URGENT_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 
 pub struct WorkspaceIndicator {
     root: gtk::Box,
@@ -25,6 +28,7 @@ pub struct WorkspaceIndicator {
 struct WorkspaceChip {
     button: gtk::Button,
     core: gtk::Box,
+    urgent_blink_source: RefCell<Option<glib::SourceId>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,23 +160,83 @@ impl WorkspaceChip {
             );
         });
 
-        Self { button, core }
+        Self {
+            button,
+            core,
+            urgent_blink_source: RefCell::new(None),
+        }
     }
 
     fn set_state(&self, view: WorkspaceView) {
+        let urgent = should_blink_urgent(view);
+
         clear_state_classes(&self.button);
         clear_state_classes(&self.core);
 
         set_state_class(&self.button, "occupied", view.occupied);
         set_state_class(&self.button, "active", view.active);
         set_state_class(&self.button, "focused", view.focused);
-        set_state_class(&self.button, "urgent", view.urgent);
+        set_state_class(&self.button, "urgent", urgent);
 
         set_state_class(&self.core, "occupied", view.occupied);
         set_state_class(&self.core, "active", view.active);
         set_state_class(&self.core, "focused", view.focused);
-        set_state_class(&self.core, "urgent", view.urgent);
+        set_state_class(&self.core, "urgent", urgent);
+
+        self.set_urgent_blinking(urgent);
     }
+
+    fn set_urgent_blinking(&self, enabled: bool) {
+        if !enabled {
+            if let Some(source) = self.urgent_blink_source.borrow_mut().take() {
+                source.remove();
+            }
+            set_urgent_blink_phase(&self.button, &self.core, false);
+            return;
+        }
+
+        if self.urgent_blink_source.borrow().is_some() {
+            return;
+        }
+
+        set_urgent_blink_phase(&self.button, &self.core, true);
+
+        let weak_button = self.button.downgrade();
+        let weak_core = self.core.downgrade();
+        let mut lit = true;
+        let source = glib::timeout_add_local(URGENT_BLINK_INTERVAL, move || {
+            let (Some(button), Some(core)) = (weak_button.upgrade(), weak_core.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+
+            lit = !lit;
+            set_urgent_blink_phase(&button, &core, lit);
+            glib::ControlFlow::Continue
+        });
+        self.urgent_blink_source.replace(Some(source));
+    }
+}
+
+impl Drop for WorkspaceChip {
+    fn drop(&mut self) {
+        if let Some(source) = self.urgent_blink_source.get_mut().take() {
+            source.remove();
+        }
+    }
+}
+
+fn set_urgent_blink_phase(button: &gtk::Button, core: &gtk::Box, lit: bool) {
+    if lit {
+        button.add_css_class(URGENT_BLINK_CLASS);
+        core.add_css_class(URGENT_BLINK_CLASS);
+    } else {
+        button.remove_css_class(URGENT_BLINK_CLASS);
+        core.remove_css_class(URGENT_BLINK_CLASS);
+    }
+}
+
+fn should_blink_urgent(view: WorkspaceView) -> bool {
+    view.urgent && !view.active && !view.focused
 }
 
 fn clear_state_classes(widget: &impl IsA<gtk::Widget>) {
@@ -274,5 +338,24 @@ mod tests {
         assert_eq!(views.len(), 1);
         assert!(views[0].urgent);
         assert!(!views[0].occupied);
+    }
+
+    #[test]
+    fn urgent_blink_is_limited_to_another_workspace() {
+        let mut view = WorkspaceView {
+            id: 7,
+            occupied: true,
+            active: false,
+            focused: false,
+            urgent: true,
+        };
+        assert!(should_blink_urgent(view));
+
+        view.active = true;
+        assert!(!should_blink_urgent(view));
+
+        view.active = false;
+        view.focused = true;
+        assert!(!should_blink_urgent(view));
     }
 }
