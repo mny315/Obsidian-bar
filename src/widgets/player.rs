@@ -368,16 +368,7 @@ enum PlayerEvent {
 }
 
 fn enqueue_player_event(sender: &async_channel::Sender<PlayerEvent>, event: PlayerEvent) {
-    match sender.try_send(event) {
-        Ok(()) => {}
-        Err(async_channel::TrySendError::Full(event)) => {
-            let sender = sender.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let _ = sender.send(event).await;
-            });
-        }
-        Err(async_channel::TrySendError::Closed(_)) => {}
-    }
+    let _ = sender.try_send(event);
 }
 
 struct PlayerView {
@@ -796,11 +787,11 @@ pub struct PlayerController {
 
 impl PlayerController {
     pub fn new() -> Self {
-        let (events_tx, events_rx) = async_channel::bounded::<PlayerEvent>(128);
+        let (events_tx, events_rx) = async_channel::unbounded::<PlayerEvent>();
         let manager = Rc::new(RefCell::new(None));
 
         let state = Rc::new(RefCell::new(PlayerState {
-            events: events_tx.clone(),
+            events: events_tx,
             players: Vec::new(),
             pending_players: HashMap::new(),
             next_request_id: 0,

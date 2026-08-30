@@ -255,12 +255,12 @@ impl AudioIndicator {
         popup_content.append(&view);
 
         frame.append(&popup_content);
-        let popup_reveal = PopupReveal::masked(frame.clone().upcast::<gtk::Widget>());
+        let popup_reveal = PopupReveal::masked(frame.upcast::<gtk::Widget>());
         popup_root.append(popup_reveal.widget());
         popup.set_child(Some(&popup_root));
 
         let view_transition = CssTransition::new(
-            view.clone().upcast::<gtk::Widget>(),
+            view.upcast::<gtk::Widget>(),
             AudioViewTransition::CLASSES,
             VIEW_TRANSITION_DURATION,
         );

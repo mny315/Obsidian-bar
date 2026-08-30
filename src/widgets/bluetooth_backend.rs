@@ -290,14 +290,16 @@ impl BluetoothBackend {
             let snapshot = Arc::new(self.read_snapshot(preferred_adapter.as_deref())?);
             let latest_revision = SNAPSHOT_REVISION.load(Ordering::Acquire);
             if latest_revision == revision {
-                let mut cache = snapshot_cache()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *cache = Some(SnapshotCacheEntry {
-                    revision,
-                    loaded_at: Instant::now(),
-                    snapshot: Arc::clone(&snapshot),
-                });
+                {
+                    let mut cache = snapshot_cache()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *cache = Some(SnapshotCacheEntry {
+                        revision,
+                        loaded_at: Instant::now(),
+                        snapshot: Arc::clone(&snapshot),
+                    });
+                }
                 return Ok(snapshot);
             }
             last_snapshot = Some(snapshot);

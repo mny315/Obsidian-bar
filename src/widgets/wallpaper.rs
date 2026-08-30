@@ -62,6 +62,9 @@ const CARD_HEIGHT: i32 = 84;
 const GRID_GAP: i32 = 8;
 const GALLERY_WIDTH: i32 = CARD_WIDTH * GRID_COLUMNS + GRID_GAP * (GRID_COLUMNS - 1);
 const GALLERY_HEIGHT: i32 = CARD_HEIGHT * 6 + GRID_GAP * 5;
+const WALLPAPER_NOTICE_MAX_CHARS: i32 = 58;
+const GALLERY_APPEAR_CASCADE_ROWS: u32 = 6;
+const GALLERY_ROW_APPEAR_STAGGER_MS: u64 = 24;
 const SMOOTH_SCROLL: SmoothScrollConfig = SmoothScrollConfig::new(96.0, 130.0, 72.0);
 const DEFAULT_RANDOM_INTERVAL_MINUTES: u32 = 30;
 const MIN_RANDOM_INTERVAL_MINUTES: u32 = 1;
@@ -69,9 +72,12 @@ const MAX_RANDOM_INTERVAL_MINUTES: u32 = 24 * 60;
 const THUMBNAIL_VERSION: &str = "cover-144x84-v2";
 const VIDEO_STILL_VERSION: &str = "video-still-v1";
 const AWWW_NAMESPACE: &str = "obsidian-bar";
+const AWWW_LAYER: &str = "background";
+const MPVPAPER_LAYER: &str = "background";
 const AWWW_TRANSITION_DURATION: Duration = Duration::from_millis(1200);
+const AWWW_TRANSITION_SETTLE: Duration = Duration::from_millis(100);
 const AWWW_TRANSITION_FPS: &str = "255";
-const AWWW_TRANSITION_STEP: &str = "2";
+const AWWW_TRANSITION_STEP: &str = "90";
 const AWWW_TRANSPARENT: &str = "00000000";
 const AWWW_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const AWWW_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -81,7 +87,10 @@ const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
 const RESUME_SUBSCRIPTION_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const RESUME_SUBSCRIPTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const MPVPAPER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const MPV_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 const MPV_REQUEST_VO_CONFIGURED: u64 = 1;
+const MPV_REQUEST_PAUSE_STATE: u64 = 2;
+const MPV_REQUEST_PAUSE: u64 = 3;
 const MPVPAPER_SOCKET_PREFIX: &str = "obsidian-mpv-";
 const IMAGE_THUMBNAIL_WORKERS: usize = 2;
 const VIDEO_THUMBNAIL_WORKERS: usize = 2;
@@ -319,6 +328,15 @@ impl Drop for OwnedMpvpaper {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.ipc_socket);
     }
+}
+
+struct ActiveVideoBackend {
+    ipc_socket: PathBuf,
+}
+
+struct PausedVideoPlayback {
+    ipc_socket: PathBuf,
+    was_paused: bool,
 }
 
 struct OwnedAwwwDaemon {
@@ -696,7 +714,22 @@ impl WallpaperController {
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
-        apply_awww_image(awww_frame.clone()).await?;
+        let paused_video = if let Some(video) = self.active_video_backend() {
+            let paused = pause_mpvpaper_playback(video).await?;
+            if !self.lifecycle_is_current(lifecycle) {
+                return Ok(());
+            }
+            Some(paused)
+        } else {
+            None
+        };
+
+        if let Err(error) = apply_awww_image(awww_frame.clone()).await {
+            if let Some(paused) = paused_video.as_ref() {
+                restore_paused_video_playback(paused).await;
+            }
+            return Err(error);
+        }
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
@@ -706,51 +739,17 @@ impl WallpaperController {
             return Ok(());
         }
         if is_video_wallpaper(&path) {
-            let video = match spawn_mpvpaper(&path) {
-                Ok(video) => video,
-                Err(error) => {
-                    self.restore_after_video_failure(&path, &awww_frame, lifecycle)
-                        .await;
-                    return Err(error);
+            if let Err(error) = self.start_video_backend(path.clone(), lifecycle).await {
+                self.restore_after_video_failure(&path, &awww_frame, lifecycle)
+                    .await;
+                if let Some(paused) = paused_video.as_ref() {
+                    restore_paused_video_playback(paused).await;
                 }
-            };
-            let ready = wait_for_mpvpaper_ready(video.ipc_socket.clone()).await;
-            if !self.lifecycle_is_current(lifecycle) {
-                return Ok(());
-            }
-            if !video.is_alive() {
-                let error = WallpaperError::Backend(
-                    "mpvpaper exited before its video output became ready".into(),
-                );
-                drop(video);
-                self.restore_after_video_failure(&path, &awww_frame, lifecycle)
-                    .await;
-                return Err(error);
-            }
-            if !ready {
-                let error = WallpaperError::Backend(format!(
-                    "mpvpaper video output did not become ready within {} ms",
-                    MPVPAPER_READY_TIMEOUT.as_millis()
-                ));
-                drop(video);
-                self.restore_after_video_failure(&path, &awww_frame, lifecycle)
-                    .await;
-                return Err(error);
-            }
-            if let Err(error) = make_awww_transparent().await {
-                drop(video);
-                self.restore_after_video_failure(&path, &awww_frame, lifecycle)
-                    .await;
                 return Err(error);
             }
             if !self.lifecycle_is_current(lifecycle) {
                 return Ok(());
             }
-            self.backend.replace(Some(WallpaperBackend::Video {
-                source: path.clone(),
-                process: video,
-            }));
-            info!(path = %path.display(), "mpvpaper video wallpaper started after awww transition");
         } else {
             self.backend.replace(Some(WallpaperBackend::Image {
                 source: path.clone(),
@@ -760,6 +759,51 @@ impl WallpaperController {
         }
 
         self.set_current_runtime(path)
+    }
+
+    fn active_video_backend(&self) -> Option<ActiveVideoBackend> {
+        match self.backend.borrow().as_ref() {
+            Some(WallpaperBackend::Video { process, .. }) if process.is_alive() => {
+                Some(ActiveVideoBackend {
+                    ipc_socket: process.ipc_socket.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    async fn start_video_backend(
+        &self,
+        source: PathBuf,
+        lifecycle: u64,
+    ) -> Result<(), WallpaperError> {
+        let video = spawn_mpvpaper(&source)?;
+        let ready = wait_for_mpvpaper_ready(video.ipc_socket.clone()).await;
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
+        }
+        if !video.is_alive() {
+            return Err(WallpaperError::Backend(
+                "mpvpaper exited before its video output became ready".into(),
+            ));
+        }
+        if !ready {
+            return Err(WallpaperError::Backend(format!(
+                "mpvpaper video output did not become ready within {} ms",
+                MPVPAPER_READY_TIMEOUT.as_millis()
+            )));
+        }
+        make_awww_transparent().await?;
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
+        }
+
+        self.backend.replace(Some(WallpaperBackend::Video {
+            source: source.clone(),
+            process: video,
+        }));
+        info!(path = %source.display(), "mpvpaper video wallpaper started after awww transition");
+        Ok(())
     }
 
     async fn ensure_awww_daemon(&self, lifecycle: u64) -> Result<(), WallpaperError> {
@@ -773,6 +817,14 @@ impl WallpaperController {
             .is_some_and(|daemon| !daemon.is_alive())
         {
             drop(self.awww_daemon.borrow_mut().take());
+        }
+        if self
+            .awww_daemon
+            .borrow()
+            .as_ref()
+            .is_some_and(OwnedAwwwDaemon::is_alive)
+        {
+            return Ok(());
         }
         if awww_is_ready().await {
             return Ok(());
@@ -860,13 +912,13 @@ impl WallpaperController {
         }
         enum RestoreAction {
             Image(PathBuf),
-            Video,
+            RevealVideo,
             KeepFallback,
         }
 
         let action = match self.backend.borrow().as_ref() {
             Some(WallpaperBackend::Image { frame, .. }) => RestoreAction::Image(frame.clone()),
-            Some(WallpaperBackend::Video { .. }) => RestoreAction::Video,
+            Some(WallpaperBackend::Video { .. }) => RestoreAction::RevealVideo,
             None => RestoreAction::KeepFallback,
         };
         let keep_fallback = matches!(&action, RestoreAction::KeepFallback);
@@ -878,7 +930,7 @@ impl WallpaperController {
                 }
                 result
             }
-            RestoreAction::Video => make_awww_transparent().await,
+            RestoreAction::RevealVideo => make_awww_transparent().await,
             RestoreAction::KeepFallback => Ok(()),
         };
         if !self.lifecycle_is_current(lifecycle) {
@@ -1200,6 +1252,21 @@ struct GalleryPage {
     refresh_spinner: gtk::Spinner,
 }
 
+fn wallpaper_notice_label() -> gtk::Label {
+    let notice = gtk::Label::new(None);
+    notice.add_css_class("wallpaper-notice");
+    notice.set_halign(gtk::Align::Start);
+    notice.set_xalign(0.0);
+    notice.set_wrap(true);
+    notice.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    notice.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+    notice.set_max_width_chars(WALLPAPER_NOTICE_MAX_CHARS);
+    notice.set_lines(2);
+    notice.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    notice.set_visible(false);
+    notice
+}
+
 fn build_gallery_page(
     controller: &Rc<WallpaperController>,
     bar_features: &Rc<BarFeatureController>,
@@ -1254,11 +1321,7 @@ fn build_gallery_page(
     let gallery_frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
     gallery_frame.add_css_class("wallpaper-gallery-frame");
 
-    let notice = gtk::Label::new(None);
-    notice.add_css_class("wallpaper-notice");
-    notice.set_xalign(0.0);
-    notice.set_wrap(true);
-    notice.set_visible(false);
+    let notice = wallpaper_notice_label();
 
     let scroller = gtk::ScrolledWindow::new();
     scroller.add_css_class("wallpaper-list-wrap");
@@ -1310,22 +1373,43 @@ fn build_gallery_page(
                 return;
             };
 
+            row.remove_css_class("wallpaper-grid-row-enter");
+            row.add_css_class("wallpaper-grid-row-pending");
             clear_box(&row);
-            let current = active_wallpaper.borrow();
-            let paths = row_data.borrow::<Vec<PathBuf>>();
-            for path in paths.iter().cloned() {
-                let active = current.as_deref() == Some(path.as_path());
-                row.append(&wallpaper_card(
-                    &controller,
-                    &weak_notice,
-                    &live_wallpaper_cards,
-                    path,
-                    active,
-                ));
+            {
+                let current = active_wallpaper.borrow();
+                let paths = row_data.borrow::<Vec<PathBuf>>();
+                for path in paths.iter().cloned() {
+                    let active = current.as_deref() == Some(path.as_path());
+                    row.append(&wallpaper_card(
+                        &controller,
+                        &weak_notice,
+                        &live_wallpaper_cards,
+                        path,
+                        active,
+                    ));
+                }
             }
 
             let has_next_row = list_item.position().saturating_add(1) < model.n_items();
             row.set_margin_bottom(if has_next_row { GRID_GAP } else { 0 });
+
+            let expected_item = row_data.upcast::<glib::Object>();
+            let weak_list_item = list_item.downgrade();
+            let weak_row = row.downgrade();
+            let cascade_index = list_item.position() % GALLERY_APPEAR_CASCADE_ROWS;
+            let delay =
+                Duration::from_millis(u64::from(cascade_index) * GALLERY_ROW_APPEAR_STAGGER_MS);
+            glib::timeout_add_local_once(delay, move || {
+                let (Some(list_item), Some(row)) = (weak_list_item.upgrade(), weak_row.upgrade())
+                else {
+                    return;
+                };
+                if list_item.item().as_ref() == Some(&expected_item) {
+                    row.remove_css_class("wallpaper-grid-row-pending");
+                    row.add_css_class("wallpaper-grid-row-enter");
+                }
+            });
         });
     }
 
@@ -1336,6 +1420,8 @@ fn build_gallery_page(
         let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
             return;
         };
+        row.remove_css_class("wallpaper-grid-row-pending");
+        row.remove_css_class("wallpaper-grid-row-enter");
         clear_box(&row);
     });
 
@@ -1520,11 +1606,7 @@ fn build_directory_page() -> DirectoryPage {
     install_smooth_scroll(&scroller, SMOOTH_SCROLL);
     frame.append(&scroller);
 
-    let notice = gtk::Label::new(None);
-    notice.add_css_class("wallpaper-notice");
-    notice.set_xalign(0.0);
-    notice.set_wrap(true);
-    notice.set_visible(false);
+    let notice = wallpaper_notice_label();
 
     let select_button = gtk::Button::with_label("Use this folder");
     select_button.add_css_class("wallpaper-directory-select");
@@ -1666,7 +1748,6 @@ fn build_picker_content(
 
     {
         let controller = Rc::clone(controller);
-        let browser = browser.clone();
         let weak_stack = stack.downgrade();
         let weak_notice = directory_page.notice.downgrade();
         directory_page.select_button.connect_clicked(move |_| {
@@ -1817,8 +1898,8 @@ impl GalleryView {
         };
         {
             let mut rendered = self.rendered.borrow_mut();
-            rendered.directory = snapshot.directory.clone();
-            rendered.current = snapshot.current.clone();
+            rendered.directory.clone_from(&snapshot.directory);
+            rendered.current.clone_from(&snapshot.current);
             rendered.loaded = false;
         }
         self.active_wallpaper.replace(snapshot.current);
@@ -1865,7 +1946,7 @@ impl GalleryView {
 
         let mut rendered = self.rendered.borrow_mut();
         let previous = rendered.current.clone();
-        rendered.current = snapshot.current.clone();
+        rendered.current.clone_from(&snapshot.current);
         if rendered.loaded {
             update_gallery_active(
                 &self.active_wallpaper,
@@ -2108,6 +2189,25 @@ fn thumbnail_picture(path: &Path) -> gtk::Picture {
     picture
 }
 
+fn set_thumbnail_with_appear(overlay: &gtk::Overlay, path: &Path) {
+    let stage = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    stage.add_css_class("wallpaper-thumbnail-stage");
+    stage.add_css_class("wallpaper-thumbnail-pending");
+    stage.set_size_request(CARD_WIDTH, CARD_HEIGHT);
+    stage.set_halign(gtk::Align::Start);
+    stage.set_valign(gtk::Align::Start);
+    stage.append(&thumbnail_picture(path));
+    overlay.set_child(Some(&stage));
+
+    let weak_stage = stage.downgrade();
+    glib::idle_add_local_once(move || {
+        if let Some(stage) = weak_stage.upgrade() {
+            stage.remove_css_class("wallpaper-thumbnail-pending");
+            stage.add_css_class("wallpaper-thumbnail-enter");
+        }
+    });
+}
+
 fn video_preview_placeholder(path: &Path) -> gtk::Box {
     let placeholder = gtk::Box::new(gtk::Orientation::Vertical, 4);
     placeholder.add_css_class("wallpaper-video-placeholder");
@@ -2215,6 +2315,10 @@ fn queue_thumbnail(
 ) {
     let weak_overlay = overlay.downgrade();
     let (sender, receiver) = async_channel::bounded::<ThumbnailResult>(1);
+    let receiver_on_destroy = receiver.clone();
+    overlay.connect_destroy(move |_| {
+        receiver_on_destroy.close();
+    });
     let should_queue = {
         let mut waiters = thumbnail_waiters()
             .lock()
@@ -2254,7 +2358,7 @@ fn queue_thumbnail(
 
         match result {
             Ok(thumbnail_path) => {
-                overlay.set_child(Some(&thumbnail_picture(&thumbnail_path)));
+                set_thumbnail_with_appear(&overlay, &thumbnail_path);
             }
             Err(error) => {
                 warn!(thumbnail_kind = kind, %error, "failed to build wallpaper thumbnail");
@@ -2356,6 +2460,11 @@ fn cached_video_still(source: &Path) -> Result<PathBuf, WallpaperError> {
 }
 
 async fn cached_video_still_async(source: PathBuf) -> Result<PathBuf, WallpaperError> {
+    let cache_path = video_still_cache_path(&source)?;
+    if cache_path.is_file() {
+        return Ok(cache_path);
+    }
+
     run_background_async(move || cached_video_still(&source).map_err(|error| error.to_string()))
         .await
         .ok_or_else(|| WallpaperError::Worker("video still worker stopped".into()))?
@@ -2367,49 +2476,67 @@ fn extract_video_frame(
     destination: &Path,
     video_filter: Option<&str>,
 ) -> Result<(), WallpaperError> {
+    extract_video_frame_at(source, destination, Some(1.0), video_filter).or_else(|_| {
+        let _ = fs::remove_file(destination);
+        extract_video_frame_at(source, destination, None, video_filter)
+    })
+}
+
+fn extract_video_frame_at(
+    source: &Path,
+    destination: &Path,
+    position_seconds: Option<f64>,
+    video_filter: Option<&str>,
+) -> Result<(), WallpaperError> {
     let temporary = unique_temporary_path(destination);
     let _ = fs::remove_file(&temporary);
 
-    let attempt = |seek: bool| -> Result<(), WallpaperError> {
-        let mut args = vec![
-            OsString::from("-hide_banner"),
-            OsString::from("-loglevel"),
-            OsString::from("error"),
-            OsString::from("-nostdin"),
-        ];
-        if seek {
-            args.extend([OsString::from("-ss"), OsString::from("1")]);
+    let mut args = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-nostdin"),
+    ];
+    if let Some(seconds) = position_seconds {
+        args.extend([
+            OsString::from("-ss"),
+            OsString::from(format!("{seconds:.6}")),
+        ]);
+    }
+    args.push(OsString::from("-i"));
+    args.push(source.as_os_str().to_owned());
+    args.extend(
+        ["-frames:v", "1", "-an", "-sn", "-dn"]
+            .into_iter()
+            .map(OsString::from),
+    );
+    if let Some(filter) = video_filter {
+        args.extend([OsString::from("-vf"), OsString::from(filter)]);
+    }
+    match temporary.extension().and_then(OsStr::to_str) {
+        Some(extension) if extension.eq_ignore_ascii_case("png") => {
+            args.extend([OsString::from("-compression_level"), OsString::from("1")]);
         }
-        args.push(OsString::from("-i"));
-        args.push(source.as_os_str().to_owned());
-        args.extend(
-            ["-frames:v", "1", "-an", "-sn", "-dn"]
-                .into_iter()
-                .map(OsString::from),
-        );
-        if let Some(filter) = video_filter {
-            args.extend([OsString::from("-vf"), OsString::from(filter)]);
+        Some(extension)
+            if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") =>
+        {
+            args.extend([OsString::from("-q:v"), OsString::from("2")]);
         }
-        args.push(OsString::from("-y"));
-        args.push(temporary.as_os_str().to_owned());
+        _ => {}
+    }
+    args.push(OsString::from("-y"));
+    args.push(temporary.as_os_str().to_owned());
 
-        match command::status_inherited(FFMPEG.get(), &args, FFMPEG_TIMEOUT) {
-            Ok(()) => Ok(()),
-            Err(command::StatusError::Io(error)) => Err(WallpaperError::Io(error)),
-            Err(command::StatusError::TimedOut | command::StatusError::Failed) => {
-                Err(WallpaperError::Ffmpeg(source.to_path_buf()))
-            }
+    match command::status_inherited(FFMPEG.get(), &args, FFMPEG_TIMEOUT) {
+        Ok(()) => {}
+        Err(command::StatusError::Io(error)) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(WallpaperError::Io(error));
         }
-    };
-
-    let result = attempt(true).or_else(|_| {
-        let _ = fs::remove_file(&temporary);
-        attempt(false)
-    });
-
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
+        Err(command::StatusError::TimedOut | command::StatusError::Failed) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(WallpaperError::Ffmpeg(source.to_path_buf()));
+        }
     }
 
     if let Err(error) = fs::rename(&temporary, destination) {
@@ -2427,8 +2554,12 @@ fn unique_temporary_path(destination: &Path) -> PathBuf {
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("wallpaper.png");
+    let extension = destination
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("tmp");
     destination.with_file_name(format!(
-        ".{filename}.{}.{}.tmp.png",
+        ".{filename}.{}.{}.tmp.{extension}",
         std::process::id(),
         nonce
     ))
@@ -2974,6 +3105,141 @@ fn write_mpv_request(
     writer.write_all(b"\n")
 }
 
+async fn pause_mpvpaper_playback(
+    video: ActiveVideoBackend,
+) -> Result<PausedVideoPlayback, WallpaperError> {
+    run_background_async(move || pause_mpvpaper_playback_blocking(video))
+        .await
+        .ok_or_else(|| WallpaperError::Worker("video pause worker stopped".into()))?
+        .map_err(WallpaperError::Backend)
+}
+
+async fn restore_paused_video_playback(paused: &PausedVideoPlayback) {
+    if paused.was_paused {
+        return;
+    }
+
+    let socket = paused.ipc_socket.clone();
+    match run_background_async(move || set_mpv_pause_blocking(&socket, false)).await {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            warn!(%error, "failed to resume previous video after wallpaper transition error");
+        }
+        None => warn!("video resume worker stopped"),
+    }
+}
+
+#[cfg(unix)]
+fn pause_mpvpaper_playback_blocking(
+    video: ActiveVideoBackend,
+) -> Result<PausedVideoPlayback, String> {
+    let pause_state = mpv_ipc_request_blocking(
+        &video.ipc_socket,
+        MPV_REQUEST_PAUSE_STATE,
+        serde_json::json!(["get_property", "pause"]),
+        MPV_IPC_TIMEOUT,
+    )?;
+    ensure_mpv_success(&pause_state, "query pause state")?;
+    let was_paused = pause_state
+        .data
+        .as_ref()
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "mpv returned an invalid pause state".to_owned())?;
+
+    if !was_paused {
+        set_mpv_pause_blocking(&video.ipc_socket, true)?;
+    }
+
+    Ok(PausedVideoPlayback {
+        ipc_socket: video.ipc_socket,
+        was_paused,
+    })
+}
+
+#[cfg(not(unix))]
+fn pause_mpvpaper_playback_blocking(
+    _video: ActiveVideoBackend,
+) -> Result<PausedVideoPlayback, String> {
+    Err("pausing mpvpaper playback requires Unix IPC".to_owned())
+}
+
+#[cfg(unix)]
+fn set_mpv_pause_blocking(socket: &Path, paused: bool) -> Result<(), String> {
+    let response = mpv_ipc_request_blocking(
+        socket,
+        MPV_REQUEST_PAUSE,
+        serde_json::json!(["set_property", "pause", paused]),
+        MPV_IPC_TIMEOUT,
+    )?;
+    ensure_mpv_success(
+        &response,
+        if paused {
+            "pause video"
+        } else {
+            "resume video"
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn set_mpv_pause_blocking(_socket: &Path, _paused: bool) -> Result<(), String> {
+    Err("controlling mpvpaper playback requires Unix IPC".to_owned())
+}
+
+fn ensure_mpv_success(response: &MpvIpcMessage, operation: &str) -> Result<(), String> {
+    if response.error.as_deref() == Some("success") {
+        Ok(())
+    } else {
+        Err(format!(
+            "mpv failed to {operation}: {}",
+            response
+                .error
+                .as_deref()
+                .unwrap_or("missing response status")
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn mpv_ipc_request_blocking(
+    socket: &Path,
+    request_id: u64,
+    command: serde_json::Value,
+    timeout: Duration,
+) -> Result<MpvIpcMessage, String> {
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|error| format!("failed to connect to mpv IPC: {error}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| format!("failed to configure mpv IPC read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| format!("failed to configure mpv IPC write timeout: {error}"))?;
+    write_mpv_request(&mut stream, request_id, command)
+        .map_err(|error| format!("failed to write mpv IPC request: {error}"))?;
+
+    let mut reader = BufReader::new(stream);
+    for _ in 0..16 {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err("mpv IPC closed before replying".to_owned()),
+            Ok(_) => {
+                let Ok(message) = serde_json::from_str::<MpvIpcMessage>(&line) else {
+                    continue;
+                };
+                if message.request_id == Some(request_id) {
+                    return Ok(message);
+                }
+            }
+            Err(error) => return Err(format!("failed to read mpv IPC response: {error}")),
+        }
+    }
+
+    Err(format!("mpv did not reply to request {request_id}"))
+}
+
 fn spawn_mpvpaper(path: &Path) -> Result<OwnedMpvpaper, WallpaperError> {
     let program = MPVPAPER.get();
     let output = env::var_os("OBSIDIAN_BAR_MPVPAPER_OUTPUT")
@@ -2989,14 +3255,12 @@ fn spawn_mpvpaper(path: &Path) -> Result<OwnedMpvpaper, WallpaperError> {
     options.push(" input-ipc-server=");
     options.push(ipc_socket.as_os_str());
 
-    let argv: [&OsStr; 6] = [
+    let argv = mpvpaper_argv(
         program,
-        OsStr::new("--auto-pause"),
-        OsStr::new("-o"),
         options.as_os_str(),
         output.as_os_str(),
         path.as_os_str(),
-    ];
+    );
 
     let process = ManagedSubprocess::spawn("mpvpaper", &argv)?;
 
@@ -3006,16 +3270,40 @@ fn spawn_mpvpaper(path: &Path) -> Result<OwnedMpvpaper, WallpaperError> {
     })
 }
 
+fn mpvpaper_argv<'a>(
+    program: &'a OsStr,
+    options: &'a OsStr,
+    output: &'a OsStr,
+    path: &'a OsStr,
+) -> [&'a OsStr; 8] {
+    [
+        program,
+        OsStr::new("--auto-pause"),
+        OsStr::new("--layer"),
+        OsStr::new(MPVPAPER_LAYER),
+        OsStr::new("-o"),
+        options,
+        output,
+        path,
+    ]
+}
+
 fn spawn_awww_daemon() -> Result<OwnedAwwwDaemon, WallpaperError> {
-    let argv: [&OsStr; 5] = [
-        AWWW_DAEMON.get(),
-        OsStr::new("--namespace"),
-        OsStr::new(AWWW_NAMESPACE),
-        OsStr::new("--no-cache"),
-        OsStr::new("--quiet"),
-    ];
+    let argv = awww_daemon_argv(AWWW_DAEMON.get());
     let process = ManagedSubprocess::spawn("awww-daemon", &argv)?;
     Ok(OwnedAwwwDaemon { process })
+}
+
+fn awww_daemon_argv(program: &OsStr) -> [&OsStr; 7] {
+    [
+        program,
+        OsStr::new("--namespace"),
+        OsStr::new(AWWW_NAMESPACE),
+        OsStr::new("--layer"),
+        OsStr::new(AWWW_LAYER),
+        OsStr::new("--no-cache"),
+        OsStr::new("--quiet"),
+    ]
 }
 
 async fn awww_is_ready() -> bool {
@@ -3049,12 +3337,13 @@ fn awww_is_ready_blocking() -> bool {
 }
 
 async fn apply_awww_image(path: PathBuf) -> Result<(), WallpaperError> {
+    let transition = next_awww_transition();
     let mut args = vec![
         OsString::from("img"),
         OsString::from("--namespace"),
         OsString::from(AWWW_NAMESPACE),
         OsString::from("--transition-type"),
-        OsString::from("random"),
+        OsString::from(transition),
         OsString::from("--transition-duration"),
         OsString::from(AWWW_TRANSITION_DURATION.as_secs_f64().to_string()),
         OsString::from("--transition-fps"),
@@ -3065,6 +3354,27 @@ async fn apply_awww_image(path: PathBuf) -> Result<(), WallpaperError> {
     append_awww_outputs(&mut args);
     args.push(path.into_os_string());
     run_awww_command(args, "img").await
+}
+
+fn next_awww_transition() -> &'static str {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    let nonce = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seed = now.as_secs()
+        ^ u64::from(now.subsec_nanos()).rotate_left(32)
+        ^ nonce.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    awww_transition_for_seed(seed)
+}
+
+fn awww_transition_for_seed(seed: u64) -> &'static str {
+    match seed % 3 {
+        0 => "wave",
+        1 => "grow",
+        _ => "outer",
+    }
 }
 
 async fn make_awww_transparent() -> Result<(), WallpaperError> {
@@ -3112,8 +3422,12 @@ async fn run_awww_command(
 }
 
 async fn wait_awww_transition() {
+    wait_local(AWWW_TRANSITION_DURATION.saturating_add(AWWW_TRANSITION_SETTLE)).await;
+}
+
+async fn wait_local(duration: Duration) {
     let (sender, receiver) = async_channel::bounded(1);
-    glib::timeout_add_local_once(AWWW_TRANSITION_DURATION, move || {
+    glib::timeout_add_local_once(duration, move || {
         let _ = sender.try_send(());
     });
     let _ = receiver.recv().await;
@@ -3170,44 +3484,18 @@ async fn wait_for_mpvpaper_ready(socket: PathBuf) -> bool {
 
 #[cfg(unix)]
 fn wait_for_mpvpaper_ready_blocking(socket: &Path) -> bool {
-    use std::os::unix::net::UnixStream;
-
     let started_at = Instant::now();
     while started_at.elapsed() < MPVPAPER_READY_TIMEOUT {
-        if let Ok(mut stream) = UnixStream::connect(socket) {
-            if stream
-                .set_read_timeout(Some(Duration::from_millis(120)))
-                .is_err()
-                || stream
-                    .set_write_timeout(Some(Duration::from_millis(120)))
-                    .is_err()
-            {
-                return false;
-            }
-
-            let command = serde_json::json!(["get_property", "vo-configured"]);
-            if write_mpv_request(&mut stream, MPV_REQUEST_VO_CONFIGURED, command).is_ok() {
-                let mut reader = BufReader::new(stream);
-                for _ in 0..8 {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            let Ok(message) = serde_json::from_str::<MpvIpcMessage>(&line) else {
-                                break;
-                            };
-                            if message.request_id == Some(MPV_REQUEST_VO_CONFIGURED) {
-                                if message.error.as_deref() == Some("success")
-                                    && message.data == Some(serde_json::Value::Bool(true))
-                                {
-                                    return true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+        let command = serde_json::json!(["get_property", "vo-configured"]);
+        if let Ok(message) = mpv_ipc_request_blocking(
+            socket,
+            MPV_REQUEST_VO_CONFIGURED,
+            command,
+            Duration::from_millis(120),
+        ) && message.error.as_deref() == Some("success")
+            && message.data == Some(serde_json::Value::Bool(true))
+        {
+            return true;
         }
 
         thread::sleep(Duration::from_millis(20));
@@ -3385,6 +3673,35 @@ mod tests {
     }
 
     #[test]
+    fn random_transition_pool_contains_only_visible_effects() {
+        for seed in 0..12 {
+            assert!(matches!(
+                awww_transition_for_seed(seed),
+                "wave" | "grow" | "outer"
+            ));
+        }
+    }
+
+    #[test]
+    fn wallpaper_backends_stay_below_desktop_effects() {
+        fn contains_pair(argv: &[&OsStr], flag: &str, value: &str) -> bool {
+            argv.windows(2)
+                .any(|pair| pair[0] == OsStr::new(flag) && pair[1] == OsStr::new(value))
+        }
+
+        let awww = awww_daemon_argv(OsStr::new("awww-daemon"));
+        let mpvpaper = mpvpaper_argv(
+            OsStr::new("mpvpaper"),
+            OsStr::new("options"),
+            OsStr::new("output"),
+            OsStr::new("wallpaper"),
+        );
+
+        assert!(contains_pair(&awww, "--layer", "background"));
+        assert!(contains_pair(&mpvpaper, "--layer", "background"));
+    }
+
+    #[test]
     fn image_backend_matches_only_its_exact_source() {
         let backend = WallpaperBackend::Image {
             source: PathBuf::from("/tmp/current.png"),
@@ -3441,5 +3758,83 @@ mod tests {
         assert_eq!(response.request_id, Some(MPV_REQUEST_VO_CONFIGURED));
         assert_eq!(response.error.as_deref(), Some("success"));
         assert_eq!(response.data, Some(serde_json::Value::Bool(true)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pauses_the_current_mpv_frame_before_a_video_transition() {
+        use std::os::unix::net::UnixListener;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = env::temp_dir().join(format!(
+            "obsidian-mpv-pause-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let socket = base.with_extension("sock");
+        let _ = fs::remove_file(&socket);
+
+        let listener = UnixListener::bind(&socket).expect("test mpv socket should bind");
+        let server = thread::spawn(move || {
+            for step in 0..2 {
+                let (stream, _) = listener.accept().expect("test mpv client should connect");
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("test mpv request should be readable");
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("test mpv request should be valid JSON");
+
+                match step {
+                    0 => {
+                        assert_eq!(request["request_id"], MPV_REQUEST_PAUSE_STATE);
+                        assert_eq!(
+                            request["command"],
+                            serde_json::json!(["get_property", "pause"])
+                        );
+                    }
+                    1 => {
+                        assert_eq!(request["request_id"], MPV_REQUEST_PAUSE);
+                        assert_eq!(
+                            request["command"],
+                            serde_json::json!(["set_property", "pause", true])
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+
+                let response = if step == 0 {
+                    serde_json::json!({
+                        "request_id": request["request_id"],
+                        "error": "success",
+                        "data": false,
+                    })
+                } else {
+                    serde_json::json!({
+                        "request_id": request["request_id"],
+                        "error": "success",
+                    })
+                };
+                serde_json::to_writer(reader.get_mut(), &response)
+                    .expect("test mpv response should serialize");
+                reader
+                    .get_mut()
+                    .write_all(b"\n")
+                    .expect("test mpv response should be written");
+            }
+        });
+
+        let paused = pause_mpvpaper_playback_blocking(ActiveVideoBackend {
+            ipc_socket: socket.clone(),
+        })
+        .expect("current video frame should be paused");
+
+        server.join().expect("test mpv server should finish");
+        assert_eq!(paused.ipc_socket, socket);
+        assert!(!paused.was_paused);
+        let _ = fs::remove_file(socket);
     }
 }

@@ -760,7 +760,7 @@ impl LauncherIndicator {
         popup.set_child(Some(&popup_root));
 
         let view_transition = CssTransition::new(
-            view.clone().upcast::<gtk::Widget>(),
+            view.upcast::<gtk::Widget>(),
             LauncherViewTransition::CLASSES,
             VIEW_TRANSITION_DURATION,
         );

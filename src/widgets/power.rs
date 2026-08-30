@@ -1,6 +1,6 @@
-use std::{process::Command, time::Duration};
+use std::{ffi::OsStr, time::Duration};
 
-use gtk::prelude::*;
+use gtk::{gio, prelude::*};
 use tracing::{info, warn};
 
 use super::tooltip::BarTooltipExt;
@@ -152,23 +152,18 @@ fn power_action_button(action: PowerAction, revealer: &gtk::Revealer) -> gtk::Bu
 
 fn run_action(action: PowerAction) {
     let (program, args) = action.command();
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(OsStr::new(program));
+    argv.extend(args.iter().map(OsStr::new));
 
-    match Command::new(program).args(args).spawn() {
-        Ok(mut child) => {
-            info!(?action, pid = child.id(), "power action started");
-            let _ = std::thread::Builder::new()
-                .name("power-action-wait".to_owned())
-                .spawn(move || match child.wait() {
-                    Ok(status) if status.success() => {
-                        info!(?action, %status, "power action finished");
-                    }
-                    Ok(status) => {
-                        warn!(?action, %status, "power action exited unsuccessfully");
-                    }
-                    Err(error) => {
-                        warn!(?action, %error, "failed to wait for power action");
-                    }
-                });
+    match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
+        Ok(process) => {
+            let identifier = process.identifier().unwrap_or_default();
+            info!(?action, pid = %identifier, "power action started");
+            process.wait_check_async(None::<&gio::Cancellable>, move |result| match result {
+                Ok(()) => info!(?action, "power action finished"),
+                Err(error) => warn!(?action, %error, "power action exited unsuccessfully"),
+            });
         }
         Err(error) => {
             warn!(?action, %error, program, "failed to start power action");

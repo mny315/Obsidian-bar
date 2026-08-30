@@ -52,13 +52,13 @@ impl SpectrumFrame {
         levels: [0.0; SPECTRUM_BANDS],
     };
 
-    fn is_visible(self) -> bool {
-        self.levels.into_iter().any(|level| level > LEVEL_EPSILON)
+    fn is_visible(&self) -> bool {
+        self.levels.iter().any(|&level| level > LEVEL_EPSILON)
     }
 }
 
 type StateSubscriber = Box<dyn Fn(bool) -> bool>;
-type FrameSubscriber = Box<dyn Fn(SpectrumFrame) -> bool>;
+type FrameSubscriber = Box<dyn Fn(&SpectrumFrame) -> bool>;
 
 pub struct AudioSpectrumController {
     enabled: Cell<bool>,
@@ -93,7 +93,7 @@ impl AudioSpectrumController {
                 if controller.worker.borrow().is_some() {
                     controller.worker_retry_attempt.set(0);
                 }
-                controller.broadcast_frame(frame);
+                controller.broadcast_frame(&frame);
             }
         });
 
@@ -153,7 +153,7 @@ impl AudioSpectrumController {
         }
     }
 
-    fn subscribe_frames(&self, callback: impl Fn(SpectrumFrame) -> bool + 'static) {
+    fn subscribe_frames(&self, callback: impl Fn(&SpectrumFrame) -> bool + 'static) {
         self.frame_subscribers.borrow_mut().push(Box::new(callback));
     }
 
@@ -220,14 +220,14 @@ impl AudioSpectrumController {
 
     fn clear_frames(&self) {
         let _ = self.frame_sender.force_send(SpectrumFrame::ZERO);
-        self.broadcast_frame(SpectrumFrame::ZERO);
+        self.broadcast_frame(&SpectrumFrame::ZERO);
     }
 
-    fn broadcast_frame(&self, frame: SpectrumFrame) {
+    fn broadcast_frame(&self, frame: &SpectrumFrame) {
         let frame = if self.enabled() {
             frame
         } else {
-            SpectrumFrame::ZERO
+            &SpectrumFrame::ZERO
         };
         self.frame_subscribers
             .borrow_mut()

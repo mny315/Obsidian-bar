@@ -296,7 +296,7 @@ impl BluetoothIndicator {
         popup_content.append(&notice);
         frame.append(&popup_content);
 
-        let popup_reveal = PopupReveal::masked(frame.clone().upcast::<gtk::Widget>());
+        let popup_reveal = PopupReveal::masked(frame.upcast::<gtk::Widget>());
         popup_root.append(popup_reveal.widget());
         popup.set_child(Some(&popup_root));
 

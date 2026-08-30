@@ -145,16 +145,7 @@ enum TrayEvent {
 }
 
 fn enqueue_tray_event(sender: &async_channel::Sender<TrayEvent>, event: TrayEvent) {
-    match sender.try_send(event) {
-        Ok(()) => {}
-        Err(async_channel::TrySendError::Full(event)) => {
-            let sender = sender.clone();
-            glib::MainContext::default().spawn_local(async move {
-                let _ = sender.send(event).await;
-            });
-        }
-        Err(async_channel::TrySendError::Closed(_)) => {}
-    }
+    let _ = sender.try_send(event);
 }
 
 pub struct TrayController {
@@ -164,8 +155,8 @@ pub struct TrayController {
 impl TrayController {
     pub fn new() -> Self {
         let mirror = Arc::new(Mutex::new(WatcherMirror::default()));
-        let (events_tx, events_rx) = async_channel::bounded::<TrayEvent>(256);
-        let state = Rc::new(RefCell::new(TrayState::new(mirror, events_tx.clone())));
+        let (events_tx, events_rx) = async_channel::unbounded::<TrayEvent>();
+        let state = Rc::new(RefCell::new(TrayState::new(mirror, events_tx)));
 
         let weak_state = Rc::downgrade(&state);
         glib::MainContext::default().spawn_local(async move {
