@@ -11,11 +11,7 @@ use std::{
 use gio::{glib, prelude::*};
 use glib::variant::{ObjectPath, ToVariant};
 
-use super::{
-    command,
-    dbus::{object_path, variant_value},
-    run_background_async,
-};
+use super::dbus::{object_path, variant_value};
 
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
@@ -44,7 +40,6 @@ const NM_AP_SEC_KEY_MGMT_OWE_TM: u32 = 0x0000_1000;
 const NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192: u32 = 0x0000_2000;
 const ROOT_OBJECT_PATH: &str = "/";
 const DBUS_TIMEOUT_MS: i32 = 5_000;
-const AUTHORIZATION_TIMEOUT_MS: i32 = 120_000;
 const NETWORK_CACHE_TTL: Duration = Duration::from_millis(500);
 static NETWORK_SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 static NETWORK_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -380,33 +375,27 @@ impl NetworkBackend {
                 method,
                 Some(&parameters),
                 None,
-                WRITE_CALL_FLAGS,
-                AUTHORIZATION_TIMEOUT_MS,
+                // The desktop session is granted access to this unit by Polkit.
+                // A toggle must not open an administrator prompt or retry as root.
+                gio::DBusCallFlags::NONE,
+                DBUS_TIMEOUT_MS,
             )
             .await
         {
             Ok(_) => {}
             Err(error)
-                if gio::DBusError::remote_error(&error).as_deref()
-                    == Some("org.freedesktop.DBus.Error.InteractiveAuthorizationRequired") =>
+                if matches!(
+                    gio::DBusError::remote_error(&error).as_deref(),
+                    Some(
+                        "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired"
+                            | "org.freedesktop.DBus.Error.AccessDenied"
+                    )
+                ) =>
             {
-                // Some sessions cannot authenticate a systemd bus request. pkexec
-                // performs its own interactive authorization for this exact command.
-                let action = if active { "start" } else { "stop" };
-                let systemctl = glib::find_program_in_path("systemctl")
-                    .ok_or_else(|| "Cannot find systemctl to change VLESS".to_owned())?;
-                let systemctl = systemctl
-                    .to_str()
-                    .ok_or_else(|| "Invalid systemctl path".to_owned())?;
-                let systemctl = systemctl.to_owned();
-                run_background_async(move || command::status(
-                    "pkexec",
-                    &[&systemctl, "--no-ask-password", action, VLESS_UNIT],
-                    Duration::from_millis(AUTHORIZATION_TIMEOUT_MS as u64),
-                )).await.ok_or_else(|| "VLESS authorization was interrupted".to_owned())?.map_err(|error| {
-                    tracing::warn!(%error, "VLESS authorization failed");
-                    "VLESS was not changed. Administrator authentication is required; check that a Polkit authentication agent is running.".to_owned()
-                })?;
+                return Err(
+                    "VLESS control is not authorized. Apply the updated vless.nix module and rebuild NixOS."
+                        .to_owned(),
+                );
             }
             Err(mut error) => {
                 gio::DBusError::strip_remote_error(&mut error);

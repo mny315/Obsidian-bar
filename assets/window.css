@@ -3165,6 +3165,8 @@ window.bar-tooltip-window .bar-tooltip-frame,
 .bar-tooltip-frame {
   padding-top: 4px;
   padding-bottom: 4px;
+  /* Match the Niri layer blur radius when the tooltip spans multiple lines. */
+  border-radius: 18px;
 }
 
 tooltip label,
