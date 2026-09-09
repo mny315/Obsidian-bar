@@ -229,6 +229,9 @@ impl BluetoothIndicator {
         pairing_message.add_css_class("bluetooth-pairing-message");
         pairing_message.set_xalign(0.0);
         pairing_message.set_wrap(true);
+        pairing_message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        pairing_message.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+        pairing_message.set_max_width_chars(48);
 
         let pairing_code = gtk::Label::new(None);
         pairing_code.add_css_class("bluetooth-pairing-code");
@@ -286,6 +289,11 @@ impl BluetoothIndicator {
         notice.add_css_class("network-section-title");
         notice.add_css_class("network-notice");
         notice.set_xalign(0.0);
+        notice.set_wrap(true);
+        notice.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        notice.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+        notice.set_max_width_chars(48);
+        notice.set_lines(3);
         notice.set_ellipsize(gtk::pango::EllipsizeMode::End);
         notice.set_visible(false);
 

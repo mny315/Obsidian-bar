@@ -11,7 +11,11 @@ use std::{
 use gio::{glib, prelude::*};
 use glib::variant::{ObjectPath, ToVariant};
 
-use super::dbus::{object_path, variant_value};
+use super::{
+    command,
+    dbus::{object_path, variant_value},
+    run_background_async,
+};
 
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
@@ -40,6 +44,7 @@ const NM_AP_SEC_KEY_MGMT_OWE_TM: u32 = 0x0000_1000;
 const NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192: u32 = 0x0000_2000;
 const ROOT_OBJECT_PATH: &str = "/";
 const DBUS_TIMEOUT_MS: i32 = 5_000;
+const AUTHORIZATION_TIMEOUT_MS: i32 = 120_000;
 const NETWORK_CACHE_TTL: Duration = Duration::from_millis(500);
 static NETWORK_SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 static NETWORK_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -49,7 +54,7 @@ static SAVED_WIFI_CACHE: OnceLock<Arc<Mutex<SavedWifiCache>>> = OnceLock::new();
 const WRITE_CALL_FLAGS: gio::DBusCallFlags = gio::DBusCallFlags::ALLOW_INTERACTIVE_AUTHORIZATION;
 
 type SettingsMap = HashMap<String, HashMap<String, glib::Variant>>;
-type SavedWifiMap = HashMap<String, Arc<[String]>>;
+type SavedWifiMap = HashMap<Vec<u8>, Arc<[String]>>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct WifiSnapshot {
@@ -101,6 +106,7 @@ impl WifiSecurity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct WifiNetwork {
     pub ssid: String,
+    pub ssid_bytes: Vec<u8>,
     pub signal: u8,
     pub security: WifiSecurity,
     pub saved_paths: Arc<[String]>,
@@ -125,6 +131,7 @@ struct AccessPointCandidate {
 
 #[derive(Debug, Default)]
 struct SavedWifiCache {
+    owner: Option<glib::GString>,
     version: Option<u64>,
     profiles: Arc<SavedWifiMap>,
 }
@@ -201,7 +208,7 @@ impl NetworkBackend {
 
         let paths = access_point_paths(&wireless)?;
 
-        let mut by_ssid = HashMap::<String, AccessPointCandidate>::with_capacity(paths.len());
+        let mut by_ssid = HashMap::<Vec<u8>, AccessPointCandidate>::with_capacity(paths.len());
 
         for path in paths {
             let ap_path = path.as_str().to_owned();
@@ -213,9 +220,9 @@ impl NetworkBackend {
             let Some(ssid_bytes) = property::<Vec<u8>>(&access_point, "Ssid") else {
                 continue;
             };
-            let Some(ssid) = ssid_from_bytes(&ssid_bytes) else {
+            if ssid_bytes.is_empty() {
                 continue;
-            };
+            }
 
             let signal = property::<u8>(&access_point, "Strength").unwrap_or(0);
             let flags = property::<u32>(&access_point, "Flags").unwrap_or(0);
@@ -229,10 +236,10 @@ impl NetworkBackend {
                 ap_path,
             };
 
-            match by_ssid.get_mut(&ssid) {
+            match by_ssid.get_mut(&ssid_bytes) {
                 Some(existing) => merge_access_point(existing, candidate),
                 None => {
-                    by_ssid.insert(ssid, candidate);
+                    by_ssid.insert(ssid_bytes, candidate);
                 }
             }
         }
@@ -244,13 +251,14 @@ impl NetworkBackend {
         };
         let mut networks = by_ssid
             .into_iter()
-            .map(|(ssid, access_point)| WifiNetwork {
+            .map(|(ssid_bytes, access_point)| WifiNetwork {
                 saved_paths: saved
                     .as_ref()
-                    .and_then(|saved| saved.get(&ssid))
+                    .and_then(|saved| saved.get(&ssid_bytes))
                     .cloned()
                     .unwrap_or_default(),
-                ssid,
+                ssid: ssid_from_bytes(&ssid_bytes).unwrap_or_default(),
+                ssid_bytes,
                 signal: access_point.signal,
                 security: access_point.security,
                 active: access_point.active,
@@ -342,61 +350,7 @@ impl NetworkBackend {
             return Ok(());
         }
 
-        let mut settings = SettingsMap::new();
-
-        let mut connection = HashMap::new();
-        connection.insert("id".to_owned(), network.ssid.to_variant());
-        connection.insert("type".to_owned(), "802-11-wireless".to_variant());
-        settings.insert("connection".to_owned(), connection);
-
-        let mut wireless = HashMap::new();
-        wireless.insert(
-            "ssid".to_owned(),
-            network.ssid.as_bytes().to_vec().to_variant(),
-        );
-        if network.security.secured() {
-            wireless.insert(
-                "security".to_owned(),
-                "802-11-wireless-security".to_variant(),
-            );
-        }
-        settings.insert("802-11-wireless".to_owned(), wireless);
-
-        let password = || required_password(password);
-        let mut security = HashMap::new();
-        match network.security {
-            WifiSecurity::Open => {}
-            WifiSecurity::Personal => {
-                security.insert("key-mgmt".to_owned(), "wpa-psk".to_variant());
-                security.insert("psk".to_owned(), password()?.to_variant());
-            }
-            WifiSecurity::Sae => {
-                security.insert("key-mgmt".to_owned(), "sae".to_variant());
-                security.insert("psk".to_owned(), password()?.to_variant());
-            }
-            WifiSecurity::Owe => {
-                security.insert("key-mgmt".to_owned(), "owe".to_variant());
-            }
-            WifiSecurity::Wep => {
-                let password = password()?;
-                security.insert("key-mgmt".to_owned(), "none".to_variant());
-                security.insert("wep-key0".to_owned(), password.to_variant());
-                security.insert(
-                    "wep-key-type".to_owned(),
-                    wep_key_type(password).to_variant(),
-                );
-            }
-            WifiSecurity::Enterprise => {
-                return Err(
-                    "enterprise Wi-Fi needs a saved NetworkManager profile with 802.1X credentials"
-                        .to_owned(),
-                );
-            }
-        }
-        if !security.is_empty() {
-            settings.insert("802-11-wireless-security".to_owned(), security);
-        }
-
+        let settings = new_wifi_settings(network, password)?;
         let parameters = (settings, device, access_point).to_variant();
         manager
             .call_sync(
@@ -412,28 +366,54 @@ impl NetworkBackend {
         Ok(())
     }
 
-    pub fn set_vless_active(&self, active: bool) -> Result<(), String> {
-        let _io_guard = network_write_guard()?;
-        let state = vless_state()?;
-        if !state.available {
-            return Err(format!("{VLESS_UNIT} is not installed"));
-        }
-
-        let manager = proxy_for(SYSTEMD_SERVICE, SYSTEMD_PATH, SYSTEMD_MANAGER_INTERFACE)?;
+    pub async fn set_vless_active(active: bool) -> Result<(), String> {
+        let bus = gio::bus_get_future(gio::BusType::System)
+            .await
+            .map_err(|error| format!("Cannot connect to system services: {error}"))?;
         let method = if active { "StartUnit" } else { "StopUnit" };
         let parameters = (VLESS_UNIT, "replace").to_variant();
-        manager
-            .call_sync(
+        match bus
+            .call_future(
+                Some(SYSTEMD_SERVICE),
+                SYSTEMD_PATH,
+                SYSTEMD_MANAGER_INTERFACE,
                 method,
                 Some(&parameters),
+                None,
                 WRITE_CALL_FLAGS,
-                DBUS_TIMEOUT_MS,
-                None::<&gio::Cancellable>,
+                AUTHORIZATION_TIMEOUT_MS,
             )
-            .map_err(|error| {
+            .await
+        {
+            Ok(_) => {}
+            Err(error)
+                if gio::DBusError::remote_error(&error).as_deref()
+                    == Some("org.freedesktop.DBus.Error.InteractiveAuthorizationRequired") =>
+            {
+                // Some sessions cannot authenticate a systemd bus request. pkexec
+                // performs its own interactive authorization for this exact command.
                 let action = if active { "start" } else { "stop" };
-                format!("failed to {action} {VLESS_UNIT}: {error}")
-            })?;
+                let systemctl = glib::find_program_in_path("systemctl")
+                    .ok_or_else(|| "Cannot find systemctl to change VLESS".to_owned())?;
+                let systemctl = systemctl
+                    .to_str()
+                    .ok_or_else(|| "Invalid systemctl path".to_owned())?;
+                let systemctl = systemctl.to_owned();
+                run_background_async(move || command::status(
+                    "pkexec",
+                    &[&systemctl, "--no-ask-password", action, VLESS_UNIT],
+                    Duration::from_millis(AUTHORIZATION_TIMEOUT_MS as u64),
+                )).await.ok_or_else(|| "VLESS authorization was interrupted".to_owned())?.map_err(|error| {
+                    tracing::warn!(%error, "VLESS authorization failed");
+                    "VLESS was not changed. Administrator authentication is required; check that a Polkit authentication agent is running.".to_owned()
+                })?;
+            }
+            Err(mut error) => {
+                gio::DBusError::strip_remote_error(&mut error);
+                let action = if active { "start" } else { "stop" };
+                return Err(format!("Could not {action} VLESS: {error}"));
+            }
+        }
         Ok(())
     }
 
@@ -475,6 +455,62 @@ impl NetworkBackend {
             ))
         }
     }
+}
+
+fn new_wifi_settings(network: &WifiNetwork, password: Option<&str>) -> Result<SettingsMap, String> {
+    let mut settings = SettingsMap::new();
+
+    let mut connection = HashMap::new();
+    connection.insert("id".to_owned(), network.ssid.to_variant());
+    connection.insert("type".to_owned(), "802-11-wireless".to_variant());
+    settings.insert("connection".to_owned(), connection);
+
+    let mut wireless = HashMap::new();
+    wireless.insert("ssid".to_owned(), network.ssid_bytes.to_variant());
+    if network.security.secured() {
+        wireless.insert(
+            "security".to_owned(),
+            "802-11-wireless-security".to_variant(),
+        );
+    }
+    settings.insert("802-11-wireless".to_owned(), wireless);
+
+    let password = || required_password(password);
+    let mut security = HashMap::new();
+    match network.security {
+        WifiSecurity::Open => {}
+        WifiSecurity::Personal => {
+            security.insert("key-mgmt".to_owned(), "wpa-psk".to_variant());
+            security.insert("psk".to_owned(), password()?.to_variant());
+        }
+        WifiSecurity::Sae => {
+            security.insert("key-mgmt".to_owned(), "sae".to_variant());
+            security.insert("psk".to_owned(), password()?.to_variant());
+        }
+        WifiSecurity::Owe => {
+            security.insert("key-mgmt".to_owned(), "owe".to_variant());
+        }
+        WifiSecurity::Wep => {
+            let password = password()?;
+            security.insert("key-mgmt".to_owned(), "none".to_variant());
+            security.insert("wep-key0".to_owned(), password.to_variant());
+            security.insert(
+                "wep-key-type".to_owned(),
+                wep_key_type(password).to_variant(),
+            );
+        }
+        WifiSecurity::Enterprise => {
+            return Err(
+                "enterprise Wi-Fi needs a saved NetworkManager profile with 802.1X credentials"
+                    .to_owned(),
+            );
+        }
+    }
+    if !security.is_empty() {
+        settings.insert("802-11-wireless-security".to_owned(), security);
+    }
+
+    Ok(settings)
 }
 
 fn network_write_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
@@ -645,25 +681,27 @@ impl NetworkBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.version = None;
+        cache.owner = None;
         cache.profiles = Arc::default();
     }
 
     fn saved_wifi_connections(&self) -> Result<Arc<SavedWifiMap>, String> {
         let settings = proxy(NM_SETTINGS_PATH, NM_SETTINGS_INTERFACE)?;
         let version = property::<u64>(&settings, "VersionId");
+        let owner = settings.name_owner();
 
         if let Some(version) = version {
             let cache = self
                 .saved_wifi_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if cache.version == Some(version) {
+            if cache.version == Some(version) && cache.owner == owner {
                 return Ok(Arc::clone(&cache.profiles));
             }
         }
 
         let paths = saved_connection_paths(&settings)?;
-        let mut saved = HashMap::<String, Vec<String>>::with_capacity(paths.len());
+        let mut saved = HashMap::<Vec<u8>, Vec<String>>::with_capacity(paths.len());
 
         for path in paths {
             let path_string = path.as_str().to_owned();
@@ -697,7 +735,7 @@ impl NetworkBackend {
                 .get("802-11-wireless")
                 .and_then(|section| section.get("ssid"))
                 .and_then(variant_value::<Vec<u8>>)
-                .and_then(|bytes| ssid_from_bytes(&bytes))
+                .filter(|bytes| !bytes.is_empty())
             else {
                 continue;
             };
@@ -717,6 +755,7 @@ impl NetworkBackend {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.version = Some(version);
+            cache.owner = owner;
             cache.profiles = Arc::clone(&saved);
         }
         Ok(saved)
@@ -783,10 +822,49 @@ fn merge_access_point(existing: &mut AccessPointCandidate, candidate: AccessPoin
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AccessPointCandidate, WifiSecurity, merge_access_point, required_password, ssid_from_bytes,
-        wep_key_type, wifi_security,
-    };
+    use super::*;
+
+    #[test]
+    fn new_wifi_profile_preserves_raw_ssid_and_password() {
+        let ssid_bytes = b" \xff\xfe Wi-Fi ".to_vec();
+        let network = WifiNetwork {
+            ssid: ssid_from_bytes(&ssid_bytes).unwrap(),
+            ssid_bytes: ssid_bytes.clone(),
+            security: WifiSecurity::Personal,
+            signal: 80,
+            saved_paths: Arc::default(),
+            active: false,
+            ap_path: "/ap/1".to_owned(),
+            device_path: "/device/1".to_owned(),
+        };
+        let settings = new_wifi_settings(&network, Some("  password  ")).unwrap();
+        assert_eq!(
+            settings["802-11-wireless"]["ssid"].get::<Vec<u8>>(),
+            Some(ssid_bytes)
+        );
+        assert_eq!(
+            settings["802-11-wireless-security"]["psk"]
+                .get::<String>()
+                .as_deref(),
+            Some("  password  ")
+        );
+        assert!(new_wifi_settings(&network, None).is_err());
+
+        let open = WifiNetwork {
+            security: WifiSecurity::Open,
+            ..network.clone()
+        };
+        assert!(
+            !new_wifi_settings(&open, None)
+                .unwrap()
+                .contains_key("802-11-wireless-security")
+        );
+        let enterprise = WifiNetwork {
+            security: WifiSecurity::Enterprise,
+            ..network
+        };
+        assert!(new_wifi_settings(&enterprise, Some("password")).is_err());
+    }
 
     fn access_point(signal: u8, active: bool) -> AccessPointCandidate {
         AccessPointCandidate {

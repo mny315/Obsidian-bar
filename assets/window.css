@@ -1481,6 +1481,17 @@ button.wallpaper-directory-select:active {
   padding: 0 4px;
 }
 
+.power-timer-label {
+  font-size: 12px;
+  font-weight: 600;
+  font-feature-settings: "tnum";
+  margin-right: 3px;
+}
+
+.controls-container button.power-toggle.power-timer-active {
+  background: alpha(@theme_selected_bg_color,0.22);
+}
+
 button.icon-button,
 button.quick-toggle,
 button.power-action,

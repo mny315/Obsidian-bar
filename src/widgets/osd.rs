@@ -319,6 +319,9 @@ impl OsdController {
                     return;
                 };
                 let retry = state.refresh.finish();
+                if !state.running.get() {
+                    return;
+                }
                 let controller = Self(state);
 
                 match result {
@@ -516,6 +519,18 @@ fn run_audio_event_monitor(
     let core = context
         .connect_rc(None)
         .map_err(|error| format!("failed to connect to PipeWire: {error}"))?;
+    let _core_listener = core
+        .add_listener_local()
+        .error({
+            let main_loop = main_loop.clone();
+            move |id, _, _, message| {
+                if id == pw::core::PW_ID_CORE {
+                    warn!(%message, "PipeWire audio monitor connection lost");
+                    main_loop.quit();
+                }
+            }
+        })
+        .register();
     let registry = core
         .get_registry_rc()
         .map_err(|error| format!("failed to get PipeWire registry: {error}"))?;

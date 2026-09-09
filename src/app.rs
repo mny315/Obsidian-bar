@@ -18,6 +18,7 @@ use crate::{
         launcher::LauncherCatalog,
         osd::OsdController,
         player::PlayerController,
+        shutdown_timer::ShutdownTimer,
         system_monitor::{SystemMonitorController, SystemMonitorView},
         tray::TrayController,
         wallpaper::WallpaperController,
@@ -51,6 +52,7 @@ pub struct App {
     tray: TrayController,
     launcher_catalog: Rc<LauncherCatalog>,
     wallpaper: Rc<WallpaperController>,
+    shutdown_timer: Rc<ShutdownTimer>,
     osd: RefCell<Option<OsdController>>,
 }
 
@@ -82,6 +84,7 @@ impl App {
             tray: TrayController::new(),
             launcher_catalog: LauncherCatalog::new(),
             wallpaper: WallpaperController::new(),
+            shutdown_timer: ShutdownTimer::new(),
             osd: RefCell::new(None),
         })
     }
@@ -188,6 +191,10 @@ impl App {
         };
 
         self.wallpaper.start();
+        self.shutdown_timer.start();
+        self.player.start();
+        self.tray.start();
+        self.launcher_catalog.start();
         self.audio_spectrum.start();
         self.system_monitor.start();
         self.ensure_niri_listener();
@@ -375,6 +382,7 @@ impl App {
                             player_controller: &self.player,
                             tray_controller: &self.tray,
                             wallpaper_controller: &self.wallpaper,
+                            shutdown_timer: &self.shutdown_timer,
                             osd_controller: osd,
                         },
                     ) {

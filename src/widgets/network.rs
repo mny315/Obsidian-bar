@@ -14,8 +14,8 @@ use super::{
     attach_popup_lifecycle, build_bar_popup, build_quick_toggle_button, build_refresh_button,
     clear_box, detach_application_window, empty_state_label,
     network_backend::{NetworkBackend, VlessState, WifiNetwork, WifiSnapshot},
-    reset_hidden_popup_state, run_background, run_when_popup_visible, set_optional_label,
-    set_spinner_active,
+    reset_hidden_popup_state, run_background, run_background_async, run_when_popup_visible,
+    set_optional_label, set_spinner_active,
 };
 
 const SCAN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -129,7 +129,7 @@ struct NetworkController {
     rescan_icon: gtk::Label,
     rescan_spinner: gtk::Spinner,
     list: gtk::Box,
-    network_rows: RefCell<HashMap<String, NetworkRow>>,
+    network_rows: RefCell<HashMap<Vec<u8>, NetworkRow>>,
     header_initialized: Cell<bool>,
     list_initialized: Cell<bool>,
     list_dirty: Cell<bool>,
@@ -286,6 +286,11 @@ impl NetworkIndicator {
         notice.add_css_class("network-notice");
         notice.set_xalign(0.0);
         notice.set_wrap(true);
+        notice.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        notice.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+        notice.set_max_width_chars(48);
+        notice.set_lines(3);
+        notice.set_ellipsize(gtk::pango::EllipsizeMode::End);
         notice.set_visible(false);
 
         let section_title = gtk::Label::new(Some("Networks"));
@@ -869,12 +874,12 @@ impl NetworkController {
         let desired_ssids = snapshot
             .networks
             .iter()
-            .map(|network| network.ssid.as_str())
+            .map(|network| network.ssid_bytes.as_slice())
             .collect::<HashSet<_>>();
         {
             let mut rows = self.network_rows.borrow_mut();
             rows.retain(|ssid, row| {
-                let keep = desired_ssids.contains(ssid.as_str());
+                let keep = desired_ssids.contains(ssid.as_slice());
                 if !keep {
                     self.list.remove(&row.row);
                 }
@@ -885,14 +890,14 @@ impl NetworkController {
         let mut previous: Option<gtk::Widget> = None;
         let mut rows = self.network_rows.borrow_mut();
         for network in &snapshot.networks {
-            let row = if let Some(row) = rows.get_mut(network.ssid.as_str()) {
+            let row = if let Some(row) = rows.get_mut(network.ssid_bytes.as_slice()) {
                 row.update(network);
                 row.row.clone()
             } else {
                 let row = self.build_network_row(network.clone());
                 let widget = row.row.clone();
                 self.list.append(&widget);
-                rows.insert(network.ssid.clone(), row);
+                rows.insert(network.ssid_bytes.clone(), row);
                 widget
             };
 
@@ -1083,6 +1088,10 @@ impl NetworkController {
     }
 
     fn set_wifi_enabled(self: &Rc<Self>, enabled: bool) {
+        if self.action_busy.get() {
+            self.update_header();
+            return;
+        }
         {
             let mut state = self.state.borrow_mut();
             state.wifi.enabled = enabled;
@@ -1116,9 +1125,11 @@ impl NetworkController {
         } else {
             "Stopping VLESS…"
         };
-        self.run_action(status, RefreshTarget::Vless, move |backend| {
-            backend.set_vless_active(target)
-        });
+        self.run_action_future(
+            status,
+            RefreshTarget::Vless,
+            NetworkBackend::set_vless_active(target),
+        );
     }
 
     fn rescan(self: &Rc<Self>) {
@@ -1200,6 +1211,20 @@ impl NetworkController {
     where
         F: FnOnce(NetworkBackend) -> Result<(), String> + Send + 'static,
     {
+        let backend = self.backend.clone();
+        self.run_action_future(status, refresh_target, async move {
+            run_background_async(move || job(backend))
+                .await
+                .unwrap_or_else(|| Err("Network action was interrupted".to_owned()))
+        });
+    }
+
+    fn run_action_future(
+        self: &Rc<Self>,
+        status: &str,
+        refresh_target: RefreshTarget,
+        action: impl std::future::Future<Output = Result<(), String>> + 'static,
+    ) {
         if self.action_busy.replace(true) {
             return;
         }
@@ -1215,37 +1240,34 @@ impl NetworkController {
         self.set_notice(Some(status));
         self.update_header();
 
-        let backend = self.backend.clone();
         let weak = Rc::downgrade(self);
-        run_background(
-            move || job(backend),
-            move |result| {
-                let Some(this) = weak.upgrade() else {
-                    return;
-                };
-                this.action_busy.set(false);
+        glib::MainContext::default().spawn_local(async move {
+            let result = action.await;
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            this.action_busy.set(false);
 
-                let succeeded = result.is_ok();
-                match result {
-                    Ok(()) => this.set_notice(None),
-                    Err(error) => {
-                        warn!(%error, "network action failed");
-                        this.set_notice(Some(&error));
+            let succeeded = result.is_ok();
+            match result {
+                Ok(()) => this.set_notice(None),
+                Err(error) => {
+                    warn!(%error, "network action failed");
+                    this.set_notice(Some(&error));
+                }
+            }
+            this.update_header();
+            if succeeded && matches!(refresh_target, RefreshTarget::Vless) {
+                let weak = Rc::downgrade(&this);
+                glib::timeout_add_local_once(VLESS_ACTION_REFRESH_DELAY, move || {
+                    if let Some(this) = weak.upgrade() {
+                        this.refresh_vless();
                     }
-                }
-                this.update_header();
-                if succeeded && matches!(refresh_target, RefreshTarget::Vless) {
-                    let weak = Rc::downgrade(&this);
-                    glib::timeout_add_local_once(VLESS_ACTION_REFRESH_DELAY, move || {
-                        if let Some(this) = weak.upgrade() {
-                            this.refresh_vless();
-                        }
-                    });
-                } else {
-                    this.refresh_target(refresh_target);
-                }
-            },
-        );
+                });
+            } else {
+                this.refresh_target(refresh_target);
+            }
+        });
     }
 
     fn refresh_target(self: &Rc<Self>, target: RefreshTarget) {
@@ -1314,7 +1336,9 @@ fn refresh_password_target(
         .networks
         .iter()
         .find(|network| {
-            network.ssid == target.ssid && !network.saved() && network.security.requires_password()
+            network.ssid_bytes == target.ssid_bytes
+                && !network.saved()
+                && network.security.requires_password()
         })
         .cloned()
 }

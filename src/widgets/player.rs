@@ -39,6 +39,7 @@ struct PlayerUi {
     revealer: gtk::Revealer,
     available: Cell<bool>,
     enabled: Cell<bool>,
+    rendered: RefCell<Option<PlayerView>>,
 }
 
 impl PlayerUi {
@@ -126,6 +127,7 @@ impl PlayerUi {
             revealer,
             available: Cell::new(false),
             enabled: Cell::new(true),
+            rendered: RefCell::new(None),
         }
     }
 
@@ -140,6 +142,7 @@ impl PlayerUi {
     }
 
     fn clear(&self) {
+        self.rendered.borrow_mut().take();
         self.available.set(false);
         self.update_visibility();
         self.source.set_visible(false);
@@ -155,6 +158,10 @@ impl PlayerUi {
     }
 
     fn render(&self, view: &PlayerView) {
+        if self.rendered.borrow().as_ref() == Some(view) {
+            return;
+        }
+        self.rendered.replace(Some(view.clone()));
         let can_switch_source = view.source_count > 1;
         self.source.set_visible(can_switch_source);
         self.source.set_sensitive(can_switch_source);
@@ -371,6 +378,7 @@ fn enqueue_player_event(sender: &async_channel::Sender<PlayerEvent>, event: Play
     let _ = sender.try_send(event);
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct PlayerView {
     status: PlaybackStatus,
     source_count: usize,
@@ -455,11 +463,12 @@ impl PlayerState {
     fn owner_changed(&mut self, bus_name: &str, has_owner: bool) {
         self.players.retain(|player| player.bus_name != bus_name);
         self.source_states.remove(bus_name);
+        // A replacement owner can arrive while the previous proxy is still
+        // connecting. Its pending request must not suppress the new connection.
+        self.pending_players.remove(bus_name);
 
         if has_owner {
             self.connect_player(bus_name);
-        } else {
-            self.pending_players.remove(bus_name);
         }
 
         self.refresh_views();
@@ -779,9 +788,9 @@ impl PlayerState {
 }
 
 pub struct PlayerController {
-    _manager: Rc<RefCell<Option<gio::DBusProxy>>>,
-    _manager_init_pending: Rc<Cell<bool>>,
-    _manager_retry_attempt: Rc<Cell<u32>>,
+    manager: Rc<RefCell<Option<gio::DBusProxy>>>,
+    manager_init_pending: Rc<Cell<bool>>,
+    manager_retry_attempt: Rc<Cell<u32>>,
     state: Rc<RefCell<PlayerState>>,
 }
 
@@ -812,19 +821,21 @@ impl PlayerController {
 
         let manager_init_pending = Rc::new(Cell::new(false));
         let manager_retry_attempt = Rc::new(Cell::new(0));
-        initialize_player_manager(
-            &manager,
-            &state,
-            &manager_init_pending,
-            &manager_retry_attempt,
-        );
-
         Self {
-            _manager: manager,
-            _manager_init_pending: manager_init_pending,
-            _manager_retry_attempt: manager_retry_attempt,
+            manager,
+            manager_init_pending,
+            manager_retry_attempt,
             state,
         }
+    }
+
+    pub fn start(&self) {
+        initialize_player_manager(
+            &self.manager,
+            &self.state,
+            &self.manager_init_pending,
+            &self.manager_retry_attempt,
+        );
     }
 }
 

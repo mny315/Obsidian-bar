@@ -412,6 +412,7 @@ pub struct WallpaperController {
     applying: Cell<bool>,
     pending_apply: RefCell<Option<PendingApply>>,
     lifecycle_generation: Generation,
+    selection_generation: Generation,
     random_source: RefCell<Option<glib::SourceId>>,
     random_pick_busy: Cell<bool>,
     random_nonce: Cell<u64>,
@@ -432,6 +433,7 @@ impl WallpaperController {
             applying: Cell::new(false),
             pending_apply: RefCell::new(None),
             lifecycle_generation: Generation::default(),
+            selection_generation: Generation::default(),
             random_source: RefCell::new(None),
             random_pick_busy: Cell::new(false),
             random_nonce: Cell::new(0),
@@ -519,6 +521,7 @@ impl WallpaperController {
         }
 
         self.persist_settings_update(|settings| settings.directory = directory)?;
+        self.selection_generation.bump();
         self.broadcast();
         Ok(())
     }
@@ -530,6 +533,7 @@ impl WallpaperController {
 
     fn set_random_enabled(self: &Rc<Self>, enabled: bool) -> Result<(), WallpaperError> {
         self.persist_settings_update(|settings| settings.random_enabled = enabled)?;
+        self.selection_generation.bump();
         self.reschedule_random_timer();
         Ok(())
     }
@@ -588,6 +592,7 @@ impl WallpaperController {
         let nonce = self.random_nonce.get().wrapping_add(1);
         self.random_nonce.set(nonce);
         let lifecycle = self.lifecycle_generation.current();
+        let selection = self.selection_generation.current();
         let weak = Rc::downgrade(self);
         run_background(
             move || {
@@ -600,6 +605,7 @@ impl WallpaperController {
                 };
                 controller.random_pick_busy.set(false);
                 if !controller.lifecycle_is_current(lifecycle)
+                    || !controller.selection_generation.is_current(selection)
                     || controller.settings.borrow().directory != directory
                 {
                     return;
@@ -639,6 +645,7 @@ impl WallpaperController {
             return;
         }
 
+        self.selection_generation.bump();
         let request = PendingApply {
             path,
             force,
@@ -730,8 +737,11 @@ impl WallpaperController {
             path.clone()
         };
 
+        if self.pending_apply.borrow().is_some() {
+            return Ok(());
+        }
         self.ensure_awww_daemon(lifecycle).await?;
-        if !self.lifecycle_is_current(lifecycle) {
+        if !self.lifecycle_is_current(lifecycle) || self.pending_apply.borrow().is_some() {
             return Ok(());
         }
         let transition_daemon = if self.has_active_video_backend() {
@@ -752,7 +762,27 @@ impl WallpaperController {
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
         }
-        wait_awww_transition().await;
+        // awww owns the animation and can replace it with the next image. Only
+        // a handoff to/from mpvpaper needs a completed frame before proceeding.
+        if transition_daemon.is_some() || is_video_wallpaper(&path) {
+            let started = Instant::now();
+            while started.elapsed() < AWWW_TRANSITION_DURATION
+                && self.lifecycle_is_current(lifecycle)
+                && self.pending_apply.borrow().is_none()
+            {
+                wait_local(Duration::from_millis(16)).await;
+            }
+            if self.lifecycle_is_current(lifecycle) && self.pending_apply.borrow().is_some() {
+                // Finish the covering frame before retiring an old video; dropping
+                // a partially transparent transition surface would expose it again.
+                apply_awww_image_immediate(awww_frame.clone(), transition_namespace).await?;
+                if !wait_for_awww_image(transition_namespace, awww_frame.clone()).await {
+                    return Err(WallpaperError::Backend(
+                        "awww did not present the replacement frame in time".into(),
+                    ));
+                }
+            }
+        }
 
         if !self.lifecycle_is_current(lifecycle) {
             return Ok(());
@@ -773,19 +803,25 @@ impl WallpaperController {
             }
         }
 
-        if is_video_wallpaper(&path) {
-            if let Err(error) = self.start_video_backend(path.clone(), lifecycle).await {
-                self.restore_after_video_failure(&path, &awww_frame, lifecycle)
-                    .await;
-                return Err(error);
-            }
-            if !self.lifecycle_is_current(lifecycle) {
-                return Ok(());
+        let started_video = if is_video_wallpaper(&path) && self.pending_apply.borrow().is_none() {
+            match self.start_video_backend(path.clone(), lifecycle).await {
+                Ok(started) => started,
+                Err(error) => {
+                    self.restore_after_video_failure(&path, &awww_frame, lifecycle)
+                        .await;
+                    return Err(error);
+                }
             }
         } else {
+            false
+        };
+        if !self.lifecycle_is_current(lifecycle) {
+            return Ok(());
+        }
+        if !started_video {
             self.backend.replace(Some(WallpaperBackend::Image {
                 source: path.clone(),
-                frame: path.clone(),
+                frame: awww_frame,
             }));
             info!(path = %path.display(), "awww image wallpaper applied");
         }
@@ -818,26 +854,35 @@ impl WallpaperController {
         &self,
         source: PathBuf,
         lifecycle: u64,
-    ) -> Result<(), WallpaperError> {
+    ) -> Result<bool, WallpaperError> {
         let video = spawn_mpvpaper(&source)?;
-        let ready = wait_for_mpvpaper_ready(video.ipc_socket.clone()).await;
-        if !self.lifecycle_is_current(lifecycle) {
-            return Ok(());
+        let started = Instant::now();
+        loop {
+            if !self.lifecycle_is_current(lifecycle) || self.pending_apply.borrow().is_some() {
+                return Ok(false);
+            }
+            if !video.is_alive() {
+                return Err(WallpaperError::Backend(
+                    "mpvpaper exited before its video output became ready".into(),
+                ));
+            }
+            if mpvpaper_is_ready(video.ipc_socket.clone()).await {
+                break;
+            }
+            if started.elapsed() >= MPVPAPER_READY_TIMEOUT {
+                return Err(WallpaperError::Backend(format!(
+                    "mpvpaper video output did not become ready within {} ms",
+                    MPVPAPER_READY_TIMEOUT.as_millis()
+                )));
+            }
+            wait_local(Duration::from_millis(20)).await;
         }
-        if !video.is_alive() {
-            return Err(WallpaperError::Backend(
-                "mpvpaper exited before its video output became ready".into(),
-            ));
-        }
-        if !ready {
-            return Err(WallpaperError::Backend(format!(
-                "mpvpaper video output did not become ready within {} ms",
-                MPVPAPER_READY_TIMEOUT.as_millis()
-            )));
+        if !self.lifecycle_is_current(lifecycle) || self.pending_apply.borrow().is_some() {
+            return Ok(false);
         }
         make_awww_transparent(AWWW_NAMESPACE).await?;
         if !self.lifecycle_is_current(lifecycle) {
-            return Ok(());
+            return Ok(false);
         }
 
         self.backend.replace(Some(WallpaperBackend::Video {
@@ -845,7 +890,7 @@ impl WallpaperController {
             process: video,
         }));
         info!(path = %source.display(), "mpvpaper video wallpaper started after awww transition");
-        Ok(())
+        Ok(true)
     }
 
     async fn ensure_awww_daemon(&self, lifecycle: u64) -> Result<(), WallpaperError> {
@@ -2319,11 +2364,18 @@ fn thumbnail_waiters() -> &'static Mutex<ThumbnailWaiters> {
 }
 
 fn thumbnail_job_needed(source: &Path) -> bool {
-    thumbnail_waiters()
+    let mut waiters = thumbnail_waiters()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let needed = waiters
         .get(source)
-        .is_some_and(|waiters| waiters.iter().any(|waiter| !waiter.is_closed()))
+        .is_some_and(|waiters| waiters.iter().any(|waiter| !waiter.is_closed()));
+    if !needed {
+        // Remove while holding the same lock used to subscribe new views.
+        // A later request can then enqueue its own job without being cancelled.
+        waiters.remove(source);
+    }
+    needed
 }
 
 fn finish_thumbnail_job(source: &Path, result: ThumbnailResult) {
@@ -2352,10 +2404,6 @@ fn thumbnail_worker_queue(
                 .spawn(move || {
                     while let Ok(job) = receiver.recv_blocking() {
                         if !thumbnail_job_needed(&job.source) {
-                            finish_thumbnail_job(
-                                &job.source,
-                                Err("thumbnail request was cancelled".to_owned()),
-                            );
                             continue;
                         }
                         let result = build(&job.source).map_err(|error| error.to_string());
@@ -2554,10 +2602,8 @@ fn extract_video_frame(
     destination: &Path,
     video_filter: Option<&str>,
 ) -> Result<(), WallpaperError> {
-    extract_video_frame_at(source, destination, Some(1.0), video_filter).or_else(|_| {
-        let _ = fs::remove_file(destination);
-        extract_video_frame_at(source, destination, None, video_filter)
-    })
+    extract_video_frame_at(source, destination, Some(1.0), video_filter)
+        .or_else(|_| extract_video_frame_at(source, destination, None, video_filter))
 }
 
 fn extract_video_frame_at(
@@ -3592,36 +3638,23 @@ fn cleanup_stale_mpvpaper_sockets() {
 #[cfg(not(target_os = "linux"))]
 fn cleanup_stale_mpvpaper_sockets() {}
 
-async fn wait_for_mpvpaper_ready(socket: PathBuf) -> bool {
-    run_background_async(move || wait_for_mpvpaper_ready_blocking(&socket))
+async fn mpvpaper_is_ready(socket: PathBuf) -> bool {
+    run_background_async(move || mpvpaper_is_ready_blocking(&socket))
         .await
         .unwrap_or(false)
 }
 
 #[cfg(unix)]
-fn wait_for_mpvpaper_ready_blocking(socket: &Path) -> bool {
-    let started_at = Instant::now();
-    while started_at.elapsed() < MPVPAPER_READY_TIMEOUT {
-        let command = serde_json::json!(["get_property", "vo-configured"]);
-        if let Ok(message) = mpv_ipc_request_blocking(
-            socket,
-            MPV_REQUEST_VO_CONFIGURED,
-            command,
-            Duration::from_millis(120),
-        ) && message.error.as_deref() == Some("success")
-            && message.data == Some(serde_json::Value::Bool(true))
-        {
-            return true;
-        }
-
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    false
+fn mpvpaper_is_ready_blocking(socket: &Path) -> bool {
+    let command = serde_json::json!(["get_property", "vo-configured"]);
+    matches!(mpv_ipc_request_blocking(
+        socket, MPV_REQUEST_VO_CONFIGURED, command, Duration::from_millis(120),
+    ), Ok(message) if message.error.as_deref() == Some("success")
+        && message.data == Some(serde_json::Value::Bool(true)))
 }
 
 #[cfg(not(unix))]
-fn wait_for_mpvpaper_ready_blocking(_socket: &Path) -> bool {
+fn mpvpaper_is_ready_blocking(_socket: &Path) -> bool {
     false
 }
 
@@ -3919,5 +3952,220 @@ mod tests {
         assert_eq!(response.request_id, Some(MPV_REQUEST_VO_CONFIGURED));
         assert_eq!(response.error.as_deref(), Some("success"));
         assert_eq!(response.data, Some(serde_json::Value::Bool(true)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rapid_wallpaper_changes_helper() {
+        let Some(directory) = env::var_os("OBSIDIAN_WALLPAPER_TEST_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let first = directory.join("first.png");
+        let middle = directory.join("middle.png");
+        let last = directory.join("last wallpaper.png");
+        for path in [&first, &middle, &last] {
+            fs::write(path, b"fixture").unwrap();
+        }
+        let controller = WallpaperController::new();
+        controller.started.set(true);
+        controller.awww_daemon.replace(Some(OwnedAwwwDaemon {
+            process: ManagedSubprocess::spawn(
+                "fixture-main",
+                &[OsStr::new("sleep"), OsStr::new("30")],
+            )
+            .unwrap(),
+        }));
+        fs::write(directory.join("obsidian-bar.ready"), b"").unwrap();
+
+        glib::MainContext::default().block_on(async {
+            let started = Instant::now();
+            controller
+                .apply_animated(first.clone(), false, 0)
+                .await
+                .unwrap();
+            controller
+                .apply_animated(middle.clone(), false, 0)
+                .await
+                .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(1100),
+                "image changes must not wait for either 1.2-second animation"
+            );
+
+            fs::write(directory.join("events"), b"").unwrap();
+            controller.request_apply_silent(first.clone());
+            controller.request_apply_silent(middle.clone());
+            controller.request_apply_silent(last.clone());
+            while controller.applying.get() {
+                wait_local(Duration::from_millis(10)).await;
+                assert!(started.elapsed() < Duration::from_secs(3));
+            }
+            let events = fs::read_to_string(directory.join("events")).unwrap();
+            assert!(!events.contains("first.png"));
+            assert!(!events.contains("middle.png"));
+            assert!(events.contains("last wallpaper.png"));
+
+            // A new click during a video handoff must settle the covering image
+            // before stopping the old player, then finish on the latest selection.
+            let video = OwnedMpvpaper {
+                process: ManagedSubprocess::spawn(
+                    "fixture-video",
+                    &[OsStr::new("sleep"), OsStr::new("30")],
+                )
+                .unwrap(),
+                ipc_socket: directory.join("unused.sock"),
+            };
+            let video_running = Rc::clone(&video.process.running);
+            controller.backend.replace(Some(WallpaperBackend::Video {
+                source: directory.join("old.mp4"),
+                process: video,
+            }));
+            fs::write(directory.join("events"), b"").unwrap();
+            controller.request_apply_silent(first.clone());
+            let started = Instant::now();
+            loop {
+                let events = fs::read_to_string(directory.join("events")).unwrap();
+                if events
+                    .lines()
+                    .any(|line| line.starts_with("obsidian-bar-transition|"))
+                {
+                    assert!(
+                        video_running.get(),
+                        "old video must stay alive behind the transition"
+                    );
+                    break;
+                }
+                wait_local(Duration::from_millis(10)).await;
+                assert!(started.elapsed() < Duration::from_secs(3));
+            }
+            controller.request_apply_silent(last.clone());
+            while controller.applying.get() {
+                wait_local(Duration::from_millis(10)).await;
+                assert!(
+                    started.elapsed() < Duration::from_millis(1100),
+                    "a queued click must interrupt the video transition wait"
+                );
+            }
+            assert!(!video_running.get());
+            assert!(controller.backend_matches(&last));
+            assert_eq!(controller.settings.borrow().current.as_ref(), Some(&last));
+            let events = fs::read_to_string(directory.join("events")).unwrap();
+            let cover = events.find("obsidian-bar-transition|simple|").unwrap();
+            let synchronize = events.find("obsidian-bar|simple|").unwrap();
+            let latest = events.rfind("last wallpaper.png").unwrap();
+            assert!(cover < synchronize && synchronize < latest);
+
+            let pending_controller = Rc::clone(&controller);
+            let pending_path = last.clone();
+            glib::timeout_add_local_once(Duration::from_millis(40), move || {
+                pending_controller.queue_apply(PendingApply {
+                    path: pending_path,
+                    force: false,
+                    on_error: Rc::new(|_| {}),
+                });
+            });
+            let started = Instant::now();
+            let installed = controller
+                .start_video_backend(directory.join("slow.mp4"), 0)
+                .await
+                .unwrap();
+            assert!(!installed);
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "a replaced video must not hold the queue until the readiness timeout"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.join("events")).unwrap(),
+                events,
+                "the covering image must remain visible when video loading is cancelled"
+            );
+            controller.take_pending_apply();
+        });
+        controller.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rapid_changes_replace_stale_requests_and_preserve_video_handoffs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = env::temp_dir().join(format!(
+            "obsidian-switch-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let client = directory.join("awww");
+        let daemon = directory.join("awww-daemon");
+        fs::write(&client, r#"#!/bin/sh
+set -eu
+operation=$1
+shift
+namespace=obsidian-bar
+transition=none
+source_path=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --namespace) namespace=$2; shift 2 ;;
+        --transition-type) transition=$2; shift 2 ;;
+        --*) shift 2 ;;
+        *) source_path=$1; shift ;;
+    esac
+done
+case "$operation" in
+    query)
+        test -f "$OBSIDIAN_WALLPAPER_TEST_DIR/$namespace.ready" || exit 1
+        if [ -f "$OBSIDIAN_WALLPAPER_TEST_DIR/$namespace.frame" ]; then
+            printf 'TEST: currently displaying: image: '
+            cat "$OBSIDIAN_WALLPAPER_TEST_DIR/$namespace.frame"
+        fi ;;
+    img)
+        printf '%s\n' "$source_path" > "$OBSIDIAN_WALLPAPER_TEST_DIR/$namespace.frame"
+        printf '%s|%s|%s\n' "$namespace" "$transition" "$source_path" >> "$OBSIDIAN_WALLPAPER_TEST_DIR/events" ;;
+    clear) printf 'clear|%s\n' "$namespace" >> "$OBSIDIAN_WALLPAPER_TEST_DIR/events" ;;
+    *) exit 1 ;;
+esac
+"#).unwrap();
+        fs::write(
+            &daemon,
+            r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --namespace) touch "$OBSIDIAN_WALLPAPER_TEST_DIR/$2.ready"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+exec sleep 30
+"#,
+        )
+        .unwrap();
+        for path in [&client, &daemon] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "widgets::wallpaper::tests::rapid_wallpaper_changes_helper",
+                "--nocapture",
+            ])
+            .env("OBSIDIAN_WALLPAPER_TEST_DIR", &directory)
+            .env("OBSIDIAN_BAR_AWWW_BIN", &client)
+            .env("OBSIDIAN_BAR_AWWW_DAEMON_BIN", &daemon)
+            .env("OBSIDIAN_BAR_MPVPAPER_BIN", &daemon)
+            .env("XDG_STATE_HOME", &directory)
+            .env("XDG_RUNTIME_DIR", &directory)
+            .output()
+            .unwrap();
+        let _ = fs::remove_dir_all(directory);
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

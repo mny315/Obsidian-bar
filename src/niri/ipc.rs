@@ -14,11 +14,12 @@ use std::{
 use niri_ipc::{
     Action, Event, LayoutSwitchTarget, Reply, Request, Response, Window, Workspace,
     WorkspaceReferenceArg,
-    socket::{SOCKET_PATH_ENV, Socket},
+    socket::SOCKET_PATH_ENV,
     state::{EventStreamStatePart, KeyboardLayoutsState, WindowsState, WorkspacesState},
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const KNOWN_LAYOUTS: &[(&[&str], &str)] = &[
     (&["english (us)", "english (united states)", "us"], "US"),
     (
@@ -113,9 +114,25 @@ pub fn focus_workspace(id: u64) -> io::Result<()> {
 }
 
 fn send_action(action: Action) -> io::Result<()> {
-    let mut socket = Socket::connect()?;
+    let socket_path = env::var_os(SOCKET_PATH_ENV)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "NIRI_SOCKET is not set"))?;
+    send_action_on_stream(UnixStream::connect(socket_path)?, action, ACTION_TIMEOUT)
+}
 
-    match socket.send(Request::Action(action))? {
+fn send_action_on_stream(
+    mut stream: UnixStream,
+    action: Action,
+    timeout: Duration,
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let mut request = serde_json::to_string(&Request::Action(action)).map_err(io::Error::other)?;
+    request.push('\n');
+    stream.write_all(request.as_bytes())?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    let reply: Reply = serde_json::from_str(&reply).map_err(io::Error::other)?;
+    match reply {
         Ok(Response::Handled) => Ok(()),
         Ok(response) => Err(io::Error::other(format!(
             "unexpected niri action response: {response:?}"
@@ -337,6 +354,53 @@ fn compact_layout_name(name: &str) -> String {
 mod tests {
     use super::*;
     use niri_ipc::KeyboardLayouts;
+
+    #[test]
+    fn an_unresponsive_compositor_does_not_hold_a_worker_forever() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        let error = send_action_on_stream(
+            client,
+            Action::SwitchLayout {
+                layout: LayoutSwitchTarget::Next,
+            },
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn action_requests_preserve_the_niri_protocol() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let responder = thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap(),
+                serde_json::to_value(Request::Action(Action::FocusWorkspace {
+                    reference: WorkspaceReferenceArg::Id(42),
+                }))
+                .unwrap()
+            );
+            server.write_all(b"{\"Ok\":\"Handled\"}\n").unwrap();
+        });
+        send_action_on_stream(
+            client,
+            Action::FocusWorkspace {
+                reference: WorkspaceReferenceArg::Id(42),
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        responder.join().unwrap();
+    }
 
     #[test]
     fn layout_names_are_compact_and_specific() {

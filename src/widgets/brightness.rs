@@ -4,7 +4,10 @@ use std::{
     fs,
     path::Path,
     rc::Rc,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 
@@ -29,6 +32,7 @@ const BRIGHTNESS_CACHE_TTL: Duration = Duration::from_millis(500);
 static BRIGHTNESS_CACHE: OnceLock<Mutex<Option<(Instant, BrightnessState)>>> = OnceLock::new();
 static BRIGHTNESS_READ_LOCK: Mutex<()> = Mutex::new(());
 static BRIGHTNESS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static BRIGHTNESS_CACHE_REVISION: AtomicU64 = AtomicU64::new(0);
 const INLINE_REVEAL_DURATION_MS: u32 = 300;
 const BACKLIGHT_CLASS_PATH: &str = "/sys/class/backlight";
 const BRIGHTNESSCTL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -82,11 +86,13 @@ struct BrightnessController {
     refresh: RefreshGate,
     refresh_revision: Generation,
     write_serial: Generation,
+    write_scheduled: Cell<bool>,
     write_busy: Cell<bool>,
     pending_write: Cell<Option<f64>>,
     percent_flash_serial: Generation,
     backlight_monitors: RefCell<Vec<gio::FileMonitor>>,
     backlight_refresh_pending: Cell<bool>,
+    backlight_monitors_dirty: Cell<bool>,
 }
 
 pub struct BrightnessIndicator {
@@ -137,11 +143,13 @@ impl BrightnessIndicator {
             refresh: RefreshGate::default(),
             refresh_revision: Generation::default(),
             write_serial: Generation::default(),
+            write_scheduled: Cell::new(false),
             write_busy: Cell::new(false),
             pending_write: Cell::new(None),
             percent_flash_serial: Generation::default(),
             backlight_monitors: RefCell::new(Vec::new()),
             backlight_refresh_pending: Cell::new(false),
+            backlight_monitors_dirty: Cell::new(false),
         });
 
         BrightnessController::connect(&controller);
@@ -210,7 +218,7 @@ impl BrightnessController {
             let weak = Rc::downgrade(this);
             monitor.connect_changed(move |_, _, _, _| {
                 if let Some(this) = weak.upgrade() {
-                    this.schedule_backlight_refresh();
+                    this.schedule_backlight_refresh(true);
                 }
             });
             monitors.push(monitor);
@@ -232,7 +240,7 @@ impl BrightnessController {
                     let weak = Rc::downgrade(this);
                     monitor.connect_changed(move |_, _, _, _| {
                         if let Some(this) = weak.upgrade() {
-                            this.schedule_backlight_refresh();
+                            this.schedule_backlight_refresh(false);
                         }
                     });
                     monitors.push(monitor);
@@ -243,7 +251,10 @@ impl BrightnessController {
         this.backlight_monitors.replace(monitors);
     }
 
-    fn schedule_backlight_refresh(self: &Rc<Self>) {
+    fn schedule_backlight_refresh(self: &Rc<Self>, rebuild_monitors: bool) {
+        if rebuild_monitors {
+            self.backlight_monitors_dirty.set(true);
+        }
         if self.backlight_refresh_pending.replace(true) {
             return;
         }
@@ -254,7 +265,9 @@ impl BrightnessController {
                 return;
             };
             this.backlight_refresh_pending.set(false);
-            Self::install_backlight_monitors(&this);
+            if this.backlight_monitors_dirty.replace(false) {
+                Self::install_backlight_monitors(&this);
+            }
             invalidate_brightness_cache();
             this.refresh();
         });
@@ -274,7 +287,10 @@ impl BrightnessController {
 
             let retry = this.refresh.finish();
 
-            if this.refresh_revision.is_current(revision) {
+            if this.refresh_revision.is_current(revision)
+                && !this.write_scheduled.get()
+                && !this.write_busy.get()
+            {
                 match result {
                     Ok(state) => {
                         *this.state.borrow_mut() = state;
@@ -361,6 +377,7 @@ impl BrightnessController {
     }
 
     fn schedule_write(self: &Rc<Self>, value: f64) {
+        self.write_scheduled.set(true);
         let generation = self.write_serial.bump();
         let delay = match self.state.borrow().backend {
             BrightnessBackend::Backlight => BACKLIGHT_WRITE_DEBOUNCE,
@@ -374,6 +391,7 @@ impl BrightnessController {
                 return;
             };
             if this.write_serial.is_current(generation) {
+                this.write_scheduled.set(false);
                 this.write_now(value);
             }
         });
@@ -425,10 +443,14 @@ fn read_brightness() -> Result<BrightnessState, String> {
         return Ok(state);
     }
 
+    let revision = BRIGHTNESS_CACHE_REVISION.load(AtomicOrdering::Acquire);
     let state = read_brightness_uncached()?;
-    *brightness_cache()
+    let mut cache = brightness_cache()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), state));
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if BRIGHTNESS_CACHE_REVISION.load(AtomicOrdering::Acquire) == revision {
+        *cache = Some((Instant::now(), state));
+    }
     Ok(state)
 }
 
@@ -466,9 +488,11 @@ fn brightness_cache() -> &'static Mutex<Option<(Instant, BrightnessState)>> {
 }
 
 fn invalidate_brightness_cache() {
-    *brightness_cache()
+    let mut cache = brightness_cache()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    BRIGHTNESS_CACHE_REVISION.fetch_add(1, AtomicOrdering::AcqRel);
+    *cache = None;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,9 +656,11 @@ fn write_brightness(backend: BrightnessBackend, value: f64) -> Result<Brightness
     };
 
     if let Ok(resolved_backend) = result.as_ref() {
-        *brightness_cache()
+        let mut cache = brightness_cache()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        BRIGHTNESS_CACHE_REVISION.fetch_add(1, AtomicOrdering::AcqRel);
+        *cache = Some((
             Instant::now(),
             BrightnessState {
                 backend: *resolved_backend,

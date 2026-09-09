@@ -101,6 +101,7 @@ struct AudioController {
     volume_revision: Generation,
     sinks_revision: Generation,
     volume_write_serial: Generation,
+    volume_write_scheduled: Cell<bool>,
     volume_write_busy: Cell<bool>,
     pending_volume_write: Cell<Option<f64>>,
     mute_write_busy: Cell<bool>,
@@ -289,6 +290,7 @@ impl AudioIndicator {
             volume_revision: Generation::default(),
             sinks_revision: Generation::default(),
             volume_write_serial: Generation::default(),
+            volume_write_scheduled: Cell::new(false),
             volume_write_busy: Cell::new(false),
             pending_volume_write: Cell::new(None),
             mute_write_busy: Cell::new(false),
@@ -452,7 +454,12 @@ impl AudioController {
                 };
                 let retry = this.volume_read.finish();
 
-                if !this.volume_revision.is_current(revision) {
+                if !this.volume_revision.is_current(revision)
+                    || this.volume_write_scheduled.get()
+                    || this.volume_write_busy.get()
+                    || this.mute_write_busy.get()
+                    || this.sink_switch_busy.get()
+                {
                     if retry {
                         this.refresh_volume();
                     }
@@ -494,7 +501,7 @@ impl AudioController {
                 };
                 let retry = this.sinks_read.finish();
 
-                if !this.sinks_revision.is_current(revision) {
+                if !this.sinks_revision.is_current(revision) || this.sink_switch_busy.get() {
                     if retry {
                         this.refresh_sinks();
                     }
@@ -605,6 +612,7 @@ impl AudioController {
     }
 
     fn schedule_volume_write(self: &Rc<Self>, value: f64) {
+        self.volume_write_scheduled.set(true);
         let generation = self.volume_write_serial.bump();
         let weak = Rc::downgrade(self);
 
@@ -615,6 +623,7 @@ impl AudioController {
             if !this.volume_write_serial.is_current(generation) {
                 return;
             }
+            this.volume_write_scheduled.set(false);
             this.write_volume_now(value);
         });
     }

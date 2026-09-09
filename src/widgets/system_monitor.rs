@@ -912,7 +912,6 @@ struct MonitorLayout {
     scale_style: MonitorScaleStyle,
     applied_scale: Cell<i32>,
     settings: RefCell<MonitorSettings>,
-    snapshot: RefCell<SystemSnapshot>,
 }
 
 impl MonitorLayout {
@@ -957,7 +956,6 @@ impl MonitorLayout {
             scale_style: MonitorScaleStyle::new(display),
             applied_scale: Cell::new(0),
             settings: RefCell::new(settings.clone()),
-            snapshot: RefCell::new(snapshot.clone()),
         });
         layout.apply_settings(&settings);
         layout.update_snapshot(&snapshot);
@@ -995,7 +993,6 @@ impl MonitorLayout {
     }
 
     fn update_snapshot(&self, snapshot: &SystemSnapshot) {
-        self.snapshot.replace(snapshot.clone());
         for section in MonitorSection::ALL {
             let Some(view) = self.sections.get(&section) else {
                 continue;
@@ -1737,11 +1734,10 @@ impl MonitorSettingsPanel {
 
         {
             let weak = Rc::downgrade(&panel);
-            controller.subscribe_settings(move |settings| {
+            controller.subscribe_settings(move |_| {
                 let Some(panel) = weak.upgrade() else {
                     return false;
                 };
-                let _ = settings;
                 panel.schedule_rebuild();
                 true
             });
@@ -3021,18 +3017,21 @@ fn read_cpu_times() -> Option<CpuTimes> {
 }
 
 fn parse_cpu_times(line: &str) -> Option<CpuTimes> {
-    let values = line
-        .split_whitespace()
-        .skip(1)
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    if values.len() < 4 {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
         return None;
     }
-    let total = values.iter().copied().sum();
-    let idle = values[3].saturating_add(values.get(4).copied().unwrap_or_default());
-    Some(CpuTimes { total, idle })
+    let (mut total, mut idle, mut count) = (0_u64, 0_u64, 0);
+    // Guest and guest_nice are already included in user and nice.
+    for (index, field) in fields.take(8).enumerate() {
+        let value = field.parse::<u64>().ok()?;
+        total = total.checked_add(value)?;
+        if matches!(index, 3 | 4) {
+            idle = idle.checked_add(value)?;
+        }
+        count += 1;
+    }
+    (count >= 4).then_some(CpuTimes { total, idle })
 }
 
 fn cpu_usage(previous: CpuTimes, current: CpuTimes) -> Option<f64> {
@@ -3439,7 +3438,7 @@ fn append_thermal_zone_temperatures(temperatures: &mut Vec<SensorReading>) {
         let Some(raw) = read_number(directory.join("temp")) else {
             continue;
         };
-        let value = if raw.abs() > 500.0 { raw / 1000.0 } else { raw };
+        let value = raw / 1000.0;
         if !(-40.0..=200.0).contains(&value) {
             continue;
         }
@@ -3931,6 +3930,15 @@ mod tests {
         let previous = parse_cpu_times("cpu  100 0 50 800 50 0 0 0").unwrap();
         let current = parse_cpu_times("cpu  150 0 70 850 70 0 0 0").unwrap();
         assert!((cpu_usage(previous, current).unwrap() - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn guest_cpu_time_is_not_counted_twice() {
+        let previous = parse_cpu_times("cpu 100 0 50 800 50 0 0 0 80 0").unwrap();
+        let current = parse_cpu_times("cpu 150 0 70 850 70 0 0 0 120 0").unwrap();
+        assert!((cpu_usage(previous, current).unwrap() - 50.0).abs() < 0.001);
+        assert!(parse_cpu_times("cpu 18446744073709551615 1 0 0").is_none());
+        assert!(parse_cpu_times("cpu 1 2").is_none());
     }
 
     #[test]

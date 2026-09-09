@@ -1,8 +1,9 @@
-use std::{ffi::OsStr, time::Duration};
+use std::{ffi::OsStr, rc::Rc, time::Duration};
 
 use gtk::{gio, prelude::*};
 use tracing::{info, warn};
 
+use super::shutdown_timer::ShutdownTimer;
 use super::tooltip::BarTooltipExt;
 use super::{attach_inline_revealer_behavior, build_inline_panel};
 
@@ -66,7 +67,7 @@ pub struct PowerIndicator {
 }
 
 impl PowerIndicator {
-    pub fn new() -> Self {
+    pub fn new(timer: &Rc<ShutdownTimer>) -> Self {
         let (root, revealer, panel) = build_inline_panel(REVEAL_DURATION_MS, 6, "power-panel");
 
         for action in [
@@ -92,7 +93,14 @@ impl PowerIndicator {
         toggle.add_css_class("power-toggle");
         toggle.set_bar_tooltip_text(Some("Power menu"));
         toggle.set_valign(gtk::Align::Center);
-        toggle.set_child(Some(&power_icon));
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let countdown = gtk::Label::new(None);
+        countdown.add_css_class("power-timer-label");
+        countdown.set_visible(false);
+        content.append(&power_icon);
+        content.append(&countdown);
+        toggle.set_child(Some(&content));
+        timer.attach(&toggle, &countdown, &power_icon, &content);
 
         let weak_revealer = revealer.downgrade();
         toggle.connect_clicked(move |_| {

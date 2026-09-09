@@ -29,6 +29,7 @@ struct WorkspaceChip {
     button: gtk::Button,
     core: gtk::Box,
     urgent_blink_source: RefCell<Option<glib::SourceId>>,
+    state: Cell<Option<WorkspaceView>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,10 +165,14 @@ impl WorkspaceChip {
             button,
             core,
             urgent_blink_source: RefCell::new(None),
+            state: Cell::new(None),
         }
     }
 
     fn set_state(&self, view: WorkspaceView) {
+        if self.state.replace(Some(view)) == Some(view) {
+            return;
+        }
         let urgent = should_blink_urgent(view);
 
         clear_state_classes(&self.button);

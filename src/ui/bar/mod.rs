@@ -17,6 +17,7 @@ use crate::widgets::{
     osd::OsdController,
     player::{PlayerController, PlayerIndicator},
     power::PowerIndicator,
+    shutdown_timer::ShutdownTimer,
     system_monitor::SystemMonitorController,
     tooltip::BarTooltip,
     tray::{TrayController, TrayIndicator},
@@ -55,6 +56,7 @@ pub struct BarDependencies<'a> {
     pub(crate) player_controller: &'a PlayerController,
     pub(crate) tray_controller: &'a TrayController,
     pub(crate) wallpaper_controller: &'a Rc<WallpaperController>,
+    pub(crate) shutdown_timer: &'a Rc<ShutdownTimer>,
     pub(crate) osd_controller: &'a OsdController,
 }
 
@@ -136,7 +138,7 @@ impl Bar {
         let network = NetworkIndicator::new(application, &window, monitor);
         let brightness = BrightnessIndicator::new();
         let audio = AudioIndicator::new(application, &window, monitor, dependencies.osd_controller);
-        let power = PowerIndicator::new();
+        let power = PowerIndicator::new(dependencies.shutdown_timer);
         let workspaces =
             WorkspaceIndicator::new(monitor, initial_workspaces, dependencies.bar_features);
 

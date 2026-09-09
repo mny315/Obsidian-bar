@@ -9,6 +9,7 @@ use std::{
 };
 
 use super::{
+    RefreshGate,
     dbus::{unbox_variant, variant_value},
     tooltip::{BarTooltipExt, BarTooltipSuppression, hide_all_tooltips_immediately},
 };
@@ -38,6 +39,7 @@ const REQUEST_NAME_DO_NOT_QUEUE: u32 = 4;
 const ICON_SCAN_MAX_DEPTH: usize = 3;
 const ICON_SCAN_MAX_ENTRIES: usize = 512;
 const ICON_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
+const ICON_FILE_CACHE_CAPACITY: usize = 512;
 const MENU_MAX_DEPTH: usize = 8;
 const MENU_MAX_NODES: usize = 256;
 const MENU_MAX_CHILDREN: usize = 64;
@@ -168,8 +170,11 @@ impl TrayController {
             }
         });
 
-        TrayState::initialize(&state);
         Self { state }
+    }
+
+    pub fn start(&self) {
+        TrayState::initialize(&self.state);
     }
 }
 
@@ -940,7 +945,7 @@ struct TrayItem {
     proxy: gio::DBusProxy,
     menu_proxy: RefCell<Option<(String, gio::DBusProxy)>>,
     events: async_channel::Sender<TrayEvent>,
-    refresh_pending: Cell<bool>,
+    refresh: RefreshGate,
 }
 
 impl TrayItem {
@@ -956,7 +961,7 @@ impl TrayItem {
             proxy,
             menu_proxy: RefCell::new(None),
             events: events.clone(),
-            refresh_pending: Cell::new(false),
+            refresh: RefreshGate::default(),
         });
         item.connect_signals();
         item
@@ -991,7 +996,7 @@ impl TrayItem {
     }
 
     fn schedule_refresh(self: &Rc<Self>) {
-        if self.refresh_pending.replace(true) {
+        if !self.refresh.begin() {
             return;
         }
 
@@ -1000,8 +1005,7 @@ impl TrayItem {
             let Some(item) = weak.upgrade() else {
                 return;
             };
-            item.refresh_pending.set(false);
-            refresh_item_properties(&item.proxy, item.id.clone(), item.events.clone());
+            refresh_item_properties(&item);
         });
     }
 
@@ -1418,7 +1422,7 @@ fn menu_row_content(node: &MenuNode, submenu: bool) -> gtk::Box {
 }
 
 fn parse_menu_layout(reply: &glib::Variant) -> Option<MenuNode> {
-    if reply.n_children() < 2 {
+    if !reply.is_container() || reply.n_children() < 2 {
         return None;
     }
     let mut remaining = MENU_MAX_NODES;
@@ -1431,7 +1435,7 @@ fn parse_menu_node(value: &glib::Variant, depth: usize, remaining: &mut usize) -
     }
     *remaining -= 1;
     let value = unbox_variant(value);
-    if value.n_children() < 3 {
+    if !value.is_container() || value.n_children() < 3 {
         return None;
     }
 
@@ -1441,6 +1445,9 @@ fn parse_menu_node(value: &glib::Variant, depth: usize, remaining: &mut usize) -
         .get::<PropertyMap>()
         .unwrap_or_default();
     let children_value = value.child_value(2);
+    if !children_value.is_container() {
+        return None;
+    }
     let mut children = Vec::new();
     let child_count = children_value.n_children().min(MENU_MAX_CHILDREN);
     for index in 0..child_count {
@@ -1529,7 +1536,8 @@ fn set_file_icon(image: &gtk::Image, path: &Path) {
 fn find_icon_file(icon_root: &Path, icon_name: &str) -> Option<PathBuf> {
     let key = (icon_root.to_path_buf(), icon_name.to_owned());
     ICON_FILE_CACHE.with(|cache| {
-        match cache.borrow().get(&key).cloned() {
+        let cached = cache.borrow().get(&key).cloned();
+        match cached {
             Some((_, Some(path))) if path.is_file() => return Some(path),
             Some((loaded_at, None)) if loaded_at.elapsed() < ICON_NEGATIVE_CACHE_TTL => {
                 return None;
@@ -1541,9 +1549,16 @@ fn find_icon_file(icon_root: &Path, icon_name: &str) -> Option<PathBuf> {
         }
 
         let resolved = scan_icon_file(icon_root, icon_name);
-        cache
-            .borrow_mut()
-            .insert(key, (Instant::now(), resolved.clone()));
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= ICON_FILE_CACHE_CAPACITY
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (loaded_at, _))| *loaded_at)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(key, (Instant::now(), resolved.clone()));
         resolved
     })
 }
@@ -1634,18 +1649,15 @@ fn pixbuf_from_pixmaps(pixmaps: &IconPixmaps) -> Option<gdk_pixbuf::Pixbuf> {
     ))
 }
 
-fn refresh_item_properties(
-    proxy: &gio::DBusProxy,
-    item_id: String,
-    events: async_channel::Sender<TrayEvent>,
-) {
+fn refresh_item_properties(item: &Rc<TrayItem>) {
+    let proxy = &item.proxy;
     let Some(destination) = proxy.name() else {
-        enqueue_tray_event(&events, TrayEvent::ItemChanged(item_id));
+        item.refresh.finish();
         return;
     };
     let object_path = proxy.object_path();
     let parameters = (ITEM_INTERFACE,).to_variant();
-    let cache = proxy.clone();
+    let weak_item = Rc::downgrade(item);
 
     proxy.connection().call(
         Some(destination.as_str()),
@@ -1658,15 +1670,21 @@ fn refresh_item_properties(
         DBUS_TIMEOUT_MS,
         None::<&gio::Cancellable>,
         move |result| {
+            let Some(item) = weak_item.upgrade() else {
+                return;
+            };
             if let Ok(reply) = result
                 && let Some((properties,)) = reply.get::<(PropertyMap,)>()
             {
                 for (name, value) in properties {
                     let value = unbox_variant(&value);
-                    cache.set_cached_property(&name, Some(&value));
+                    item.proxy.set_cached_property(&name, Some(&value));
                 }
             }
-            enqueue_tray_event(&events, TrayEvent::ItemChanged(item_id));
+            enqueue_tray_event(&item.events, TrayEvent::ItemChanged(item.id.clone()));
+            if item.refresh.finish() {
+                item.schedule_refresh();
+            }
         },
     );
 }
@@ -1674,7 +1692,7 @@ fn refresh_item_properties(
 fn tooltip_text(proxy: &gio::DBusProxy) -> Option<String> {
     let tooltip = proxy.cached_property("ToolTip")?;
     let tooltip = unbox_variant(&tooltip);
-    if tooltip.n_children() < 4 {
+    if !tooltip.is_container() || tooltip.n_children() < 4 {
         return None;
     }
 
@@ -1801,6 +1819,29 @@ fn map_property<T: glib::variant::FromVariant>(properties: &PropertyMap, name: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_icon_cache_entries_can_be_replaced_without_borrowing_twice() {
+        let root = PathBuf::from("/nonexistent/obsidian-tray-cache-test");
+        let key = (root.clone(), "missing-icon".to_owned());
+        ICON_FILE_CACHE.with(|cache| {
+            cache.borrow_mut().insert(
+                key.clone(),
+                (Instant::now() - ICON_NEGATIVE_CACHE_TTL, None),
+            );
+        });
+        assert_eq!(find_icon_file(&root, "missing-icon"), None);
+        ICON_FILE_CACHE.with(|cache| {
+            cache.borrow_mut().remove(&key);
+        });
+    }
+
+    #[test]
+    fn malformed_menu_layouts_are_rejected_without_panicking() {
+        assert!(parse_menu_layout(&42_i32.to_variant()).is_none());
+        let invalid_children = (0_u32, (1_i32, PropertyMap::new(), 42_i32)).to_variant();
+        assert!(parse_menu_layout(&invalid_children).is_none());
+    }
 
     #[test]
     fn normalizes_status_notifier_item_ids() {

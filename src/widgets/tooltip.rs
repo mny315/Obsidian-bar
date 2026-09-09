@@ -7,6 +7,8 @@ use std::{
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
+use super::detach_application_window;
+
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(420);
 const TOOLTIP_GAP: i32 = 13;
 // The compact controls on the right are the visual baseline for bar tooltips.
@@ -71,8 +73,8 @@ struct TooltipState {
     window: gtk::ApplicationWindow,
     frame: gtk::Box,
     label: gtk::Label,
-    active_target: RefCell<Option<gtk::Widget>>,
-    pending_target: RefCell<Option<gtk::Widget>>,
+    active_target: glib::WeakRef<gtk::Widget>,
+    pending_target: glib::WeakRef<gtk::Widget>,
     show_generation: Cell<Generation>,
     hide_generation: Cell<Generation>,
     placement_generation: Cell<Generation>,
@@ -112,9 +114,12 @@ impl BarTooltip {
 
         let label = gtk::Label::new(None);
         label.add_css_class("bar-tooltip-label");
-        label.set_single_line_mode(true);
-        label.set_wrap(false);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::None);
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        label.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+        label.set_max_width_chars(64);
+        label.set_lines(6);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         label.set_halign(gtk::Align::Center);
         label.set_valign(gtk::Align::Center);
         label.set_xalign(0.5);
@@ -135,8 +140,8 @@ impl BarTooltip {
             window,
             frame,
             label,
-            active_target: RefCell::new(None),
-            pending_target: RefCell::new(None),
+            active_target: glib::WeakRef::new(),
+            pending_target: glib::WeakRef::new(),
             show_generation: Cell::new(Generation::default()),
             hide_generation: Cell::new(Generation::default()),
             placement_generation: Cell::new(Generation::default()),
@@ -149,7 +154,7 @@ impl BarTooltip {
 
     pub fn close(&self) {
         self.hide();
-        self.state.window.close();
+        detach_application_window(&self.state.window);
     }
 
     pub fn hide(&self) {
@@ -159,8 +164,11 @@ impl BarTooltip {
 
 pub trait BarTooltipExt: IsA<gtk::Widget> {
     fn set_bar_tooltip_text(&self, text: Option<&str>) {
-        self.set_tooltip_text(text);
         let widget = self.upcast_ref::<gtk::Widget>();
+        if widget.has_css_class(ATTACHED_CSS_CLASS) && self.tooltip_text().as_deref() == text {
+            return;
+        }
+        self.set_tooltip_text(text);
         widget.set_has_tooltip(false);
         attach_bar_tooltip(widget);
         refresh_active_tooltip(widget);
@@ -227,18 +235,14 @@ fn attach_bar_tooltip(widget: &gtk::Widget) {
     click.connect_pressed(|_, _, _, _| hide_all_tooltips_immediately());
     widget.add_controller(click);
 
+    widget.connect_unmap(hide_target);
     widget.connect_destroy(hide_target);
 }
 
 pub(crate) fn hide_all_tooltips_immediately() {
-    TOOLTIP_STATES.with(|states| {
-        let mut states = states.borrow_mut();
-        states.retain(|state| state.strong_count() > 0);
-
-        for state in states.iter().filter_map(Weak::upgrade) {
-            state.invalidate_all();
-        }
-    });
+    for state in live_tooltip_states() {
+        state.invalidate_all();
+    }
 }
 
 fn refresh_active_tooltip(widget: &gtk::Widget) {
@@ -248,7 +252,7 @@ fn refresh_active_tooltip(widget: &gtk::Widget) {
 
     if state
         .active_target
-        .borrow()
+        .upgrade()
         .as_ref()
         .is_some_and(|target| target == widget)
     {
@@ -257,14 +261,17 @@ fn refresh_active_tooltip(widget: &gtk::Widget) {
 }
 
 fn hide_target(widget: &gtk::Widget) {
+    for state in live_tooltip_states() {
+        state.hide(Some(widget));
+    }
+}
+
+fn live_tooltip_states() -> Vec<Rc<TooltipState>> {
     TOOLTIP_STATES.with(|states| {
         let mut states = states.borrow_mut();
         states.retain(|state| state.strong_count() > 0);
-
-        for state in states.iter().filter_map(Weak::upgrade) {
-            state.hide(Some(widget));
-        }
-    });
+        states.iter().filter_map(Weak::upgrade).collect()
+    })
 }
 
 fn tooltip_state_for(widget: &gtk::Widget) -> Option<Rc<TooltipState>> {
@@ -307,8 +314,8 @@ impl TooltipState {
         self.next_show_generation();
         self.next_hide_generation();
         self.next_placement_generation();
-        drop(self.active_target.borrow_mut().take());
-        drop(self.pending_target.borrow_mut().take());
+        self.active_target.set(None);
+        self.pending_target.set(None);
         self.window.set_visible(false);
     }
 
@@ -327,7 +334,7 @@ impl TooltipState {
         // TOOLTIP_SHOW_DELAY expires, the old tooltip would otherwise remain
         // visible with no active target and could stick indefinitely.
         let generation = self.next_show_generation();
-        self.pending_target.replace(Some(target.clone()));
+        self.pending_target.set(Some(target));
 
         let weak_state = Rc::downgrade(self);
         let weak_target = target.downgrade();
@@ -338,14 +345,14 @@ impl TooltipState {
             if state.show_generation.get() != generation
                 || !state
                     .pending_target
-                    .borrow()
+                    .upgrade()
                     .as_ref()
                     .is_some_and(|pending| pending == &target)
             {
                 return;
             }
 
-            drop(state.pending_target.borrow_mut().take());
+            state.pending_target.set(None);
             state.show(&target);
         });
     }
@@ -361,7 +368,7 @@ impl TooltipState {
         };
 
         self.next_hide_generation();
-        self.active_target.replace(Some(target.clone()));
+        self.active_target.set(Some(target));
 
         if uses_markup {
             self.label.set_markup(&text);
@@ -384,7 +391,7 @@ impl TooltipState {
             if state.placement_generation.get() == generation
                 && state
                     .active_target
-                    .borrow()
+                    .upgrade()
                     .as_ref()
                     .is_some_and(|active| active == &target)
             {
@@ -397,17 +404,17 @@ impl TooltipState {
         if let Some(target) = target {
             if self
                 .pending_target
-                .borrow()
+                .upgrade()
                 .as_ref()
                 .is_some_and(|pending| pending == target)
             {
                 self.next_show_generation();
-                drop(self.pending_target.borrow_mut().take());
+                self.pending_target.set(None);
             }
 
             if !self
                 .active_target
-                .borrow()
+                .upgrade()
                 .as_ref()
                 .is_some_and(|active| active == target)
             {
@@ -415,10 +422,10 @@ impl TooltipState {
             }
         } else {
             self.next_show_generation();
-            drop(self.pending_target.borrow_mut().take());
+            self.pending_target.set(None);
         }
 
-        drop(self.active_target.borrow_mut().take());
+        self.active_target.set(None);
         self.next_placement_generation();
         let generation = self.next_hide_generation();
         let weak_state = Rc::downgrade(self);
@@ -426,7 +433,8 @@ impl TooltipState {
             let Some(state) = weak_state.upgrade() else {
                 return;
             };
-            if state.hide_generation.get() == generation && state.active_target.borrow().is_none() {
+            if state.hide_generation.get() == generation && state.active_target.upgrade().is_none()
+            {
                 state.window.set_visible(false);
             }
         });

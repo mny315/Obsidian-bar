@@ -18,7 +18,7 @@ use spa::{
 };
 use tracing::warn;
 
-use super::detach_application_window;
+use super::{Generation, detach_application_window};
 
 const SETTINGS_GROUP: &str = "visualizer";
 const SETTINGS_FILE: &str = "audio-spectrum.ini";
@@ -76,6 +76,7 @@ type FrameSubscriber = Box<dyn Fn(&SpectrumFrame) -> bool>;
 pub struct AudioSpectrumController {
     enabled: Cell<bool>,
     worker: RefCell<Option<SpectrumWorker>>,
+    worker_generation: Generation,
     worker_retry_pending: Cell<bool>,
     worker_retry_attempt: Cell<u32>,
     frame_sender: async_channel::Sender<SpectrumFrame>,
@@ -89,6 +90,7 @@ impl AudioSpectrumController {
         let controller = Rc::new(Self {
             enabled: Cell::new(load_enabled()),
             worker: RefCell::new(None),
+            worker_generation: Generation::default(),
             worker_retry_pending: Cell::new(false),
             worker_retry_attempt: Cell::new(0),
             frame_sender,
@@ -176,6 +178,7 @@ impl AudioSpectrumController {
         }
 
         let (stopped_sender, stopped_receiver) = async_channel::bounded::<()>(1);
+        let generation = self.worker_generation.bump();
         match SpectrumWorker::spawn(self.frame_sender.clone(), stopped_sender) {
             Ok(worker) => {
                 *self.worker.borrow_mut() = Some(worker);
@@ -195,6 +198,9 @@ impl AudioSpectrumController {
             let Some(controller) = weak.upgrade() else {
                 return;
             };
+            if !controller.worker_generation.is_current(generation) {
+                return;
+            }
             drop(controller.worker.borrow_mut().take());
             controller.clear_frames();
             if controller.enabled() {
@@ -228,6 +234,8 @@ impl AudioSpectrumController {
     }
 
     fn stop_worker(&self) {
+        // The old completion can arrive after a new worker has already started.
+        self.worker_generation.bump();
         drop(self.worker.borrow_mut().take());
     }
 
@@ -546,6 +554,19 @@ fn run_capture(
         .connect_rc(None)
         .map_err(|error| format!("failed to connect to PipeWire: {error}"))?;
 
+    let _core_listener = core
+        .add_listener_local()
+        .error({
+            let main_loop = main_loop.clone();
+            move |id, _, _, message| {
+                if id == pw::core::PW_ID_CORE {
+                    warn!(%message, "PipeWire spectrum connection lost");
+                    main_loop.quit();
+                }
+            }
+        })
+        .register();
+
     let _stop_receiver = stop_receiver.attach(main_loop.loop_(), {
         let main_loop = main_loop.clone();
         move |_| main_loop.quit()
@@ -568,6 +589,15 @@ fn run_capture(
 
     let _listener = stream
         .add_local_listener_with_user_data(data)
+        .state_changed({
+            let main_loop = main_loop.clone();
+            move |_, _, _, state| {
+                if let pw::stream::StreamState::Error(error) = state {
+                    warn!(%error, "PipeWire spectrum stream failed");
+                    main_loop.quit();
+                }
+            }
+        })
         .param_changed(|_, data, id, param| {
             let Some(param) = param else {
                 return;
@@ -802,7 +832,7 @@ impl SpectrumAnalyzer {
     }
 
     fn push_sample(&mut self, sample: f32) -> Option<SpectrumFrame> {
-        self.ring[self.write_index] = sample;
+        self.ring[self.write_index] = if sample.is_finite() { sample } else { 0.0 };
         self.write_index = (self.write_index + 1) % FFT_SIZE;
         self.filled = (self.filled + 1).min(FFT_SIZE);
         self.samples_since_frame += 1;
@@ -937,6 +967,23 @@ mod tests {
         let frame = frame.expect("analyzer should emit a spectrum frame");
         let peak = frame.levels.into_iter().fold(0.0_f32, f32::max);
         assert!(peak > 0.5, "unexpectedly weak peak: {peak}");
+    }
+
+    #[test]
+    fn invalid_audio_samples_do_not_poison_the_spectrum() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        for index in 0..FFT_SIZE * 3 {
+            let sample = match index % 100 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => f32::NEG_INFINITY,
+                _ => (TAU * 440.0 * index as f32 / 48_000.0).sin() * 0.4,
+            };
+            if let Some(frame) = analyzer.push_sample(sample) {
+                assert!(frame.levels.iter().all(|level| level.is_finite()));
+                assert!(frame.is_visible());
+            }
+        }
     }
 
     #[test]

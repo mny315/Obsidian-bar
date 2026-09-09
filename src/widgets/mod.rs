@@ -101,7 +101,9 @@ where
 {
     let (sender, receiver) = async_channel::bounded::<T>(1);
     let task: BackgroundJob = Box::new(move || {
-        let _ = sender.send_blocking(job());
+        if !sender.is_closed() {
+            let _ = sender.send_blocking(job());
+        }
     });
 
     let queue = background_queue().clone();
@@ -196,9 +198,9 @@ fn set_spinner_active(icon: &gtk::Label, spinner: &gtk::Spinner, active: bool) {
 
 fn detach_application_window(window: &gtk::ApplicationWindow) {
     window.set_visible(false);
-    if let Some(application) = window.application() {
-        application.remove_window(window);
-    }
+    // GTK also owns a reference through its toplevel list. Removing only the
+    // application reference leaves hidden windows alive after monitor changes.
+    window.destroy();
 }
 
 fn build_quick_toggle_button(
@@ -777,6 +779,7 @@ mod smooth_scroll;
 use smooth_scroll::{SmoothScrollConfig, install_smooth_scroll};
 pub mod player;
 pub mod power;
+pub mod shutdown_timer;
 pub mod system_monitor;
 pub mod tooltip;
 pub mod tray;
@@ -785,7 +788,48 @@ pub mod workspace;
 
 #[cfg(test)]
 mod tests {
-    use super::{Generation, popup_animation_progress};
+    use super::{Generation, RefreshGate, popup_animation_progress};
+
+    #[test]
+    #[ignore = "requires a GTK display; run under Xvfb with --ignored"]
+    fn detached_popup_releases_its_window_and_children() {
+        use gtk::{gio, prelude::*};
+
+        gtk::init().unwrap();
+        let application = gtk::Application::builder()
+            .application_id("dev.obsidian.WindowLifecycleTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(None::<&gio::Cancellable>).unwrap();
+        let window = gtk::ApplicationWindow::builder()
+            .application(&application)
+            .build();
+        window.set_hide_on_close(true);
+        let child = gtk::Button::new();
+        window.set_child(Some(&child));
+        let weak_window = window.downgrade();
+        let weak_child = child.downgrade();
+
+        super::detach_application_window(&window);
+        assert!(application.windows().is_empty());
+        drop(window);
+        drop(child);
+        assert!(weak_window.upgrade().is_none());
+        assert!(weak_child.upgrade().is_none());
+    }
+
+    #[test]
+    fn refresh_requests_while_busy_produce_one_followup() {
+        let gate = RefreshGate::default();
+        assert!(gate.begin());
+        for _ in 0..20 {
+            assert!(!gate.begin());
+        }
+        assert!(gate.finish());
+        assert!(gate.begin());
+        assert!(!gate.finish());
+        assert!(gate.begin());
+    }
 
     #[test]
     fn generation_invalidates_older_values() {

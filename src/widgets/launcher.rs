@@ -303,7 +303,7 @@ pub struct LauncherCatalog {
 impl LauncherCatalog {
     pub fn new() -> Rc<Self> {
         let app_monitor = gio::AppInfoMonitor::get();
-        let catalog = Rc::new(Self {
+        Rc::new(Self {
             data: RefCell::new(LauncherCatalogData::default()),
             subscribers: RefCell::new(Vec::new()),
             refresh_scheduled: Cell::new(false),
@@ -313,19 +313,23 @@ impl LauncherCatalog {
             app_monitor_handler: RefCell::new(None),
             desktop_monitors: RefCell::new(Vec::new()),
             monitor_rebuild_scheduled: Cell::new(false),
-        });
+        })
+    }
 
-        let weak = Rc::downgrade(&catalog);
-        let handler = catalog.app_monitor.connect_changed(move |_| {
+    pub fn start(self: &Rc<Self>) {
+        if self.app_monitor_handler.borrow().is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let handler = self.app_monitor.connect_changed(move |_| {
             if let Some(catalog) = weak.upgrade() {
                 catalog.schedule_refresh();
                 catalog.schedule_monitor_rebuild();
             }
         });
-        catalog.app_monitor_handler.replace(Some(handler));
-        catalog.rebuild_desktop_monitors();
-        catalog.schedule_refresh();
-        catalog
+        self.app_monitor_handler.replace(Some(handler));
+        self.rebuild_desktop_monitors();
+        self.schedule_refresh();
     }
 
     fn subscribe(&self, controller: &Rc<LauncherController>) {
@@ -1056,6 +1060,15 @@ impl LauncherController {
         }
     }
 
+    fn remove_favorite(&self, key: &str) {
+        let mut state = LauncherUserState::read();
+        // The animation can finish after another view or process removed the
+        // entry. Removing it again must not toggle it back on.
+        if !state.favorites.remove(key) || save_state_keys(FAVORITES_STATE_FILE, &state.favorites) {
+            self.catalog.notify_user_state_changed(&state);
+        }
+    }
+
     fn default_category(&self) -> LauncherCategory {
         self.user_state.borrow().default_category()
     }
@@ -1396,16 +1409,27 @@ impl LauncherController {
 
         let app_for_toggle = Rc::clone(&app);
         let weak = Rc::downgrade(self);
-        let overlay_for_toggle = overlay.clone();
+        let overlay_for_toggle = overlay.downgrade();
         favorite_toggle.connect_clicked(move |toggle| {
+            let Some(overlay) = overlay_for_toggle.upgrade() else {
+                return;
+            };
             toggle.set_sensitive(false);
-            overlay_for_toggle.add_css_class("launcher-favorite-tile-removing");
+            overlay.add_css_class("launcher-favorite-tile-removing");
 
             let weak = weak.clone();
+            let weak_overlay = overlay.downgrade();
+            let weak_toggle = toggle.downgrade();
             let app_for_toggle = Rc::clone(&app_for_toggle);
             glib::timeout_add_local_once(FAVORITE_REMOVE_TRANSITION_DURATION, move || {
                 if let Some(this) = weak.upgrade() {
-                    this.toggle_state_key(LauncherStateKind::Favorite, &app_for_toggle.key);
+                    this.remove_favorite(&app_for_toggle.key);
+                }
+                if let Some(overlay) = weak_overlay.upgrade() {
+                    overlay.remove_css_class("launcher-favorite-tile-removing");
+                }
+                if let Some(toggle) = weak_toggle.upgrade() {
+                    toggle.set_sensitive(true);
                 }
             });
         });
