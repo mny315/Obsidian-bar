@@ -14,12 +14,6 @@ const PIPE_FINISH_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[output truncated]\n";
 
-static KILL: ExternalProgram = ExternalProgram::new(
-    "OBSIDIAN_BAR_KILL_BIN",
-    option_env!("OBSIDIAN_BAR_KILL_BIN"),
-    "kill",
-);
-
 pub(super) struct ExternalProgram {
     runtime_variable: &'static str,
     build_time_value: Option<&'static str>,
@@ -141,7 +135,7 @@ fn run(
             match (stdout, stderr) {
                 (Ok(stdout), Ok(stderr)) => (status, stdout, stderr),
                 (stdout, stderr) => {
-                    terminate_process_group(process_group, "-KILL");
+                    terminate_process_group(process_group, libc::SIGKILL);
                     return Err(stdout
                         .err()
                         .or_else(|| stderr.err())
@@ -191,32 +185,32 @@ fn wait_for_exit(mut child: Child, timeout: Duration) -> WaitOutcome {
         });
 
     if let Err(error) = waiter {
-        terminate_process_group(process_group, "-KILL");
+        terminate_process_group(process_group, libc::SIGKILL);
         return WaitOutcome::Failed(error);
     }
 
     match receiver.recv_timeout(timeout) {
         Ok(Ok(status)) => WaitOutcome::Exited(status),
         Ok(Err(error)) => {
-            terminate_process_group(process_group, "-KILL");
+            terminate_process_group(process_group, libc::SIGKILL);
             WaitOutcome::Failed(error)
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            terminate_process_group(process_group, "-KILL");
+            terminate_process_group(process_group, libc::SIGKILL);
             WaitOutcome::Failed(io::Error::other(
                 "process waiter stopped before reporting an exit status",
             ))
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            terminate_process_group(process_group, "-TERM");
+            terminate_process_group(process_group, libc::SIGTERM);
             match receiver.recv_timeout(PROCESS_TERMINATION_GRACE) {
                 Ok(_) => {
                     // The leader exited after TERM; kill any descendants that kept
                     // the process group alive and still report the original timeout.
-                    terminate_process_group(process_group, "-KILL");
+                    terminate_process_group(process_group, libc::SIGKILL);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    terminate_process_group(process_group, "-KILL");
+                    terminate_process_group(process_group, libc::SIGKILL);
                     let _ = receiver.recv_timeout(PIPE_FINISH_TIMEOUT);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {}
@@ -226,14 +220,14 @@ fn wait_for_exit(mut child: Child, timeout: Duration) -> WaitOutcome {
     }
 }
 
-fn terminate_process_group(process_group_id: u32, signal: &str) {
-    let process_group = format!("-{process_group_id}");
-    let _ = Command::new(KILL.get())
-        .args([signal, "--", process_group.as_str()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+fn terminate_process_group(process_group_id: u32, signal: libc::c_int) {
+    if let Ok(pid) = libc::pid_t::try_from(process_group_id)
+        && pid > 0
+    {
+        // The child starts its own process group. Signal it directly so timeout
+        // handling cannot itself get stuck spawning or waiting for `kill`.
+        unsafe { libc::kill(-pid, signal) };
+    }
 }
 
 fn read_pipe<R>(mut pipe: R) -> mpsc::Receiver<io::Result<Vec<u8>>>
@@ -324,6 +318,25 @@ mod tests {
 
         assert!(error.contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn timeout_kills_and_reaps_a_process_that_ignores_term() {
+        let child = Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id() as libc::pid_t;
+        let started = Instant::now();
+
+        assert!(matches!(
+            wait_for_exit(child, Duration::from_millis(100)),
+            WaitOutcome::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     #[test]

@@ -25,6 +25,7 @@ const DEVICE_LIST_MIN_HEIGHT: i32 = 120;
 const DEVICE_LIST_MAX_HEIGHT: i32 = 220;
 const BLUETOOTH_POPUP_NAMESPACE: &str = "obsidian-bar-bluetooth";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCOVERY_STOP_RETRY_DELAY: Duration = Duration::from_millis(250);
 const NOTICE_TIMEOUT: Duration = Duration::from_millis(4200);
 const SIGNAL_SUBSCRIPTION_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const SIGNAL_SUBSCRIPTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -1409,14 +1410,28 @@ impl BluetoothController {
         let token = self.discovery_timeout_generation.bump();
         let weak = Rc::downgrade(self);
         glib::timeout_add_local_once(DISCOVERY_TIMEOUT, move || {
-            let Some(this) = weak.upgrade() else {
-                return;
-            };
-            if !this.discovery_timeout_generation.is_current(token) || !this.display_scanning() {
-                return;
+            if let Some(this) = weak.upgrade() {
+                this.stop_discovery_when_idle(token);
             }
-            this.set_scanning(false);
         });
+    }
+
+    fn stop_discovery_when_idle(self: &Rc<Self>, token: u64) {
+        if !self.discovery_timeout_generation.is_current(token) || !self.display_scanning() {
+            return;
+        }
+        if self.action_busy.get() {
+            // set_scanning rejects concurrent actions. Keep the timeout alive
+            // while a device operation finishes, instead of losing the stop.
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_local_once(DISCOVERY_STOP_RETRY_DELAY, move || {
+                if let Some(this) = weak.upgrade() {
+                    this.stop_discovery_when_idle(token);
+                }
+            });
+        } else {
+            self.set_scanning(false);
+        }
     }
 
     fn set_scan_animating(&self, active: bool) {

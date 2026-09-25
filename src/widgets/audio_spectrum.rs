@@ -18,7 +18,7 @@ use spa::{
 };
 use tracing::warn;
 
-use super::{Generation, detach_application_window};
+use super::{Generation, detach_application_window, make_window_click_through};
 
 const SETTINGS_GROUP: &str = "visualizer";
 const SETTINGS_FILE: &str = "audio-spectrum.ini";
@@ -259,6 +259,7 @@ impl AudioSpectrumController {
 pub struct AudioSpectrumView {
     window: gtk::ApplicationWindow,
     monitor: gdk::Monitor,
+    geometry_handler: Option<glib::SignalHandlerId>,
 }
 
 impl AudioSpectrumView {
@@ -267,10 +268,6 @@ impl AudioSpectrumView {
         monitor: &gdk::Monitor,
         controller: &Rc<AudioSpectrumController>,
     ) -> Self {
-        let geometry = monitor.geometry();
-        let height = ((f64::from(geometry.height()) * WINDOW_HEIGHT_FRACTION).round() as i32)
-            .max(MIN_WINDOW_HEIGHT);
-
         let window = gtk::ApplicationWindow::builder()
             .application(application)
             .decorated(false)
@@ -287,13 +284,10 @@ impl AudioSpectrumView {
         window.set_anchor(Edge::Right, true);
         window.set_anchor(Edge::Top, false);
         window.set_exclusive_zone(-1);
-        window.set_default_size(geometry.width().max(1), height);
-        window.set_can_target(false);
+        make_window_click_through(&window);
 
         let area = gtk::DrawingArea::new();
         area.add_css_class("audio-spectrum-canvas");
-        area.set_content_width(geometry.width().max(1));
-        area.set_content_height(height);
         area.set_hexpand(true);
         area.set_vexpand(true);
         area.set_can_target(false);
@@ -306,6 +300,26 @@ impl AudioSpectrumView {
             });
         }
         window.set_child(Some(&area));
+
+        let resize = |window: &gtk::ApplicationWindow,
+                      area: &gtk::DrawingArea,
+                      monitor: &gdk::Monitor| {
+            let geometry = monitor.geometry();
+            let height = ((f64::from(geometry.height()) * WINDOW_HEIGHT_FRACTION).round() as i32)
+                .max(MIN_WINDOW_HEIGHT);
+            let width = geometry.width().max(1);
+            window.set_default_size(width, height);
+            area.set_content_width(width);
+            area.set_content_height(height);
+        };
+        resize(&window, &area, monitor);
+        let weak_window = window.downgrade();
+        let weak_area = area.downgrade();
+        let geometry_handler = monitor.connect_geometry_notify(move |monitor| {
+            if let (Some(window), Some(area)) = (weak_window.upgrade(), weak_area.upgrade()) {
+                resize(&window, &area, monitor);
+            }
+        });
 
         let ticking = Rc::new(Cell::new(false));
         {
@@ -334,6 +348,7 @@ impl AudioSpectrumView {
         Self {
             window,
             monitor: monitor.clone(),
+            geometry_handler: Some(geometry_handler),
         }
     }
 
@@ -344,6 +359,9 @@ impl AudioSpectrumView {
 
 impl Drop for AudioSpectrumView {
     fn drop(&mut self) {
+        if let Some(handler) = self.geometry_handler.take() {
+            self.monitor.disconnect(handler);
+        }
         detach_application_window(&self.window);
     }
 }

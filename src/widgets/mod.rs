@@ -198,9 +198,25 @@ fn set_spinner_active(icon: &gtk::Label, spinner: &gtk::Spinner, active: bool) {
 
 fn detach_application_window(window: &gtk::ApplicationWindow) {
     window.set_visible(false);
+    // GTK 4.22's Wayland session cleanup assumes a realized surface when an
+    // application window is removed. Create it without mapping unused popups.
+    if !window.is_realized() && window.application().is_some() {
+        WidgetExt::realize(window);
+    }
     // GTK also owns a reference through its toplevel list. Removing only the
     // application reference leaves hidden windows alive after monitor changes.
     window.destroy();
+}
+
+fn make_window_click_through(window: &gtk::ApplicationWindow) {
+    window.set_can_target(false);
+    window.connect_realize(|window| {
+        if let Some(surface) = window.surface() {
+            // can-target only affects GTK picking. The compositor needs an
+            // empty native input region to pass input to the window underneath.
+            surface.set_input_region(Some(&gtk::cairo::Region::create()));
+        }
+    });
 }
 
 fn build_quick_toggle_button(
@@ -791,7 +807,7 @@ mod tests {
     use super::{Generation, RefreshGate, popup_animation_progress};
 
     #[test]
-    #[ignore = "requires a GTK display; run under Xvfb with --ignored"]
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
     fn detached_popup_releases_its_window_and_children() {
         use gtk::{gio, prelude::*};
 
@@ -801,21 +817,27 @@ mod tests {
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         application.register(None::<&gio::Cancellable>).unwrap();
-        let window = gtk::ApplicationWindow::builder()
-            .application(&application)
-            .build();
-        window.set_hide_on_close(true);
-        let child = gtk::Button::new();
-        window.set_child(Some(&child));
-        let weak_window = window.downgrade();
-        let weak_child = child.downgrade();
+        for realized in [false, true] {
+            let window = gtk::ApplicationWindow::builder()
+                .application(&application)
+                .build();
+            window.set_hide_on_close(true);
+            super::make_window_click_through(&window);
+            let child = gtk::Button::new();
+            window.set_child(Some(&child));
+            let weak_window = window.downgrade();
+            let weak_child = child.downgrade();
+            if realized {
+                WidgetExt::realize(&window);
+            }
 
-        super::detach_application_window(&window);
-        assert!(application.windows().is_empty());
-        drop(window);
-        drop(child);
-        assert!(weak_window.upgrade().is_none());
-        assert!(weak_child.upgrade().is_none());
+            super::detach_application_window(&window);
+            assert!(application.windows().is_empty());
+            drop(window);
+            drop(child);
+            assert!(weak_window.upgrade().is_none());
+            assert!(weak_child.upgrade().is_none());
+        }
     }
 
     #[test]

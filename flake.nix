@@ -29,7 +29,6 @@
             OBSIDIAN_BAR_DDCUTIL_BIN = "${pkgs.ddcutil}/bin/ddcutil";
             OBSIDIAN_BAR_PW_DUMP_BIN = "${pkgs.pipewire}/bin/pw-dump";
             OBSIDIAN_BAR_WPCTL_BIN = "${pkgs.wireplumber}/bin/wpctl";
-            OBSIDIAN_BAR_KILL_BIN = "${pkgs.coreutils}/bin/kill";
 
             meta.mainProgram = "obsidian-bar";
           };
@@ -56,7 +55,6 @@
           OBSIDIAN_BAR_DDCUTIL_BIN = "${pkgs.ddcutil}/bin/ddcutil";
           OBSIDIAN_BAR_PW_DUMP_BIN = "${pkgs.pipewire}/bin/pw-dump";
           OBSIDIAN_BAR_WPCTL_BIN = "${pkgs.wireplumber}/bin/wpctl";
-          OBSIDIAN_BAR_KILL_BIN = "${pkgs.coreutils}/bin/kill";
           packages = with pkgs; [
             cargo
             rustc

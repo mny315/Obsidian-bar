@@ -41,14 +41,8 @@ window.audio-spectrum-window,
 window.audio-spectrum-window.background,
 window.system-monitor-window,
 window.system-monitor-window.background,
-window.system-monitor-trigger-window,
-window.system-monitor-trigger-window.background,
-window.system-monitor-handle-window,
-window.system-monitor-handle-window.background,
-window.system-monitor-height-handle-window,
-window.system-monitor-height-handle-window.background,
-window.system-monitor-settings-window,
-window.system-monitor-settings-window.background,
+window.system-monitor-hotspot-window,
+window.system-monitor-hotspot-window.background,
 .audio-spectrum-canvas,
 .osd-placement {
   background: transparent;
@@ -58,18 +52,42 @@ window.system-monitor-settings-window.background,
   border: none;
 }
 
+.system-monitor-card {
+  color: @fg;
+  font-size: 11px;
+  background: @popup_surface_bg;
+  border-radius: 18px;
+}
+
 .system-monitor-surface {
   color: @fg;
-  background: linear-gradient(
-    90deg,
-    alpha(@theme_bg_color,0.68),
-    alpha(@theme_bg_color,0.34) 74%,
-    transparent
-  );
-  border: none;
-  border-radius: 1.09em;
-  box-shadow: none;
-  padding: 0.82em 1em 0.91em 0.82em;
+  font-size: 1em;
+  background: transparent;
+  padding: 0 1em 0.91em 0.82em;
+}
+
+.system-monitor-header {
+  min-height: 3.27em;
+}
+
+.system-monitor-header-title {
+  margin-left: 1.09em;
+  font-size: 1em;
+  font-weight: 600;
+  opacity: 0.76;
+}
+
+.system-monitor-tail {
+  background: alpha(@theme_bg_color,0.14);
+  border-radius: 7px 0 0 7px;
+  transition: background-color 160ms ease;
+}
+
+.system-monitor-tail-grip {
+  min-width: 3px;
+  min-height: 24px;
+  border-radius: 3px;
+  background: alpha(@theme_fg_color,0.22);
 }
 
 .system-monitor-section {
@@ -176,7 +194,7 @@ button.system-monitor-settings-trigger:focus {
   background-image: none;
   box-shadow: none;
   outline: none;
-  opacity: 0.04;
+  opacity: 0.64;
   transition: opacity 170ms ease, background-color 170ms ease, border-color 170ms ease;
 }
 
@@ -208,54 +226,30 @@ button.system-monitor-settings-trigger:active {
   font-size: 1.55em;
 }
 
-.system-monitor-drag-handle {
-  min-width: 1.64em;
-  min-height: 10.91em;
-  background: transparent;
+button.system-monitor-settings-pin {
+  min-height: 32px;
+  border: 1px solid @soft_overlay_16;
+  border-radius: 10px;
+  color: @fg;
+  background: @soft_overlay_06;
+  box-shadow: none;
 }
 
-.system-monitor-width-resize-zone,
-.system-monitor-height-handle {
-  background: transparent;
+button.system-monitor-settings-pin:hover {
+  background: @hover_bg;
 }
 
-.system-monitor-height-handle {
-  min-width: 10.91em;
-  min-height: 1.64em;
-}
-
-.system-monitor-resize-corner {
-  min-width: 1.64em;
-  min-height: 1.64em;
-  margin: 0 0.09em 0.09em 0;
-  border-right: 0.18em solid alpha(@theme_fg_color,0.10);
-  border-bottom: 0.18em solid alpha(@theme_fg_color,0.10);
-  border-radius: 0 0 0.36em 0;
-  background: transparent;
-  opacity: 0.34;
-  transition: opacity 160ms ease, border-color 160ms ease;
-}
-
-.system-monitor-resize-corner:hover {
-  border-color: alpha(@theme_fg_color,0.78);
-  opacity: 1;
-}
-
-.system-monitor-drag-handle.system-monitor-dragging .system-monitor-resize-corner,
-.system-monitor-drag-handle.system-monitor-width-resizing .system-monitor-resize-corner,
-.system-monitor-drag-handle.system-monitor-height-resizing .system-monitor-resize-corner,
-.system-monitor-drag-handle.system-monitor-resizing .system-monitor-resize-corner {
-  opacity: 0;
+button.system-monitor-settings-pin:checked {
+  background: @accent_overlay_26;
+  border-color: @glass_border;
 }
 
 .system-monitor-settings-surface {
   padding: 12px;
   color: @fg;
-  background: alpha(@theme_bg_color,0.92);
+  background: transparent;
   background-image: none;
-  border: 1px solid alpha(@theme_fg_color,0.16);
-  border-radius: 18px;
-  background-clip: padding-box;
+  border-right: 1px solid alpha(@theme_fg_color,0.12);
   box-shadow: none;
 }
 
@@ -1912,6 +1906,30 @@ scale.slider-control:active > trough > slider {
   background-image: none;
   box-shadow: none;
   opacity: 0;
+}
+
+scale.slider-control.system-monitor-settings-scale slider {
+  min-width: 12px;
+  min-height: 12px;
+  margin: -2px;
+  border-radius: 999px;
+  background: @fg;
+  opacity: 1;
+}
+
+scale.system-monitor-settings-scale value {
+  min-width: 44px;
+  color: @fg;
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.85;
+}
+
+scale.system-monitor-settings-scale marks indicator {
+  background: @soft_overlay_42;
+  color: @soft_overlay_42;
+  border: none;
+  box-shadow: none;
 }
 
 .slider-value {

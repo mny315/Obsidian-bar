@@ -7,7 +7,7 @@ use std::{
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
-use super::detach_application_window;
+use super::{Generation, detach_application_window, make_window_click_through};
 
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(420);
 const TOOLTIP_GAP: i32 = 13;
@@ -59,15 +59,6 @@ fn tooltips_suspended() -> bool {
     TOOLTIP_SUSPENSION_DEPTH.with(|depth| depth.get() > 0)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Generation(u64);
-
-impl Generation {
-    fn next(self) -> Self {
-        Self(self.0.wrapping_add(1))
-    }
-}
-
 struct TooltipState {
     monitor: gdk::Monitor,
     window: gtk::ApplicationWindow,
@@ -75,9 +66,9 @@ struct TooltipState {
     label: gtk::Label,
     active_target: glib::WeakRef<gtk::Widget>,
     pending_target: glib::WeakRef<gtk::Widget>,
-    show_generation: Cell<Generation>,
-    hide_generation: Cell<Generation>,
-    placement_generation: Cell<Generation>,
+    show_generation: Generation,
+    hide_generation: Generation,
+    placement_generation: Generation,
 }
 
 #[derive(Clone)]
@@ -95,6 +86,7 @@ impl BarTooltip {
         window.add_css_class("widget-popup-window");
         window.add_css_class("bar-tooltip-window");
         window.set_focusable(false);
+        make_window_click_through(&window);
         window.set_hide_on_close(true);
         window.init_layer_shell();
         window.set_namespace(Some("obsidian-bar-tooltip"));
@@ -142,9 +134,9 @@ impl BarTooltip {
             label,
             active_target: glib::WeakRef::new(),
             pending_target: glib::WeakRef::new(),
-            show_generation: Cell::new(Generation::default()),
-            hide_generation: Cell::new(Generation::default()),
-            placement_generation: Cell::new(Generation::default()),
+            show_generation: Generation::default(),
+            hide_generation: Generation::default(),
+            placement_generation: Generation::default(),
         });
 
         TOOLTIP_STATES.with(|states| states.borrow_mut().push(Rc::downgrade(&state)));
@@ -292,28 +284,10 @@ fn tooltip_state_for(widget: &gtk::Widget) -> Option<Rc<TooltipState>> {
 }
 
 impl TooltipState {
-    fn next_show_generation(&self) -> Generation {
-        let generation = self.show_generation.get().next();
-        self.show_generation.set(generation);
-        generation
-    }
-
-    fn next_hide_generation(&self) -> Generation {
-        let generation = self.hide_generation.get().next();
-        self.hide_generation.set(generation);
-        generation
-    }
-
-    fn next_placement_generation(&self) -> Generation {
-        let generation = self.placement_generation.get().next();
-        self.placement_generation.set(generation);
-        generation
-    }
-
     fn invalidate_all(&self) {
-        self.next_show_generation();
-        self.next_hide_generation();
-        self.next_placement_generation();
+        self.show_generation.bump();
+        self.hide_generation.bump();
+        self.placement_generation.bump();
         self.active_target.set(None);
         self.pending_target.set(None);
         self.window.set_visible(false);
@@ -333,7 +307,7 @@ impl TooltipState {
         // of the previous tooltip yet: if the pointer leaves this target before
         // TOOLTIP_SHOW_DELAY expires, the old tooltip would otherwise remain
         // visible with no active target and could stick indefinitely.
-        let generation = self.next_show_generation();
+        let generation = self.show_generation.bump();
         self.pending_target.set(Some(target));
 
         let weak_state = Rc::downgrade(self);
@@ -342,7 +316,7 @@ impl TooltipState {
             let (Some(state), Some(target)) = (weak_state.upgrade(), weak_target.upgrade()) else {
                 return;
             };
-            if state.show_generation.get() != generation
+            if !state.show_generation.is_current(generation)
                 || !state
                     .pending_target
                     .upgrade()
@@ -367,7 +341,7 @@ impl TooltipState {
             return;
         };
 
-        self.next_hide_generation();
+        self.hide_generation.bump();
         self.active_target.set(Some(target));
 
         if uses_markup {
@@ -381,14 +355,14 @@ impl TooltipState {
         self.place(target);
         self.window.set_visible(true);
 
-        let generation = self.next_placement_generation();
+        let generation = self.placement_generation.bump();
         let weak_state = Rc::downgrade(self);
         let weak_target = target.downgrade();
         glib::idle_add_local_once(move || {
             let (Some(state), Some(target)) = (weak_state.upgrade(), weak_target.upgrade()) else {
                 return;
             };
-            if state.placement_generation.get() == generation
+            if state.placement_generation.is_current(generation)
                 && state
                     .active_target
                     .upgrade()
@@ -408,7 +382,7 @@ impl TooltipState {
                 .as_ref()
                 .is_some_and(|pending| pending == target)
             {
-                self.next_show_generation();
+                self.show_generation.bump();
                 self.pending_target.set(None);
             }
 
@@ -421,19 +395,20 @@ impl TooltipState {
                 return;
             }
         } else {
-            self.next_show_generation();
+            self.show_generation.bump();
             self.pending_target.set(None);
         }
 
         self.active_target.set(None);
-        self.next_placement_generation();
-        let generation = self.next_hide_generation();
+        self.placement_generation.bump();
+        let generation = self.hide_generation.bump();
         let weak_state = Rc::downgrade(self);
         glib::idle_add_local_once(move || {
             let Some(state) = weak_state.upgrade() else {
                 return;
             };
-            if state.hide_generation.get() == generation && state.active_target.upgrade().is_none()
+            if state.hide_generation.is_current(generation)
+                && state.active_target.upgrade().is_none()
             {
                 state.window.set_visible(false);
             }

@@ -13,32 +13,30 @@ use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use tracing::{info, warn};
 
-use super::{PopupReveal, clear_box, run_background};
+use super::{Generation, clear_box, detach_application_window, run_background};
+
+mod drawer;
+use drawer::MonitorDrawer;
 
 const SETTINGS_GROUP: &str = "monitor";
 const SETTINGS_FILE: &str = "system-monitor.ini";
 const CONTENT_NAMESPACE: &str = "obsidian-system-monitor";
-const TRIGGER_NAMESPACE: &str = "obsidian-system-monitor-settings-trigger";
-const HANDLE_NAMESPACE: &str = "obsidian-system-monitor-drag-handle";
-const HEIGHT_HANDLE_NAMESPACE: &str = "obsidian-system-monitor-height-handle";
-const SETTINGS_NAMESPACE: &str = "obsidian-system-monitor-settings";
-const CONTENT_WIDGET_NAME: &str = "obsidian-system-monitor-content";
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const HIDE_DELAY: Duration = Duration::from_secs(2);
 const NETWORK_HISTORY_LENGTH: usize = 64;
 const PANEL_MIN_WIDTH: i32 = 220;
 const PANEL_MAX_WIDTH: i32 = 280;
-const PANEL_MIN_HEIGHT: i32 = 380;
-const PANEL_MAX_HEIGHT: i32 = 620;
 const PANEL_EDGE_MARGIN: i32 = 8;
 const SETTINGS_TRIGGER_SIZE: i32 = 36;
-const DRAG_HANDLE_WIDTH: i32 = 18;
-const HEIGHT_HANDLE_SIZE: i32 = 18;
-const RESIZE_CORNER_SIZE: i32 = 18;
-const SETTINGS_WINDOW_WIDTH: i32 = 330;
-const SETTINGS_WINDOW_HEIGHT: i32 = 510;
+const SETTINGS_PANEL_WIDTH: i32 = 330;
+const SETTINGS_PANEL_PADDING: i32 = 12;
 const SCALE_MILLI_DEFAULT: i32 = 1_000;
 const SCALE_MILLI_MIN: i32 = 700;
-const SCALE_MILLI_MAX: i32 = 3_000;
+const SCALE_MILLI_MAX: i32 = 2_000;
+
+fn scaled_pixels(base: i32, scale_milli: i32) -> i32 {
+    (base.saturating_mul(scale_milli) / SCALE_MILLI_DEFAULT).max(1)
+}
 
 const ICON_SETTINGS: &str = "\u{f0493}";
 const ICON_MONITOR: &str = "\u{f0379}";
@@ -46,10 +44,6 @@ const ICON_UP: &str = "\u{f005d}";
 const ICON_DOWN: &str = "\u{f0045}";
 const ICON_VISIBLE: &str = "\u{f0208}";
 const ICON_HIDDEN: &str = "\u{f0209}";
-
-fn scaled_pixels(base: i32, scale_milli: i32) -> i32 {
-    (base.saturating_mul(scale_milli) / SCALE_MILLI_DEFAULT).max(1)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum MonitorSection {
@@ -114,11 +108,9 @@ struct SectionPreference {
 struct MonitorSettings {
     enabled: bool,
     sections: Vec<SectionPreference>,
-    position_x: Option<i32>,
     position_y: Option<i32>,
+    pinned: bool,
     scale_milli: i32,
-    panel_width: Option<i32>,
-    legacy_width: Option<i32>,
 }
 
 impl Default for MonitorSettings {
@@ -132,11 +124,9 @@ impl Default for MonitorSettings {
                     visible: true,
                 })
                 .collect(),
-            position_x: None,
             position_y: None,
+            pinned: false,
             scale_milli: SCALE_MILLI_DEFAULT,
-            panel_width: None,
-            legacy_width: None,
         }
     }
 }
@@ -165,26 +155,19 @@ impl MonitorSettings {
             .ok()
             .map(|value| parse_section_list(&value).into_iter().collect())
             .unwrap_or_default();
-        let position_x = key_file.integer(SETTINGS_GROUP, "position_x").ok();
         let position_y = key_file.integer(SETTINGS_GROUP, "position_y").ok();
-        let saved_scale = key_file.integer(SETTINGS_GROUP, "scale").ok();
-        let scale_milli = saved_scale
-            .unwrap_or(defaults.scale_milli)
+        let pinned = key_file.boolean(SETTINGS_GROUP, "pinned").unwrap_or(false);
+        let scale_milli = key_file
+            .integer(SETTINGS_GROUP, "scale")
+            .unwrap_or(SCALE_MILLI_DEFAULT)
             .clamp(SCALE_MILLI_MIN, SCALE_MILLI_MAX);
-        let panel_width = key_file.integer(SETTINGS_GROUP, "panel_width").ok();
-        let legacy_width = saved_scale
-            .is_none()
-            .then(|| key_file.integer(SETTINGS_GROUP, "width").ok())
-            .flatten();
 
         Self {
             enabled,
             sections: normalized_sections(order, &hidden),
-            position_x,
             position_y,
+            pinned,
             scale_milli,
-            panel_width,
-            legacy_width,
         }
     }
 
@@ -219,20 +202,11 @@ impl MonitorSettings {
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        if let Some(position_x) = self.position_x {
-            key_file.set_integer(SETTINGS_GROUP, "position_x", position_x);
-        }
         if let Some(position_y) = self.position_y {
             key_file.set_integer(SETTINGS_GROUP, "position_y", position_y);
         }
-        if let Some(panel_width) = self.panel_width {
-            key_file.set_integer(SETTINGS_GROUP, "panel_width", panel_width);
-        }
-        if let Some(width) = self.legacy_width {
-            key_file.set_integer(SETTINGS_GROUP, "width", width);
-        } else {
-            key_file.set_integer(SETTINGS_GROUP, "scale", self.scale_milli);
-        }
+        key_file.set_boolean(SETTINGS_GROUP, "pinned", self.pinned);
+        key_file.set_integer(SETTINGS_GROUP, "scale", self.scale_milli);
 
         let temporary = path.with_extension("ini.tmp");
         if let Err(error) = key_file.save_to_file(&temporary) {
@@ -607,19 +581,18 @@ impl SystemMonitorController {
         })
     }
 
-    fn set_position(&self, x: i32, y: i32) -> bool {
+    fn set_position(&self, y: i32) -> bool {
+        self.update_settings(|settings| settings.position_y = Some(y))
+    }
+
+    fn set_scale(&self, scale_milli: i32) -> bool {
         self.update_settings(|settings| {
-            settings.position_x = Some(x);
-            settings.position_y = Some(y);
+            settings.scale_milli = scale_milli.clamp(SCALE_MILLI_MIN, SCALE_MILLI_MAX)
         })
     }
 
-    fn set_dimensions(&self, scale_milli: i32, panel_width: i32) -> bool {
-        self.update_settings(|settings| {
-            settings.scale_milli = scale_milli;
-            settings.panel_width = Some(panel_width);
-            settings.legacy_width = None;
-        })
+    fn set_pinned(&self, pinned: bool) -> bool {
+        self.update_settings(|settings| settings.pinned = pinned)
     }
 }
 
@@ -656,43 +629,6 @@ impl NetworkGraphState {
         while self.upload.len() > NETWORK_HISTORY_LENGTH {
             self.upload.pop_front();
         }
-    }
-}
-
-struct MonitorScaleStyle {
-    provider: gtk::CssProvider,
-    display: gdk::Display,
-}
-
-impl MonitorScaleStyle {
-    fn new(display: &gdk::Display) -> Self {
-        let provider = gtk::CssProvider::new();
-        provider.connect_parsing_error(|_, _, error| {
-            warn!(%error, "system monitor scale css parsing error");
-        });
-        gtk::style_context_add_provider_for_display(
-            display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-        );
-        Self {
-            provider,
-            display: display.clone(),
-        }
-    }
-
-    fn apply(&self, scale_milli: i32) {
-        let scale = f64::from(scale_milli) / f64::from(SCALE_MILLI_DEFAULT);
-        self.provider.load_from_data(&format!(
-            "#{CONTENT_WIDGET_NAME}.system-monitor-surface, window.system-monitor-trigger-window, window.system-monitor-handle-window, window.system-monitor-height-handle-window {{ font-size: {:.2}px; }}",
-            11.0 * scale
-        ));
-    }
-}
-
-impl Drop for MonitorScaleStyle {
-    fn drop(&mut self) {
-        gtk::style_context_remove_provider_for_display(&self.display, &self.provider);
     }
 }
 
@@ -751,10 +687,6 @@ impl MeterView {
             .set(fraction.unwrap_or_default().clamp(0.0, 1.0));
         self.area.queue_draw();
     }
-
-    fn apply_scale(&self, scale_milli: i32) {
-        self.area.set_content_height(scaled_pixels(3, scale_milli));
-    }
 }
 
 struct SectionView {
@@ -762,7 +694,6 @@ struct SectionView {
     rows: gtk::Box,
     signature: RefCell<Vec<(String, String)>>,
     value_labels: RefCell<Vec<gtk::Label>>,
-    row_boxes: RefCell<Vec<gtk::Box>>,
     meter: Option<MeterView>,
     graph: Option<gtk::DrawingArea>,
     graph_state: Option<Rc<RefCell<NetworkGraphState>>>,
@@ -817,7 +748,6 @@ impl SectionView {
             rows,
             signature: RefCell::new(Vec::new()),
             value_labels: RefCell::new(Vec::new()),
-            row_boxes: RefCell::new(Vec::new()),
             meter,
             graph,
             graph_state,
@@ -834,9 +764,7 @@ impl SectionView {
         if *self.signature.borrow() != signature {
             clear_box(&self.rows);
             let mut value_labels = self.value_labels.borrow_mut();
-            let mut row_boxes = self.row_boxes.borrow_mut();
             value_labels.clear();
-            row_boxes.clear();
             for metric in &metrics {
                 let row = gtk::Box::new(
                     gtk::Orientation::Horizontal,
@@ -861,7 +789,6 @@ impl SectionView {
                 row.append(&label);
                 row.append(&value);
                 self.rows.append(&row);
-                row_boxes.push(row);
                 value_labels.push(value);
             }
             self.signature.replace(signature);
@@ -877,6 +804,25 @@ impl SectionView {
         self.available.set(!metrics.is_empty());
     }
 
+    fn apply_scale(&self, scale_milli: i32) {
+        self.scale_milli.set(scale_milli);
+        self.root.set_spacing(scaled_pixels(3, scale_milli));
+        self.rows.set_spacing(scaled_pixels(1, scale_milli));
+        let mut row = self.rows.first_child();
+        while let Some(widget) = row {
+            if let Some(row) = widget.downcast_ref::<gtk::Box>() {
+                row.set_spacing(scaled_pixels(6, scale_milli));
+            }
+            row = widget.next_sibling();
+        }
+        if let Some(graph) = &self.graph {
+            graph.set_content_height(scaled_pixels(72, scale_milli));
+        }
+        if let Some(meter) = &self.meter {
+            meter.area.set_content_height(scaled_pixels(3, scale_milli));
+        }
+    }
+
     fn push_network_sample(&self, download: f64, upload: f64) {
         let Some(state) = self.graph_state.as_ref() else {
             return;
@@ -884,21 +830,6 @@ impl SectionView {
         state.borrow_mut().push(download, upload);
         if let Some(graph) = self.graph.as_ref() {
             graph.queue_draw();
-        }
-    }
-
-    fn apply_scale(&self, scale_milli: i32) {
-        self.scale_milli.set(scale_milli);
-        self.root.set_spacing(scaled_pixels(3, scale_milli));
-        self.rows.set_spacing(scaled_pixels(1, scale_milli));
-        for row in self.row_boxes.borrow().iter() {
-            row.set_spacing(scaled_pixels(6, scale_milli));
-        }
-        if let Some(graph) = self.graph.as_ref() {
-            graph.set_content_height(scaled_pixels(72, scale_milli));
-        }
-        if let Some(meter) = self.meter.as_ref() {
-            meter.apply_scale(scale_milli);
         }
     }
 }
@@ -909,8 +840,9 @@ struct MonitorLayout {
     empty_state: gtk::Box,
     empty_title: gtk::Label,
     empty_hint: gtk::Label,
-    scale_style: MonitorScaleStyle,
     applied_scale: Cell<i32>,
+    scale_provider: gtk::CssProvider,
+    display: gdk::Display,
     settings: RefCell<MonitorSettings>,
 }
 
@@ -922,7 +854,6 @@ impl MonitorLayout {
     ) -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 7);
         root.add_css_class("system-monitor-surface");
-        root.set_widget_name(CONTENT_WIDGET_NAME);
         root.set_valign(gtk::Align::Start);
         root.set_can_target(false);
 
@@ -947,14 +878,21 @@ impl MonitorLayout {
             .into_iter()
             .map(|section| (section, SectionView::new(section)))
             .collect();
+        let scale_provider = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            display,
+            &scale_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
         let layout = Rc::new(Self {
             root,
             sections,
             empty_state,
             empty_title,
             empty_hint,
-            scale_style: MonitorScaleStyle::new(display),
             applied_scale: Cell::new(0),
+            scale_provider,
+            display: display.clone(),
             settings: RefCell::new(settings.clone()),
         });
         layout.apply_settings(&settings);
@@ -964,7 +902,19 @@ impl MonitorLayout {
 
     fn apply_settings(&self, settings: &MonitorSettings) {
         self.settings.replace(settings.clone());
-        self.apply_scale(settings.scale_milli);
+        if self.applied_scale.replace(settings.scale_milli) != settings.scale_milli {
+            self.scale_provider.load_from_data(&format!(
+                ".system-monitor-body {{ font-size: {:.2}px; }}",
+                11.0 * f64::from(settings.scale_milli) / 1000.0
+            ));
+            self.root
+                .set_spacing(scaled_pixels(7, settings.scale_milli));
+            self.empty_state
+                .set_spacing(scaled_pixels(3, settings.scale_milli));
+            for section in self.sections.values() {
+                section.apply_scale(settings.scale_milli);
+            }
+        }
         clear_box(&self.root);
         for preference in &settings.sections {
             if let Some(section) = self.sections.get(&preference.section) {
@@ -973,18 +923,6 @@ impl MonitorLayout {
         }
         self.root.append(&self.empty_state);
         self.refresh_visibility();
-    }
-
-    fn apply_scale(&self, scale_milli: i32) {
-        if self.applied_scale.replace(scale_milli) == scale_milli {
-            return;
-        }
-        self.scale_style.apply(scale_milli);
-        self.root.set_spacing(scaled_pixels(7, scale_milli));
-        self.empty_state.set_spacing(scaled_pixels(3, scale_milli));
-        for section in self.sections.values() {
-            section.apply_scale(scale_milli);
-        }
     }
 
     fn natural_height(&self, width: i32) -> i32 {
@@ -1036,6 +974,12 @@ impl MonitorLayout {
         }
         self.empty_state
             .set_visible(settings.enabled && !has_visible_metrics);
+    }
+}
+
+impl Drop for MonitorLayout {
+    fn drop(&mut self) {
+        gtk::style_context_remove_provider_for_display(&self.display, &self.scale_provider);
     }
 }
 
@@ -1430,253 +1374,41 @@ struct PanelGeometry {
     screen_width: i32,
     screen_height: i32,
     panel_width: i32,
-    panel_height: i32,
 }
 
 impl PanelGeometry {
-    fn for_monitor(monitor: &gdk::Monitor) -> Self {
+    fn for_monitor(monitor: &gdk::Monitor, scale_milli: i32) -> Self {
         let geometry = monitor.geometry();
         let screen_width = geometry.width().max(1);
         let screen_height = geometry.height().max(1);
-        let panel_width = ((f64::from(screen_width) * 0.18).round() as i32)
-            .clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH)
-            .min((screen_width - PANEL_EDGE_MARGIN * 2).max(1));
-        let panel_height = ((f64::from(screen_height) * 0.68).round() as i32)
-            .clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT)
-            .min((screen_height - PANEL_EDGE_MARGIN * 2).max(1));
+        let base_width = ((f64::from(screen_width) * 0.18).round() as i32)
+            .clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
+        let panel_width = scaled_pixels(base_width, scale_milli)
+            .min((screen_width - drawer::RIGHT_MARGIN).max(1));
         Self {
             screen_width,
             screen_height,
             panel_width,
-            panel_height,
         }
     }
 
-    fn resolve_scale(self, settings: &MonitorSettings) -> i32 {
-        let scale_milli = settings
-            .legacy_width
-            .map(|width| width.saturating_mul(SCALE_MILLI_DEFAULT) / self.panel_width)
-            .unwrap_or(settings.scale_milli);
-        self.clamp_scale(scale_milli)
+    fn clamp_y(self, y: i32, height: i32) -> i32 {
+        let maximum = (self.screen_height - height - PANEL_EDGE_MARGIN).max(PANEL_EDGE_MARGIN);
+        y.clamp(PANEL_EDGE_MARGIN, maximum)
     }
 
-    fn clamp_scale(self, scale_milli: i32) -> i32 {
-        let available_width = (self.screen_width - PANEL_EDGE_MARGIN * 2).max(1);
-        let width_limit = available_width.saturating_mul(SCALE_MILLI_DEFAULT) / self.panel_width;
-        let minimum = SCALE_MILLI_MIN.min(width_limit);
-        let maximum = SCALE_MILLI_MAX.min(width_limit).max(minimum);
-        scale_milli.clamp(minimum, maximum)
-    }
-
-    fn width_for_scale(self, scale_milli: i32) -> i32 {
-        (self.panel_width.saturating_mul(scale_milli) / SCALE_MILLI_DEFAULT).max(1)
-    }
-
-    fn resolve_width(self, settings: &MonitorSettings, scale_milli: i32) -> i32 {
-        let maximum = (self.screen_width - PANEL_EDGE_MARGIN * 2).max(1);
-        let minimum = scaled_pixels(PANEL_MIN_WIDTH, scale_milli).min(maximum);
-        settings
-            .panel_width
-            .unwrap_or_else(|| self.width_for_scale(scale_milli))
-            .clamp(minimum, maximum)
-    }
-
-    fn height_for_scale(self, scale_milli: i32) -> i32 {
-        (self.panel_height.saturating_mul(scale_milli) / SCALE_MILLI_DEFAULT).max(1)
-    }
-
-    fn resolve(self, settings: &MonitorSettings, width: i32, height: i32) -> (i32, i32) {
-        let default_x = ((f64::from(self.screen_width) * 0.025).round() as i32).max(18);
-        let default_y = ((f64::from(self.screen_height) * 0.26).round() as i32).max(58);
-        self.clamp(
-            settings.position_x.unwrap_or(default_x),
-            settings.position_y.unwrap_or(default_y),
-            width,
-            height,
-        )
-    }
-
-    fn clamp(self, x: i32, y: i32, width: i32, height: i32) -> (i32, i32) {
-        let max_x = (self.screen_width - width - PANEL_EDGE_MARGIN).max(PANEL_EDGE_MARGIN);
-        let max_y = (self.screen_height - height - PANEL_EDGE_MARGIN).max(PANEL_EDGE_MARGIN);
-        (
-            x.clamp(PANEL_EDGE_MARGIN, max_x),
-            y.clamp(PANEL_EDGE_MARGIN, max_y),
-        )
-    }
-}
-
-struct PlacementRuntime {
-    x: Cell<i32>,
-    y: Cell<i32>,
-    width: Cell<i32>,
-    height: Cell<i32>,
-    scale_milli: Cell<i32>,
-    drag_start_x: Cell<i32>,
-    drag_start_y: Cell<i32>,
-    resize_start_width: Cell<i32>,
-    resize_start_height: Cell<i32>,
-    resize_start_scale: Cell<i32>,
-    geometry: PanelGeometry,
-}
-
-impl PlacementRuntime {
-    fn new(geometry: PanelGeometry, settings: &MonitorSettings) -> Rc<Self> {
-        let scale_milli = geometry.resolve_scale(settings);
-        let width = geometry.resolve_width(settings, scale_milli);
-        let height = geometry.height_for_scale(scale_milli);
-        let (x, y) = geometry.resolve(settings, width, height);
-        Rc::new(Self {
-            x: Cell::new(x),
-            y: Cell::new(y),
-            width: Cell::new(width),
-            height: Cell::new(height),
-            scale_milli: Cell::new(scale_milli),
-            drag_start_x: Cell::new(x),
-            drag_start_y: Cell::new(y),
-            resize_start_width: Cell::new(width),
-            resize_start_height: Cell::new(height),
-            resize_start_scale: Cell::new(scale_milli),
-            geometry,
-        })
-    }
-
-    fn set(&self, x: i32, y: i32) -> (i32, i32) {
-        let (x, y) = self
-            .geometry
-            .clamp(x, y, self.width.get(), self.height.get());
-        self.x.set(x);
-        self.y.set(y);
-        (x, y)
-    }
-
-    fn begin_resize(&self, measured_width: i32, measured_height: i32) {
-        self.resize_start_width.set(measured_width.max(1));
-        self.resize_start_height.set(measured_height.max(1));
-        self.resize_start_scale.set(self.scale_milli.get());
-        self.width.set(measured_width.max(1));
-        self.height.set(measured_height.max(1));
-    }
-
-    fn begin_width_resize(&self, measured_width: i32) {
-        self.resize_start_width.set(measured_width.max(1));
-        self.width.set(measured_width.max(1));
-    }
-
-    fn resize_width(&self, offset_x: f64) {
-        let available = (self.geometry.screen_width - self.x.get() - PANEL_EDGE_MARGIN).max(1);
-        let minimum = scaled_pixels(PANEL_MIN_WIDTH, self.scale_milli.get()).min(available);
-        let requested = self
-            .resize_start_width
-            .get()
-            .saturating_add(offset_x.round() as i32);
-        self.width.set(requested.clamp(minimum, available));
-    }
-
-    fn resize(&self, offset_x: f64, offset_y: f64) {
-        let start_width = f64::from(self.resize_start_width.get().max(1));
-        let start_height = f64::from(self.resize_start_height.get().max(1));
-        let projection = (offset_x * start_width + offset_y * start_height)
-            / (start_width.mul_add(start_width, start_height * start_height));
-        let requested =
-            (f64::from(self.resize_start_scale.get()) * (1.0 + projection)).round() as i32;
-
-        let available_width =
-            (self.geometry.screen_width - self.x.get() - PANEL_EDGE_MARGIN).max(1);
-        let available_height =
-            (self.geometry.screen_height - self.y.get() - PANEL_EDGE_MARGIN).max(1);
-        let maximum_from_width = self
-            .resize_start_scale
-            .get()
-            .saturating_mul(available_width)
-            / self.resize_start_width.get().max(1);
-        let maximum_from_height = self
-            .resize_start_scale
-            .get()
-            .saturating_mul(available_height)
-            / self.resize_start_height.get().max(1);
-        let maximum = SCALE_MILLI_MAX
-            .min(maximum_from_width)
-            .min(maximum_from_height)
-            .max(SCALE_MILLI_MIN);
-        let scale_milli = requested.clamp(SCALE_MILLI_MIN.min(maximum), maximum);
-        let factor = f64::from(scale_milli) / f64::from(self.resize_start_scale.get().max(1));
-
-        self.scale_milli.set(scale_milli);
-        self.width
-            .set((start_width * factor).round().max(1.0) as i32);
-        self.height
-            .set((start_height * factor).round().max(1.0) as i32);
-    }
-
-    fn resize_height(&self, offset_y: f64) {
-        let start_width = self.resize_start_width.get().max(1);
-        let start_height = self.resize_start_height.get().max(1);
-        let start_scale = self.resize_start_scale.get().max(1);
-        let requested_height = start_height.saturating_add(offset_y.round() as i32).max(1);
-        let requested_scale = start_scale.saturating_mul(requested_height) / start_height;
-        let available_height =
-            (self.geometry.screen_height - self.y.get() - PANEL_EDGE_MARGIN).max(1);
-        let maximum_from_height = start_scale.saturating_mul(available_height) / start_height;
-        let maximum = SCALE_MILLI_MAX
-            .min(maximum_from_height)
-            .max(SCALE_MILLI_MIN);
-        let scale_milli = requested_scale.clamp(SCALE_MILLI_MIN.min(maximum), maximum);
-
-        self.scale_milli.set(scale_milli);
-        self.width.set(start_width);
-        self.height
-            .set(start_height.saturating_mul(scale_milli) / start_scale);
-    }
-
-    fn set_measured_height(&self, height: i32) {
-        if height > 1 {
-            self.height.set(height);
-        }
-    }
-
-    fn apply_settings(&self, settings: &MonitorSettings) {
-        let old_scale = self.scale_milli.get().max(1);
-        let scale_milli = self.geometry.resolve_scale(settings);
-        let width = self.geometry.resolve_width(settings, scale_milli);
-        let height = self.height.get().saturating_mul(scale_milli) / old_scale;
-        let (x, y) = self.geometry.resolve(settings, width, height);
-        self.scale_milli.set(scale_milli);
-        self.width.set(width);
-        self.height.set(height.max(1));
-        self.x.set(x);
-        self.y.set(y);
-    }
-}
-
-#[derive(Default)]
-struct PointerDragState {
-    active: Cell<bool>,
-    offset_x: Cell<f64>,
-    offset_y: Cell<f64>,
-}
-
-impl PointerDragState {
-    fn begin(&self) {
-        self.offset_x.set(0.0);
-        self.offset_y.set(0.0);
-        self.active.set(true);
-    }
-
-    fn update(&self, offset_x: f64, offset_y: f64) {
-        self.offset_x.set(offset_x);
-        self.offset_y.set(offset_y);
-    }
-
-    fn end(&self, offset_x: f64, offset_y: f64) {
-        self.update(offset_x, offset_y);
-        self.active.set(false);
+    fn default_y(self) -> i32 {
+        ((f64::from(self.screen_height) * 0.26).round() as i32).max(58)
     }
 }
 
 struct MonitorSettingsPanel {
     root: gtk::Box,
     list: gtk::Box,
+    pin: gtk::ToggleButton,
+    syncing_pin: Cell<bool>,
+    scale: gtk::Scale,
+    syncing_scale: Cell<bool>,
     rebuild_pending: Cell<bool>,
     available_sections: Cell<u8>,
     controller: Rc<SystemMonitorController>,
@@ -1686,7 +1418,7 @@ impl MonitorSettingsPanel {
     fn new(controller: &Rc<SystemMonitorController>) -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
         root.add_css_class("system-monitor-settings-panel");
-        root.set_size_request(SETTINGS_WINDOW_WIDTH, -1);
+        root.set_size_request(SETTINGS_PANEL_WIDTH - SETTINGS_PANEL_PADDING * 2, -1);
 
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 9);
         header.add_css_class("system-monitor-settings-header");
@@ -1699,6 +1431,27 @@ impl MonitorSettingsPanel {
         header.append(&icon);
         header.append(&title);
 
+        let pin = gtk::ToggleButton::with_label("Pin panel");
+        pin.add_css_class("system-monitor-settings-pin");
+        pin.set_tooltip_text(Some("Keep the monitor visible when the pointer leaves"));
+        pin.set_active(controller.settings().pinned);
+
+        let scale_row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let scale_title = gtk::Label::new(Some("Scale"));
+        scale_title.add_css_class("system-monitor-settings-section-title");
+        scale_title.set_xalign(0.0);
+        let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 70.0, 200.0, 5.0);
+        scale.add_css_class("slider-control");
+        scale.add_css_class("system-monitor-settings-scale");
+        scale.set_value(f64::from(controller.settings().scale_milli) / 10.0);
+        scale.set_digits(0);
+        scale.set_draw_value(true);
+        scale.set_value_pos(gtk::PositionType::Right);
+        scale.set_format_value_func(|_, value| format!("{value:.0}%"));
+        scale.add_mark(100.0, gtk::PositionType::Bottom, None);
+        scale_row.append(&scale_title);
+        scale_row.append(&scale);
+
         let section_title = gtk::Label::new(Some("Visible sections and order"));
         section_title.add_css_class("system-monitor-settings-section-title");
         section_title.set_xalign(0.0);
@@ -1709,7 +1462,7 @@ impl MonitorSettingsPanel {
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         footer.add_css_class("system-monitor-settings-footer");
         let hint = gtk::Label::new(Some(
-            "Left-drag the right edge to move. Right-drag the right or bottom edge to resize one axis; use the corner to scale everything.",
+            "Hover over the monitor area at the right edge to show it. Drag the header up and down. Height follows the visible sections.",
         ));
         hint.add_css_class("system-monitor-settings-hint");
         hint.set_wrap(true);
@@ -1720,6 +1473,8 @@ impl MonitorSettingsPanel {
         footer.append(&hint);
 
         root.append(&header);
+        root.append(&pin);
+        root.append(&scale_row);
         root.append(&section_title);
         root.append(&list);
         root.append(&footer);
@@ -1727,10 +1482,47 @@ impl MonitorSettingsPanel {
         let panel = Rc::new(Self {
             root,
             list,
+            pin,
+            syncing_pin: Cell::new(false),
+            scale,
+            syncing_scale: Cell::new(false),
             rebuild_pending: Cell::new(false),
             available_sections: Cell::new(available_section_mask(&controller.latest())),
             controller: Rc::clone(controller),
         });
+
+        {
+            let weak = Rc::downgrade(&panel);
+            panel.pin.connect_toggled(move |pin| {
+                let Some(panel) = weak.upgrade() else {
+                    return;
+                };
+                if panel.syncing_pin.get() {
+                    return;
+                }
+                if !panel.controller.set_pinned(pin.is_active()) {
+                    panel.sync_pin(panel.controller.settings().pinned);
+                }
+            });
+        }
+
+        {
+            let weak = Rc::downgrade(&panel);
+            panel.scale.connect_value_changed(move |scale| {
+                let Some(panel) = weak.upgrade() else {
+                    return;
+                };
+                if panel.syncing_scale.get() {
+                    return;
+                }
+                if !panel
+                    .controller
+                    .set_scale((scale.value() * 10.0).round() as i32)
+                {
+                    panel.sync_scale(panel.controller.settings().scale_milli);
+                }
+            });
+        }
 
         {
             let weak = Rc::downgrade(&panel);
@@ -1762,6 +1554,20 @@ impl MonitorSettingsPanel {
         panel
     }
 
+    fn sync_scale(&self, scale_milli: i32) {
+        self.syncing_scale.set(true);
+        self.scale.set_value(f64::from(scale_milli) / 10.0);
+        self.syncing_scale.set(false);
+    }
+
+    fn sync_pin(&self, pinned: bool) {
+        self.syncing_pin.set(true);
+        self.pin.set_active(pinned);
+        self.pin
+            .set_label(if pinned { "Unpin panel" } else { "Pin panel" });
+        self.syncing_pin.set(false);
+    }
+
     fn schedule_rebuild(self: &Rc<Self>) {
         if self.rebuild_pending.replace(true) {
             return;
@@ -1779,6 +1585,8 @@ impl MonitorSettingsPanel {
     fn rebuild(self: &Rc<Self>) {
         clear_box(&self.list);
         let settings = self.controller.settings();
+        self.sync_pin(settings.pinned);
+        self.sync_scale(settings.scale_milli);
         let snapshot = self.controller.latest();
         self.available_sections
             .set(available_section_mask(&snapshot));
@@ -1889,15 +1697,252 @@ fn settings_move_button(icon: &str, tooltip: &str, sensitive: bool) -> gtk::Butt
     button
 }
 
-pub struct SystemMonitorView {
+struct MonitorRuntime {
     monitor: gdk::Monitor,
-    content_window: gtk::ApplicationWindow,
-    trigger_window: gtk::ApplicationWindow,
-    handle_window: gtk::ApplicationWindow,
-    height_handle_window: gtk::ApplicationWindow,
-    settings_window: gtk::ApplicationWindow,
-    _layout: Rc<MonitorLayout>,
-    _settings_panel: Rc<MonitorSettingsPanel>,
+    window: gtk::ApplicationWindow,
+    surface: gtk::Box,
+    settings_reveal: gtk::Revealer,
+    settings_scroller: gtk::ScrolledWindow,
+    settings_panel: Rc<MonitorSettingsPanel>,
+    drawer: Rc<MonitorDrawer>,
+    hotspot_window: gtk::ApplicationWindow,
+    hotspot: gtk::Box,
+    card: gtk::Box,
+    header: gtk::Box,
+    scroller: gtk::ScrolledWindow,
+    layout: Rc<MonitorLayout>,
+    requested_y: Cell<i32>,
+    y: Cell<i32>,
+    pinned: Cell<bool>,
+    scale_milli: Cell<i32>,
+    hovered: Cell<bool>,
+    hotspot_hovered: Cell<bool>,
+    dragging: Cell<bool>,
+    drag_start_y: Cell<i32>,
+    hide_generation: Generation,
+    panel_width: Cell<i32>,
+    scale_geometry: Cell<Option<(i32, i32, i32)>>,
+}
+
+impl MonitorRuntime {
+    fn apply_size(&self) {
+        let geometry = PanelGeometry::for_monitor(&self.monitor, self.scale_milli.get());
+        let frozen = self.scale_geometry.get();
+        let settings_open =
+            self.settings_reveal.reveals_child() || self.settings_reveal.is_child_revealed();
+        let maximum_width = if settings_open {
+            (geometry.screen_width
+                - SETTINGS_PANEL_WIDTH
+                - 1
+                - drawer::RIGHT_MARGIN
+                - PANEL_EDGE_MARGIN)
+                .max(120)
+        } else {
+            geometry.panel_width
+        };
+        let width = frozen.map_or(geometry.panel_width.min(maximum_width), |(width, _, _)| {
+            width
+        });
+        self.panel_width.set(width);
+        self.card.set_size_request(width, -1);
+        let (_, header_height, _, _) = self.header.measure(gtk::Orientation::Vertical, width);
+        let available_height = frozen.map_or(
+            geometry.screen_height - PANEL_EDGE_MARGIN * 2,
+            |(_, height, _)| height,
+        );
+        let available = (available_height - header_height).max(1);
+        let height = self.layout.natural_height(width).min(available);
+        self.scroller.set_min_content_height(-1);
+        self.scroller.set_max_content_height(height);
+        self.scroller.set_min_content_height(height);
+        let (_, natural, _, _) = self.card.measure(gtk::Orientation::Vertical, width);
+        let mut height = natural.max(drawer::TAIL_TOP + drawer::TAIL_HEIGHT);
+        if settings_open && frozen.is_none() {
+            let (_, settings_height, _, _) = self.settings_panel.root.measure(
+                gtk::Orientation::Vertical,
+                SETTINGS_PANEL_WIDTH - SETTINGS_PANEL_PADDING * 2,
+            );
+            height = height.max(
+                (settings_height + SETTINGS_PANEL_PADDING * 2)
+                    .min(geometry.screen_height - PANEL_EDGE_MARGIN * 2),
+            );
+        }
+        if let Some((_, fixed_height, _)) = frozen {
+            height = fixed_height;
+        }
+        let settings_height = (height - SETTINGS_PANEL_PADDING * 2).max(1);
+        self.settings_scroller.set_min_content_height(-1);
+        self.settings_scroller
+            .set_max_content_height(settings_height);
+        self.settings_scroller
+            .set_min_content_height(settings_height);
+        let y = frozen.map_or_else(
+            || geometry.clamp_y(self.requested_y.get(), height),
+            |(_, _, y)| y,
+        );
+        self.y.set(y);
+        self.window.set_default_size(1, height);
+        self.window.set_margin(Edge::Top, y);
+        if !self.dragging.get() {
+            self.hotspot_window.set_margin(Edge::Top, y);
+            self.hotspot
+                .set_size_request(width + drawer::RIGHT_MARGIN, height);
+            self.hotspot_window
+                .set_default_size(width + drawer::RIGHT_MARGIN, height);
+            self.sync_input_region();
+        }
+    }
+
+    fn set_settings_open(self: &Rc<Self>, open: bool) {
+        if open {
+            self.settings_panel.rebuild();
+        }
+        self.settings_reveal.set_reveal_child(open);
+        self.window.set_keyboard_mode(if open {
+            KeyboardMode::OnDemand
+        } else {
+            KeyboardMode::None
+        });
+        self.apply_size();
+        self.sync_reveal();
+    }
+
+    fn sync_input_region(&self) {
+        if let Some(surface) = self.hotspot_window.surface() {
+            // Keep one stable input region throughout the reveal. Changing it
+            // under a stationary pointer can generate a leave without an enter.
+            surface.set_input_region(None);
+        }
+    }
+
+    fn header_hit(&self, x: f64, y: f64) -> bool {
+        let width = self.panel_width.get();
+        let (_, height, _, _) = self.header.measure(gtk::Orientation::Vertical, width);
+        self.drawer.is_open()
+            && y >= 0.0
+            && y < f64::from(height)
+            && x < f64::from(
+                width - scaled_pixels(SETTINGS_TRIGGER_SIZE + 8, self.scale_milli.get()),
+            )
+    }
+
+    fn keep_open(&self) -> bool {
+        self.pinned.get() || self.hovered.get() || self.hotspot_hovered.get() || self.dragging.get()
+    }
+
+    fn sync_reveal(self: &Rc<Self>) {
+        let generation = self.hide_generation.bump();
+        if self.keep_open() {
+            self.drawer.set_revealed(true);
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(HIDE_DELAY, move || {
+            if let Some(runtime) = weak.upgrade()
+                && runtime.hide_generation.is_current(generation)
+                && !runtime.keep_open()
+            {
+                runtime.settings_reveal.set_reveal_child(false);
+                runtime.window.set_keyboard_mode(KeyboardMode::None);
+                runtime.drawer.set_revealed(false);
+                runtime.sync_input_region();
+            }
+        });
+    }
+
+    fn install_drag(
+        self: &Rc<Self>,
+        widget: &impl IsA<gtk::Widget>,
+        controller: &Rc<SystemMonitorController>,
+    ) {
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(gdk::BUTTON_PRIMARY);
+        {
+            let weak = Rc::downgrade(self);
+            drag.connect_drag_begin(move |gesture, x, y| {
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                if !runtime.header_hit(x, y) {
+                    gesture.set_state(gtk::EventSequenceState::Denied);
+                    return;
+                }
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                runtime.drag_start_y.set(runtime.y.get());
+                runtime.dragging.set(true);
+                runtime.sync_reveal();
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            drag.connect_drag_update(move |_, _, offset_y| {
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                if !runtime.dragging.get() {
+                    return;
+                }
+                // Keep the input surface stationary until release, so GTK's
+                // offsets stay relative to one origin while the panel moves.
+                runtime.requested_y.set(
+                    runtime
+                        .drag_start_y
+                        .get()
+                        .saturating_add(offset_y.round() as i32),
+                );
+                runtime.apply_size();
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            let controller = Rc::clone(controller);
+            drag.connect_drag_end(move |_, _, offset_y| {
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                if !runtime.dragging.replace(false) {
+                    return;
+                }
+                runtime.requested_y.set(
+                    runtime
+                        .drag_start_y
+                        .get()
+                        .saturating_add(offset_y.round() as i32),
+                );
+                runtime.apply_size();
+                if !controller.set_position(runtime.y.get()) {
+                    let geometry =
+                        PanelGeometry::for_monitor(&runtime.monitor, runtime.scale_milli.get());
+                    runtime.requested_y.set(
+                        controller
+                            .settings()
+                            .position_y
+                            .unwrap_or(geometry.default_y()),
+                    );
+                    runtime.apply_size();
+                }
+                runtime.sync_reveal();
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            drag.connect_cancel(move |_, _| {
+                if let Some(runtime) = weak.upgrade()
+                    && runtime.dragging.replace(false)
+                {
+                    runtime.requested_y.set(runtime.drag_start_y.get());
+                    runtime.apply_size();
+                    runtime.sync_reveal();
+                }
+            });
+        }
+        widget.add_controller(drag);
+    }
+}
+
+pub struct SystemMonitorView {
+    runtime: Rc<MonitorRuntime>,
+    geometry_handler: Option<glib::SignalHandlerId>,
 }
 
 impl SystemMonitorView {
@@ -1906,986 +1951,385 @@ impl SystemMonitorView {
         monitor: &gdk::Monitor,
         controller: &Rc<SystemMonitorController>,
     ) -> Self {
-        let geometry = PanelGeometry::for_monitor(monitor);
         let settings = controller.settings();
-        let placement = PlacementRuntime::new(geometry, &settings);
-
+        let geometry = PanelGeometry::for_monitor(monitor, settings.scale_milli);
         let layout = MonitorLayout::new(&monitor.display(), settings.clone(), controller.latest());
-        layout.root.set_size_request(placement.width.get(), -1);
-        placement.set_measured_height(layout.natural_height(placement.width.get()));
-        placement.set(placement.x.get(), placement.y.get());
-
-        let content_window = desktop_window(
-            application,
-            monitor,
-            CONTENT_NAMESPACE,
-            "system-monitor-window",
-            false,
-        );
-        content_window.set_default_size(placement.width.get(), -1);
-        content_window.set_can_target(false);
-        content_window.set_child(Some(&layout.root));
-
-        let trigger_window = desktop_window(
-            application,
-            monitor,
-            TRIGGER_NAMESPACE,
-            "system-monitor-trigger-window",
-            true,
-        );
-        trigger_window.set_default_size(SETTINGS_TRIGGER_SIZE, SETTINGS_TRIGGER_SIZE);
-        let trigger = gtk::Button::new();
-        trigger.add_css_class("system-monitor-settings-trigger");
-        trigger.set_tooltip_text(Some("Configure system monitor"));
-        let trigger_icon = gtk::Label::new(Some(ICON_SETTINGS));
-        trigger_icon.add_css_class("system-monitor-settings-trigger-icon");
-        trigger.set_child(Some(&trigger_icon));
-        trigger_window.set_child(Some(&trigger));
-
-        let handle_window = desktop_window(
-            application,
-            monitor,
-            HANDLE_NAMESPACE,
-            "system-monitor-handle-window",
-            true,
-        );
-        handle_window.set_default_size(DRAG_HANDLE_WIDTH, geometry.panel_height);
-        let handle = gtk::Overlay::new();
-        handle.add_css_class("system-monitor-drag-handle");
-        handle.set_tooltip_text(Some("Drag the right edge to move the monitor"));
-        handle.set_cursor_from_name(Some("grab"));
-        let width_resize_zone = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        width_resize_zone.add_css_class("system-monitor-width-resize-zone");
-        width_resize_zone.set_halign(gtk::Align::Fill);
-        width_resize_zone.set_valign(gtk::Align::Fill);
-        width_resize_zone.set_margin_bottom(RESIZE_CORNER_SIZE);
-        width_resize_zone.set_cursor_from_name(Some("ew-resize"));
-        width_resize_zone.set_tooltip_text(Some("Right-drag to change only the monitor width"));
-        handle.add_overlay(&width_resize_zone);
-        let resize_corner = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        resize_corner.add_css_class("system-monitor-resize-corner");
-        resize_corner.set_size_request(RESIZE_CORNER_SIZE, RESIZE_CORNER_SIZE);
-        resize_corner.set_halign(gtk::Align::End);
-        resize_corner.set_valign(gtk::Align::End);
-        resize_corner.set_cursor_from_name(Some("nwse-resize"));
-        resize_corner.set_tooltip_text(Some("Right-drag the corner to scale the whole monitor"));
-        handle.add_overlay(&resize_corner);
-        handle_window.set_child(Some(&handle));
-
-        let height_handle_window = desktop_window(
-            application,
-            monitor,
-            HEIGHT_HANDLE_NAMESPACE,
-            "system-monitor-height-handle-window",
-            true,
-        );
-        height_handle_window.set_default_size(geometry.panel_width, HEIGHT_HANDLE_SIZE);
-        let height_handle = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        height_handle.add_css_class("system-monitor-height-handle");
-        height_handle.set_cursor_from_name(Some("ns-resize"));
-        height_handle.set_tooltip_text(Some(
-            "Right-drag to change the monitor height without changing its width",
-        ));
-        height_handle_window.set_child(Some(&height_handle));
-
-        let settings_window = gtk::ApplicationWindow::builder()
+        let content_window = gtk::ApplicationWindow::builder()
             .application(application)
             .decorated(false)
             .resizable(false)
             .build();
-        settings_window.add_css_class("system-monitor-settings-window");
-        settings_window.init_layer_shell();
-        settings_window.set_namespace(Some(SETTINGS_NAMESPACE));
-        settings_window.set_layer(Layer::Top);
-        settings_window.set_keyboard_mode(KeyboardMode::OnDemand);
-        settings_window.set_monitor(Some(monitor));
-        settings_window.set_anchor(Edge::Top, true);
-        settings_window.set_anchor(Edge::Left, true);
-        settings_window.set_anchor(Edge::Right, false);
-        settings_window.set_anchor(Edge::Bottom, false);
-        settings_window.set_exclusive_zone(-1);
-        settings_window.set_hide_on_close(true);
-        settings_window.set_default_size(SETTINGS_WINDOW_WIDTH, SETTINGS_WINDOW_HEIGHT);
+        content_window.add_css_class("system-monitor-window");
+        content_window.init_layer_shell();
+        content_window.set_namespace(Some(CONTENT_NAMESPACE));
+        content_window.set_layer(Layer::Bottom);
+        content_window.set_keyboard_mode(KeyboardMode::None);
+        content_window.set_monitor(Some(monitor));
+        content_window.set_anchor(Edge::Top, true);
+        content_window.set_anchor(Edge::Right, true);
+        content_window.set_exclusive_zone(-1);
 
+        let tail = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        tail.add_css_class("system-monitor-tail");
+        tail.set_size_request(drawer::TAIL_WIDTH, drawer::TAIL_HEIGHT);
+        tail.set_valign(gtk::Align::Start);
+        tail.set_halign(gtk::Align::End);
+        tail.set_hexpand(true);
+        tail.set_can_target(false);
+        tail.set_margin_top(drawer::TAIL_TOP);
+        let grip = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        grip.add_css_class("system-monitor-tail-grip");
+        grip.set_halign(gtk::Align::Center);
+        grip.set_valign(gtk::Align::Center);
+        grip.set_vexpand(true);
+        tail.append(&grip);
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        header.add_css_class("system-monitor-header");
+        let drag_handle = gtk::Label::new(Some("System monitor"));
+        drag_handle.add_css_class("system-monitor-header-title");
+        drag_handle.set_xalign(0.0);
+        drag_handle.set_hexpand(true);
+        let trigger = gtk::Button::new();
+        trigger.add_css_class("system-monitor-settings-trigger");
+        trigger.set_size_request(SETTINGS_TRIGGER_SIZE, SETTINGS_TRIGGER_SIZE);
+        trigger.set_tooltip_text(Some("Configure system monitor"));
+        let trigger_icon = gtk::Label::new(Some(ICON_SETTINGS));
+        trigger_icon.add_css_class("system-monitor-settings-trigger-icon");
+        trigger.set_child(Some(&trigger_icon));
+        header.append(&drag_handle);
+        header.append(&trigger);
+
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        scroller.set_propagate_natural_height(true);
+        scroller.set_child(Some(&layout.root));
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card.add_css_class("system-monitor-body");
+        card.set_valign(gtk::Align::Start);
+        card.append(&header);
+        card.append(&scroller);
+        let hotspot_window = gtk::ApplicationWindow::builder()
+            .application(application)
+            .decorated(false)
+            .resizable(false)
+            .build();
+        hotspot_window.add_css_class("system-monitor-hotspot-window");
+        hotspot_window.init_layer_shell();
+        hotspot_window.set_namespace(Some("obsidian-system-monitor-hotspot"));
+        hotspot_window.set_layer(Layer::Bottom);
+        hotspot_window.set_keyboard_mode(KeyboardMode::None);
+        hotspot_window.set_monitor(Some(monitor));
+        hotspot_window.set_anchor(Edge::Top, true);
+        hotspot_window.set_anchor(Edge::Right, true);
+        hotspot_window.set_exclusive_zone(-1);
+        let hotspot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        hotspot.append(&tail);
+        hotspot_window.set_child(Some(&hotspot));
         let settings_panel = MonitorSettingsPanel::new(controller);
+        let settings_scroller = gtk::ScrolledWindow::new();
+        settings_scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        settings_scroller.set_child(Some(&settings_panel.root));
         let settings_surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
         settings_surface.add_css_class("system-monitor-settings-surface");
-        settings_surface.append(&settings_panel.root);
-        let settings_reveal = PopupReveal::masked(settings_surface.upcast::<gtk::Widget>());
-        let settings_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        settings_root.add_css_class("widget-popup-root");
-        settings_root.set_focusable(true);
-        settings_root.append(settings_reveal.widget());
-        settings_window.set_child(Some(&settings_root));
-
-        let settings_focus_armed = Rc::new(Cell::new(false));
+        settings_surface.append(&settings_scroller);
+        let settings_reveal = gtk::Revealer::new();
+        settings_reveal.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+        settings_reveal.set_transition_duration(220);
+        settings_reveal.set_child(Some(&settings_surface));
+        let surface = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        surface.add_css_class("system-monitor-card");
+        surface.set_overflow(gtk::Overflow::Hidden);
+        surface.append(&settings_reveal);
+        surface.append(&card);
+        let drawer = MonitorDrawer::new(&content_window, &hotspot_window, &surface);
         let settings_trigger_pressed = Rc::new(Cell::new(false));
 
+        let runtime = Rc::new(MonitorRuntime {
+            monitor: monitor.clone(),
+            window: content_window.clone(),
+            surface,
+            settings_reveal: settings_reveal.clone(),
+            settings_scroller,
+            settings_panel,
+            drawer,
+            hotspot_window: hotspot_window.clone(),
+            hotspot: hotspot.clone(),
+            card,
+            header,
+            scroller,
+            layout,
+            requested_y: Cell::new(settings.position_y.unwrap_or(geometry.default_y())),
+            y: Cell::new(0),
+            pinned: Cell::new(settings.pinned),
+            scale_milli: Cell::new(settings.scale_milli),
+            hovered: Cell::new(false),
+            hotspot_hovered: Cell::new(false),
+            dragging: Cell::new(false),
+            drag_start_y: Cell::new(0),
+            hide_generation: Generation::default(),
+            panel_width: Cell::new(geometry.panel_width),
+            scale_geometry: Cell::new(None),
+        });
+        runtime.install_drag(&hotspot, controller);
         {
-            let pressed = Rc::clone(&settings_trigger_pressed);
+            // Keep the settings stationary under the pointer while the slider
+            // changes font metrics. Apply the final outer size on release.
+            let events = gtk::EventControllerLegacy::new();
+            events.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let weak = Rc::downgrade(&runtime);
+            events.connect_event(move |_, event| {
+                if let Some(runtime) = weak.upgrade() {
+                    match event.event_type() {
+                        gdk::EventType::ButtonPress | gdk::EventType::TouchBegin => {
+                            runtime.scale_geometry.set(Some((
+                                runtime.panel_width.get(),
+                                runtime.surface.height().max(1),
+                                runtime.y.get(),
+                            )));
+                        }
+                        gdk::EventType::ButtonRelease
+                        | gdk::EventType::TouchEnd
+                        | gdk::EventType::TouchCancel
+                            if runtime.scale_geometry.take().is_some() =>
+                        {
+                            runtime.apply_size();
+                        }
+                        _ => {}
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+            runtime.settings_panel.scale.add_controller(events);
+            let weak = Rc::downgrade(&runtime);
+            runtime.settings_panel.scale.connect_unmap(move |_| {
+                if let Some(runtime) = weak.upgrade()
+                    && runtime.scale_geometry.take().is_some()
+                {
+                    runtime.apply_size();
+                }
+            });
+        }
+        {
             let click = gtk::GestureClick::new();
             click.set_button(gdk::BUTTON_PRIMARY);
-            click.set_propagation_phase(gtk::PropagationPhase::Capture);
-            click.connect_pressed(move |_, _, _, _| {
-                pressed.set(true);
-                let pressed = Rc::clone(&pressed);
-                glib::timeout_add_local_once(Duration::from_millis(150), move || {
-                    pressed.set(false);
-                });
-            });
-            trigger.add_controller(click);
-        }
-
-        apply_monitor_size(
-            &placement,
-            &layout,
-            &content_window,
-            &trigger_window,
-            &handle_window,
-            &height_handle_window,
-        );
-        apply_monitor_placement(
-            &placement,
-            &content_window,
-            &trigger_window,
-            &handle_window,
-            &height_handle_window,
-        );
-
-        let move_state = Rc::new(PointerDragState::default());
-        let width_state = Rc::new(PointerDragState::default());
-        let height_state = Rc::new(PointerDragState::default());
-        let resize_state = Rc::new(PointerDragState::default());
-
-        {
-            let placement = Rc::clone(&placement);
-            let move_state = Rc::clone(&move_state);
-            let width_state = Rc::clone(&width_state);
-            let height_state = Rc::clone(&height_state);
-            let resize_state = Rc::clone(&resize_state);
-            let weak_layout = Rc::downgrade(&layout);
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            let weak_handle = handle_window.downgrade();
-            let weak_height_handle = height_handle_window.downgrade();
-            controller.subscribe_snapshot(move |snapshot| {
-                let (
-                    Some(layout),
-                    Some(content),
-                    Some(trigger),
-                    Some(handle),
-                    Some(height_handle),
-                ) = (
-                    weak_layout.upgrade(),
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                    weak_handle.upgrade(),
-                    weak_height_handle.upgrade(),
-                ) else {
-                    return false;
-                };
-                layout.update_snapshot(snapshot);
-                if move_state.active.get()
-                    || width_state.active.get()
-                    || height_state.active.get()
-                    || resize_state.active.get()
-                {
-                    apply_monitor_content_size(&placement, &layout, &content, &trigger);
-                    apply_monitor_content_placement(&placement, &content, &trigger);
-                } else {
-                    apply_monitor_size(
-                        &placement,
-                        &layout,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                    apply_monitor_placement(
-                        &placement,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                }
-                true
-            });
-        }
-        {
-            let weak_layout = Rc::downgrade(&layout);
-            controller.subscribe_settings(move |settings| {
-                let Some(layout) = weak_layout.upgrade() else {
-                    return false;
-                };
-                layout.apply_settings(settings);
-                true
-            });
-        }
-        {
-            let placement = Rc::clone(&placement);
-            let weak_layout = Rc::downgrade(&layout);
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            let weak_handle = handle_window.downgrade();
-            let weak_height_handle = height_handle_window.downgrade();
-            controller.subscribe_settings(move |settings| {
-                let (
-                    Some(layout),
-                    Some(content),
-                    Some(trigger),
-                    Some(handle),
-                    Some(height_handle),
-                ) = (
-                    weak_layout.upgrade(),
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                    weak_handle.upgrade(),
-                    weak_height_handle.upgrade(),
-                ) else {
-                    return false;
-                };
-                placement.apply_settings(settings);
-                apply_monitor_size(
-                    &placement,
-                    &layout,
-                    &content,
-                    &trigger,
-                    &handle,
-                    &height_handle,
-                );
-                apply_monitor_placement(
-                    &placement,
-                    &content,
-                    &trigger,
-                    &handle,
-                    &height_handle,
-                );
-                true
-            });
-        }
-
-        {
-            let placement = Rc::clone(&placement);
-            let weak_settings = settings_window.downgrade();
-            let weak_settings_root = settings_root.downgrade();
-            let settings_panel = Rc::downgrade(&settings_panel);
-            let focus_armed = Rc::clone(&settings_focus_armed);
-            let reveal = settings_reveal.clone();
-            trigger.connect_clicked(move |_| {
-                let Some(window) = weak_settings.upgrade() else {
-                    return;
-                };
-                if reveal.is_revealed() {
-                    focus_armed.set(false);
-                    reveal.hide(&window);
-                    return;
-                }
-                if let Some(panel) = settings_panel.upgrade() {
-                    panel.rebuild();
-                }
-                let (left, top) = settings_popup_position(&placement);
-                window.set_margin(Edge::Left, left);
-                window.set_margin(Edge::Top, top);
-                reveal.sync_top_anchor(&window);
-                focus_armed.set(false);
-                let generation = reveal.show(&window);
-                let weak_window = window.downgrade();
-                let weak_settings_root = weak_settings_root.clone();
-                let reveal = reveal.clone();
-                glib::idle_add_local_once(move || {
-                    if reveal.is_current(generation)
-                        && weak_window
-                            .upgrade()
-                            .is_some_and(|window| window.is_visible())
-                        && let Some(root) = weak_settings_root.upgrade()
-                    {
-                        root.grab_focus();
+            let hit_trigger = {
+                let weak = Rc::downgrade(&runtime);
+                let weak_trigger = trigger.downgrade();
+                Rc::new(move |x: f64, y: f64| {
+                    let (Some(runtime), Some(trigger)) = (weak.upgrade(), weak_trigger.upgrade())
+                    else {
+                        return false;
+                    };
+                    runtime.drawer.is_open()
+                        && trigger.compute_bounds(&runtime.card).is_some_and(|bounds| {
+                            bounds.contains_point(&gtk::graphene::Point::new(x as f32, y as f32))
+                        })
+                })
+            };
+            {
+                let pressed = Rc::clone(&settings_trigger_pressed);
+                let hit_trigger = Rc::clone(&hit_trigger);
+                click.connect_pressed(move |gesture, _, x, y| {
+                    let hit = hit_trigger(x, y);
+                    pressed.set(hit);
+                    if hit {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
                     }
                 });
+            }
+            {
+                let pressed = Rc::clone(&settings_trigger_pressed);
+                let weak_trigger = trigger.downgrade();
+                click.connect_released(move |_, _, x, y| {
+                    if pressed.replace(false)
+                        && hit_trigger(x, y)
+                        && let Some(trigger) = weak_trigger.upgrade()
+                    {
+                        trigger.emit_clicked();
+                    }
+                });
+            }
+            {
+                let pressed = Rc::clone(&settings_trigger_pressed);
+                click.connect_cancel(move |_, _| {
+                    pressed.set(false);
+                });
+            }
+            hotspot.add_controller(click);
+        }
+        {
+            let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+            let weak = Rc::downgrade(&runtime);
+            scroll.connect_scroll(move |scroll, _, dy| {
+                let Some(runtime) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                let adjustment = runtime.scroller.vadjustment();
+                let step = if scroll.unit() == gdk::ScrollUnit::Surface {
+                    1.0
+                } else {
+                    40.0
+                };
+                adjustment.set_value((adjustment.value() + dy * step).clamp(
+                    adjustment.lower(),
+                    (adjustment.upper() - adjustment.page_size()).max(adjustment.lower()),
+                ));
+                glib::Propagation::Stop
             });
+            hotspot.add_controller(scroll);
         }
 
         {
-            let focus_armed = Rc::clone(&settings_focus_armed);
-            let reveal = settings_reveal.clone();
-            settings_window.connect_visible_notify(move |window| {
-                if !window.is_visible() {
-                    focus_armed.set(false);
-                    reveal.reset_hidden();
+            let weak = Rc::downgrade(&runtime);
+            runtime.drawer.connect_settled(move || {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.sync_input_region();
                 }
             });
         }
-
         {
-            let weak_window = settings_window.downgrade();
-            let focus_armed = Rc::clone(&settings_focus_armed);
-            let reveal = settings_reveal.clone();
+            let weak = Rc::downgrade(&runtime);
+            hotspot_window.connect_map(move |_| {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.sync_input_region();
+                }
+            });
+        }
+        for (widget, is_tail) in [(runtime.surface.clone(), false), (hotspot.clone(), true)] {
+            let motion = gtk::EventControllerMotion::new();
+            let weak = Rc::downgrade(&runtime);
+            motion.connect_enter(move |_, _, _| {
+                if let Some(runtime) = weak.upgrade() {
+                    if is_tail {
+                        runtime.hotspot_hovered.set(true);
+                    } else {
+                        runtime.hovered.set(true);
+                    }
+                    runtime.sync_reveal();
+                }
+            });
+            if is_tail {
+                let weak = Rc::downgrade(&runtime);
+                motion.connect_motion(move |_, x, y| {
+                    if let Some(runtime) = weak.upgrade() {
+                        runtime
+                            .hotspot
+                            .set_cursor_from_name(if runtime.header_hit(x, y) {
+                                Some("ns-resize")
+                            } else {
+                                None
+                            });
+                    }
+                });
+            }
+            let weak = Rc::downgrade(&runtime);
+            motion.connect_leave(move |_| {
+                if let Some(runtime) = weak.upgrade() {
+                    if is_tail {
+                        runtime.hotspot_hovered.set(false);
+                    } else {
+                        runtime.hovered.set(false);
+                    }
+                    runtime.sync_reveal();
+                }
+            });
+            widget.add_controller(motion);
+        }
+        {
+            let weak = Rc::downgrade(&runtime);
+            controller.subscribe_snapshot(move |snapshot| {
+                let Some(runtime) = weak.upgrade() else {
+                    return false;
+                };
+                runtime.layout.update_snapshot(snapshot);
+                runtime.apply_size();
+                true
+            });
+        }
+        {
+            let weak = Rc::downgrade(&runtime);
+            controller.subscribe_settings(move |settings| {
+                let Some(runtime) = weak.upgrade() else {
+                    return false;
+                };
+                runtime.layout.apply_settings(settings);
+                runtime.pinned.set(settings.pinned);
+                runtime.scale_milli.set(settings.scale_milli);
+                if !runtime.dragging.get() {
+                    let geometry =
+                        PanelGeometry::for_monitor(&runtime.monitor, runtime.scale_milli.get());
+                    runtime
+                        .requested_y
+                        .set(settings.position_y.unwrap_or(geometry.default_y()));
+                }
+                runtime.apply_size();
+                runtime.sync_reveal();
+                true
+            });
+        }
+        let geometry_handler = {
+            let weak = Rc::downgrade(&runtime);
+            monitor.connect_geometry_notify(move |_| {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.apply_size();
+                }
+            })
+        };
+        {
+            let weak = Rc::downgrade(&runtime);
+            settings_reveal.connect_child_revealed_notify(move |_| {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.apply_size();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&runtime);
+            trigger.connect_clicked(move |_| {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.set_settings_open(!runtime.settings_reveal.reveals_child());
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&runtime);
             let key = gtk::EventControllerKey::new();
             key.connect_key_pressed(move |_, key, _, _| {
                 if key == gdk::Key::Escape
-                    && let Some(window) = weak_window.upgrade()
+                    && let Some(runtime) = weak.upgrade()
+                    && runtime.settings_reveal.reveals_child()
                 {
-                    focus_armed.set(false);
-                    reveal.hide(&window);
+                    runtime.set_settings_open(false);
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
             });
-            settings_window.add_controller(key);
+            content_window.add_controller(key);
         }
 
-        {
-            let focus_armed = Rc::clone(&settings_focus_armed);
-            let trigger_pressed = Rc::clone(&settings_trigger_pressed);
-            let reveal = settings_reveal.clone();
-            settings_window.connect_is_active_notify(move |window| {
-                if window.is_active() {
-                    if window.is_visible() && reveal.is_revealed() {
-                        focus_armed.set(true);
-                    }
-                    return;
-                }
-                if !window.is_visible()
-                    || !reveal.is_revealed()
-                    || !focus_armed.get()
-                    || trigger_pressed.get()
-                {
-                    return;
-                }
-                let weak_window = window.downgrade();
-                let focus_armed = Rc::clone(&focus_armed);
-                let trigger_pressed = Rc::clone(&trigger_pressed);
-                let reveal = reveal.clone();
-                glib::timeout_add_local_once(Duration::from_millis(60), move || {
-                    if let Some(window) = weak_window.upgrade()
-                        && window.is_visible()
-                        && !window.is_active()
-                        && reveal.is_revealed()
-                        && focus_armed.get()
-                        && !trigger_pressed.get()
-                    {
-                        focus_armed.set(false);
-                        reveal.hide(&window);
-                    }
-                });
-            });
-        }
-
-        let drag = gtk::GestureDrag::new();
-        drag.set_button(gdk::BUTTON_PRIMARY);
-        {
-            let placement = Rc::clone(&placement);
-            let move_state = Rc::clone(&move_state);
-            let weak_settings = settings_window.downgrade();
-            let reveal = settings_reveal.clone();
-            let weak_handle = handle.downgrade();
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            drag.connect_drag_begin(move |_, _, _| {
-                placement.drag_start_x.set(placement.x.get());
-                placement.drag_start_y.set(placement.y.get());
-                move_state.begin();
-                if let Some(handle) = weak_handle.upgrade() {
-                    handle.add_css_class("system-monitor-dragging");
-                    handle.set_cursor_from_name(Some("grabbing"));
-
-                    let move_state = Rc::clone(&move_state);
-                    let placement = Rc::clone(&placement);
-                    let weak_content = weak_content.clone();
-                    let weak_trigger = weak_trigger.clone();
-                    handle.add_tick_callback(move |_, _| {
-                        if !move_state.active.get() {
-                            return glib::ControlFlow::Break;
-                        }
-                        let (Some(content), Some(trigger)) =
-                            (weak_content.upgrade(), weak_trigger.upgrade())
-                        else {
-                            return glib::ControlFlow::Break;
-                        };
-                        placement.set(
-                            placement.drag_start_x.get() + move_state.offset_x.get().round() as i32,
-                            placement.drag_start_y.get() + move_state.offset_y.get().round() as i32,
-                        );
-                        apply_monitor_content_placement(&placement, &content, &trigger);
-                        glib::ControlFlow::Continue
-                    });
-                }
-                if let Some(window) = weak_settings.upgrade() {
-                    reveal.hide(&window);
-                }
-            });
-        }
-        {
-            let move_state = Rc::clone(&move_state);
-            drag.connect_drag_update(move |_, offset_x, offset_y| {
-                move_state.update(offset_x, offset_y);
-            });
-        }
-        {
-            let placement = Rc::clone(&placement);
-            let move_state = Rc::clone(&move_state);
-            let controller = Rc::clone(controller);
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            let weak_handle_window = handle_window.downgrade();
-            let weak_height_handle_window = height_handle_window.downgrade();
-            let weak_handle = handle.downgrade();
-            drag.connect_drag_end(move |_, offset_x, offset_y| {
-                move_state.end(offset_x, offset_y);
-                placement.set(
-                    placement.drag_start_x.get() + offset_x.round() as i32,
-                    placement.drag_start_y.get() + offset_y.round() as i32,
-                );
-                if let (Some(content), Some(trigger)) =
-                    (weak_content.upgrade(), weak_trigger.upgrade())
-                {
-                    apply_monitor_content_placement(&placement, &content, &trigger);
-                }
-                if let Some(handle) = weak_handle.upgrade() {
-                    handle.remove_css_class("system-monitor-dragging");
-                    handle.set_cursor_from_name(Some("grab"));
-                }
-                if !controller.set_position(placement.x.get(), placement.y.get()) {
-                    placement.apply_settings(&controller.settings());
-                }
-                if let (Some(content), Some(trigger), Some(handle), Some(height_handle)) = (
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                    weak_handle_window.upgrade(),
-                    weak_height_handle_window.upgrade(),
-                ) {
-                    apply_monitor_placement(
-                        &placement,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                }
-            });
-        }
-        handle.add_controller(drag);
-
-        let width_resize = gtk::GestureDrag::new();
-        width_resize.set_button(gdk::BUTTON_SECONDARY);
-        {
-            let placement = Rc::clone(&placement);
-            let width_state = Rc::clone(&width_state);
-            let weak_layout = Rc::downgrade(&layout);
-            let weak_settings = settings_window.downgrade();
-            let reveal = settings_reveal.clone();
-            let weak_handle = handle.downgrade();
-            let weak_zone = width_resize_zone.downgrade();
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            width_resize.connect_drag_begin(move |_, _, _| {
-                let Some(layout) = weak_layout.upgrade() else {
-                    return;
-                };
-                placement.begin_width_resize(layout.root.width().max(placement.width.get()));
-                width_state.begin();
-                if let Some(handle) = weak_handle.upgrade() {
-                    handle.add_css_class("system-monitor-width-resizing");
-                }
-                if let Some(zone) = weak_zone.upgrade() {
-                    let width_state = Rc::clone(&width_state);
-                    let placement = Rc::clone(&placement);
-                    let layout = Rc::clone(&layout);
-                    let weak_content = weak_content.clone();
-                    let weak_trigger = weak_trigger.clone();
-                    zone.add_tick_callback(move |_, _| {
-                        if !width_state.active.get() {
-                            return glib::ControlFlow::Break;
-                        }
-                        let (Some(content), Some(trigger)) =
-                            (weak_content.upgrade(), weak_trigger.upgrade())
-                        else {
-                            return glib::ControlFlow::Break;
-                        };
-                        placement.resize_width(width_state.offset_x.get());
-                        apply_monitor_content_size(&placement, &layout, &content, &trigger);
-                        apply_monitor_content_placement(&placement, &content, &trigger);
-                        glib::ControlFlow::Continue
-                    });
-                }
-                if let Some(window) = weak_settings.upgrade() {
-                    reveal.hide(&window);
-                }
-            });
-        }
-        {
-            let width_state = Rc::clone(&width_state);
-            width_resize.connect_drag_update(move |_, offset_x, offset_y| {
-                width_state.update(offset_x, offset_y);
-            });
-        }
-        {
-            let placement = Rc::clone(&placement);
-            let width_state = Rc::clone(&width_state);
-            let controller = Rc::clone(controller);
-            let weak_layout = Rc::downgrade(&layout);
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            let weak_handle_window = handle_window.downgrade();
-            let weak_height_handle_window = height_handle_window.downgrade();
-            let weak_handle = handle.downgrade();
-            width_resize.connect_drag_end(move |_, offset_x, offset_y| {
-                width_state.end(offset_x, offset_y);
-                placement.resize_width(offset_x);
-                if let (Some(layout), Some(content), Some(trigger)) = (
-                    weak_layout.upgrade(),
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                ) {
-                    apply_monitor_content_size(&placement, &layout, &content, &trigger);
-                    apply_monitor_content_placement(&placement, &content, &trigger);
-                }
-                if let Some(handle) = weak_handle.upgrade() {
-                    handle.remove_css_class("system-monitor-width-resizing");
-                }
-                if !controller.set_dimensions(placement.scale_milli.get(), placement.width.get()) {
-                    placement.apply_settings(&controller.settings());
-                }
-                if let (
-                    Some(layout),
-                    Some(content),
-                    Some(trigger),
-                    Some(handle),
-                    Some(height_handle),
-                ) = (
-                    weak_layout.upgrade(),
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                    weak_handle_window.upgrade(),
-                    weak_height_handle_window.upgrade(),
-                ) {
-                    apply_monitor_size(
-                        &placement,
-                        &layout,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                    apply_monitor_placement(
-                        &placement,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                }
-            });
-        }
-        width_resize_zone.add_controller(width_resize);
-
-        let height_resize = gtk::GestureDrag::new();
-        height_resize.set_button(gdk::BUTTON_SECONDARY);
-        {
-            let placement = Rc::clone(&placement);
-            let height_state = Rc::clone(&height_state);
-            let weak_layout = Rc::downgrade(&layout);
-            let weak_settings = settings_window.downgrade();
-            let reveal = settings_reveal.clone();
-            let weak_height_handle = height_handle.downgrade();
-            let weak_handle = handle.downgrade();
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            height_resize.connect_drag_begin(move |_, _, _| {
-                let Some(layout) = weak_layout.upgrade() else {
-                    return;
-                };
-                let measured_width = layout.root.width().max(placement.width.get());
-                let measured_height = layout
-                    .root
-                    .height()
-                    .max(layout.natural_height(measured_width));
-                placement.begin_resize(measured_width, measured_height);
-                height_state.begin();
-                if let Some(handle) = weak_handle.upgrade() {
-                    handle.add_css_class("system-monitor-height-resizing");
-                }
-                if let Some(height_handle) = weak_height_handle.upgrade() {
-                    height_handle.add_css_class("system-monitor-height-resizing");
-
-                    let height_state = Rc::clone(&height_state);
-                    let placement = Rc::clone(&placement);
-                    let layout = Rc::clone(&layout);
-                    let weak_content = weak_content.clone();
-                    let weak_trigger = weak_trigger.clone();
-                    height_handle.add_tick_callback(move |_, _| {
-                        if !height_state.active.get() {
-                            return glib::ControlFlow::Break;
-                        }
-                        let (Some(content), Some(trigger)) =
-                            (weak_content.upgrade(), weak_trigger.upgrade())
-                        else {
-                            return glib::ControlFlow::Break;
-                        };
-                        placement.resize_height(height_state.offset_y.get());
-                        apply_monitor_content_size(&placement, &layout, &content, &trigger);
-                        apply_monitor_content_placement(&placement, &content, &trigger);
-                        glib::ControlFlow::Continue
-                    });
-                }
-                if let Some(window) = weak_settings.upgrade() {
-                    reveal.hide(&window);
-                }
-            });
-        }
-        {
-            let height_state = Rc::clone(&height_state);
-            height_resize.connect_drag_update(move |_, offset_x, offset_y| {
-                height_state.update(offset_x, offset_y);
-            });
-        }
-        {
-            let placement = Rc::clone(&placement);
-            let height_state = Rc::clone(&height_state);
-            let controller = Rc::clone(controller);
-            let weak_layout = Rc::downgrade(&layout);
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            let weak_handle_window = handle_window.downgrade();
-            let weak_height_handle_window = height_handle_window.downgrade();
-            let weak_height_handle = height_handle.downgrade();
-            let weak_handle = handle.downgrade();
-            height_resize.connect_drag_end(move |_, offset_x, offset_y| {
-                height_state.end(offset_x, offset_y);
-                placement.resize_height(offset_y);
-                if let (Some(layout), Some(content), Some(trigger)) = (
-                    weak_layout.upgrade(),
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                ) {
-                    apply_monitor_content_size(&placement, &layout, &content, &trigger);
-                    apply_monitor_content_placement(&placement, &content, &trigger);
-                }
-                if let Some(height_handle) = weak_height_handle.upgrade() {
-                    height_handle.remove_css_class("system-monitor-height-resizing");
-                }
-                if let Some(handle) = weak_handle.upgrade() {
-                    handle.remove_css_class("system-monitor-height-resizing");
-                }
-                if !controller.set_dimensions(placement.scale_milli.get(), placement.width.get()) {
-                    placement.apply_settings(&controller.settings());
-                }
-                if let (
-                    Some(layout),
-                    Some(content),
-                    Some(trigger),
-                    Some(handle),
-                    Some(height_handle),
-                ) = (
-                    weak_layout.upgrade(),
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                    weak_handle_window.upgrade(),
-                    weak_height_handle_window.upgrade(),
-                ) {
-                    apply_monitor_size(
-                        &placement,
-                        &layout,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                    apply_monitor_placement(
-                        &placement,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                }
-            });
-        }
-        height_handle.add_controller(height_resize);
-
-        let resize = gtk::GestureDrag::new();
-        resize.set_button(gdk::BUTTON_SECONDARY);
-        {
-            let placement = Rc::clone(&placement);
-            let resize_state = Rc::clone(&resize_state);
-            let weak_layout = Rc::downgrade(&layout);
-            let weak_settings = settings_window.downgrade();
-            let reveal = settings_reveal.clone();
-            let weak_handle = handle.downgrade();
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            resize.connect_drag_begin(move |_, _, _| {
-                let Some(layout) = weak_layout.upgrade() else {
-                    return;
-                };
-                let measured_width = layout.root.width().max(placement.width.get());
-                let measured_height = layout
-                    .root
-                    .height()
-                    .max(layout.natural_height(measured_width));
-                placement.begin_resize(measured_width, measured_height);
-                resize_state.begin();
-                if let Some(handle) = weak_handle.upgrade() {
-                    handle.add_css_class("system-monitor-resizing");
-
-                    let resize_state = Rc::clone(&resize_state);
-                    let placement = Rc::clone(&placement);
-                    let layout = Rc::clone(&layout);
-                    let weak_content = weak_content.clone();
-                    let weak_trigger = weak_trigger.clone();
-                    handle.add_tick_callback(move |_, _| {
-                        if !resize_state.active.get() {
-                            return glib::ControlFlow::Break;
-                        }
-                        let (Some(content), Some(trigger)) =
-                            (weak_content.upgrade(), weak_trigger.upgrade())
-                        else {
-                            return glib::ControlFlow::Break;
-                        };
-                        placement.resize(resize_state.offset_x.get(), resize_state.offset_y.get());
-                        apply_monitor_content_size(&placement, &layout, &content, &trigger);
-                        apply_monitor_content_placement(&placement, &content, &trigger);
-                        glib::ControlFlow::Continue
-                    });
-                }
-                if let Some(window) = weak_settings.upgrade() {
-                    reveal.hide(&window);
-                }
-            });
-        }
-        {
-            let resize_state = Rc::clone(&resize_state);
-            resize.connect_drag_update(move |_, offset_x, offset_y| {
-                resize_state.update(offset_x, offset_y);
-            });
-        }
-        {
-            let placement = Rc::clone(&placement);
-            let resize_state = Rc::clone(&resize_state);
-            let controller = Rc::clone(controller);
-            let weak_layout = Rc::downgrade(&layout);
-            let weak_content = content_window.downgrade();
-            let weak_trigger = trigger_window.downgrade();
-            let weak_handle_window = handle_window.downgrade();
-            let weak_height_handle_window = height_handle_window.downgrade();
-            let weak_handle = handle.downgrade();
-            resize.connect_drag_end(move |_, offset_x, offset_y| {
-                resize_state.end(offset_x, offset_y);
-                placement.resize(offset_x, offset_y);
-                if let (Some(layout), Some(content), Some(trigger)) = (
-                    weak_layout.upgrade(),
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                ) {
-                    apply_monitor_content_size(&placement, &layout, &content, &trigger);
-                    apply_monitor_content_placement(&placement, &content, &trigger);
-                }
-                if let Some(handle) = weak_handle.upgrade() {
-                    handle.remove_css_class("system-monitor-resizing");
-                    handle.set_cursor_from_name(Some("grab"));
-                }
-                if !controller.set_dimensions(placement.scale_milli.get(), placement.width.get()) {
-                    placement.apply_settings(&controller.settings());
-                }
-                if let (
-                    Some(layout),
-                    Some(content),
-                    Some(trigger),
-                    Some(handle),
-                    Some(height_handle),
-                ) = (
-                    weak_layout.upgrade(),
-                    weak_content.upgrade(),
-                    weak_trigger.upgrade(),
-                    weak_handle_window.upgrade(),
-                    weak_height_handle_window.upgrade(),
-                ) {
-                    apply_monitor_size(
-                        &placement,
-                        &layout,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                    apply_monitor_placement(
-                        &placement,
-                        &content,
-                        &trigger,
-                        &handle,
-                        &height_handle,
-                    );
-                }
-            });
-        }
-        resize_corner.add_controller(resize);
-
-        content_window.present();
-        trigger_window.present();
-        height_handle_window.present();
-        handle_window.present();
-
+        runtime.apply_size();
+        hotspot_window.present();
         Self {
-            monitor: monitor.clone(),
-            content_window,
-            trigger_window,
-            handle_window,
-            height_handle_window,
-            settings_window,
-            _layout: layout,
-            _settings_panel: settings_panel,
+            runtime,
+            geometry_handler: Some(geometry_handler),
         }
     }
 
     pub fn monitor(&self) -> &gdk::Monitor {
-        &self.monitor
+        &self.runtime.monitor
     }
 }
 
 impl Drop for SystemMonitorView {
     fn drop(&mut self) {
-        close_monitor_window(&self.settings_window);
-        close_monitor_window(&self.handle_window);
-        close_monitor_window(&self.height_handle_window);
-        close_monitor_window(&self.trigger_window);
-        close_monitor_window(&self.content_window);
+        if let Some(handler) = self.geometry_handler.take() {
+            self.runtime.monitor.disconnect(handler);
+        }
+        for window in [&self.runtime.window, &self.runtime.hotspot_window] {
+            detach_application_window(window);
+        }
     }
-}
-
-fn close_monitor_window(window: &gtk::ApplicationWindow) {
-    window.set_hide_on_close(false);
-    window.close();
-}
-
-fn desktop_window(
-    application: &gtk::Application,
-    monitor: &gdk::Monitor,
-    namespace: &str,
-    css_class: &str,
-    targetable: bool,
-) -> gtk::ApplicationWindow {
-    let window = gtk::ApplicationWindow::builder()
-        .application(application)
-        .decorated(false)
-        .build();
-    window.add_css_class(css_class);
-    window.set_focusable(false);
-    window.set_can_target(targetable);
-    window.init_layer_shell();
-    window.set_namespace(Some(namespace));
-    window.set_layer(Layer::Bottom);
-    window.set_keyboard_mode(KeyboardMode::None);
-    window.set_monitor(Some(monitor));
-    window.set_anchor(Edge::Top, true);
-    window.set_anchor(Edge::Left, true);
-    window.set_anchor(Edge::Right, false);
-    window.set_anchor(Edge::Bottom, false);
-    window.set_exclusive_zone(-1);
-    window
-}
-
-fn apply_monitor_placement(
-    placement: &PlacementRuntime,
-    content: &gtk::ApplicationWindow,
-    trigger: &gtk::ApplicationWindow,
-    handle: &gtk::ApplicationWindow,
-    height_handle: &gtk::ApplicationWindow,
-) {
-    apply_monitor_content_placement(placement, content, trigger);
-    apply_monitor_handle_placement(placement, handle, height_handle);
-}
-
-fn apply_monitor_content_placement(
-    placement: &PlacementRuntime,
-    content: &gtk::ApplicationWindow,
-    trigger: &gtk::ApplicationWindow,
-) {
-    let x = placement.x.get();
-    let y = placement.y.get();
-    content.set_margin(Edge::Left, x);
-    content.set_margin(Edge::Top, y);
-    trigger.set_margin(Edge::Left, x);
-    trigger.set_margin(Edge::Top, y);
-}
-
-fn apply_monitor_handle_placement(
-    placement: &PlacementRuntime,
-    handle: &gtk::ApplicationWindow,
-    height_handle: &gtk::ApplicationWindow,
-) {
-    let x = placement.x.get();
-    let y = placement.y.get();
-    let scale_milli = placement.scale_milli.get();
-    handle.set_margin(
-        Edge::Left,
-        x + placement.width.get() - scaled_pixels(DRAG_HANDLE_WIDTH, scale_milli),
-    );
-    handle.set_margin(Edge::Top, y);
-    height_handle.set_margin(Edge::Left, x);
-    height_handle.set_margin(
-        Edge::Top,
-        y + placement.height.get() - scaled_pixels(HEIGHT_HANDLE_SIZE, scale_milli),
-    );
-}
-
-fn apply_monitor_size(
-    placement: &PlacementRuntime,
-    layout: &MonitorLayout,
-    content: &gtk::ApplicationWindow,
-    trigger: &gtk::ApplicationWindow,
-    handle: &gtk::ApplicationWindow,
-    height_handle: &gtk::ApplicationWindow,
-) {
-    apply_monitor_content_size(placement, layout, content, trigger);
-    apply_monitor_handle_size(placement, handle, height_handle);
-}
-
-fn apply_monitor_content_size(
-    placement: &PlacementRuntime,
-    layout: &MonitorLayout,
-    content: &gtk::ApplicationWindow,
-    trigger: &gtk::ApplicationWindow,
-) {
-    let width = placement.width.get();
-    layout.apply_scale(placement.scale_milli.get());
-    layout.root.set_size_request(width, -1);
-    content.set_default_size(width, -1);
-    placement.set_measured_height(layout.natural_height(width));
-    placement.set(placement.x.get(), placement.y.get());
-    trigger.set_default_size(
-        scaled_pixels(SETTINGS_TRIGGER_SIZE, placement.scale_milli.get()),
-        scaled_pixels(SETTINGS_TRIGGER_SIZE, placement.scale_milli.get()),
-    );
-}
-
-fn apply_monitor_handle_size(
-    placement: &PlacementRuntime,
-    handle: &gtk::ApplicationWindow,
-    height_handle: &gtk::ApplicationWindow,
-) {
-    let scale_milli = placement.scale_milli.get();
-    let handle_width = scaled_pixels(DRAG_HANDLE_WIDTH, scale_milli);
-    handle.set_default_size(handle_width, placement.height.get());
-    height_handle.set_default_size(
-        placement.width.get().saturating_sub(handle_width).max(1),
-        scaled_pixels(HEIGHT_HANDLE_SIZE, scale_milli),
-    );
-}
-
-fn settings_popup_position(placement: &PlacementRuntime) -> (i32, i32) {
-    let trigger_size = scaled_pixels(SETTINGS_TRIGGER_SIZE, placement.scale_milli.get());
-    let left = (placement.x.get() + trigger_size + 6).clamp(
-        PANEL_EDGE_MARGIN,
-        (placement.geometry.screen_width - SETTINGS_WINDOW_WIDTH - PANEL_EDGE_MARGIN)
-            .max(PANEL_EDGE_MARGIN),
-    );
-    let top = placement.y.get().clamp(
-        PANEL_EDGE_MARGIN,
-        (placement.geometry.screen_height - SETTINGS_WINDOW_HEIGHT - PANEL_EDGE_MARGIN)
-            .max(PANEL_EDGE_MARGIN),
-    );
-    (left, top)
 }
 
 #[derive(Clone, Copy)]
@@ -3983,102 +3427,16 @@ mod tests {
     }
 
     #[test]
-    fn panel_position_is_clamped_to_the_monitor() {
+    fn panel_stays_on_screen_as_content_grows_and_shrinks() {
         let geometry = PanelGeometry {
             screen_width: 1280,
             screen_height: 720,
             panel_width: 230,
-            panel_height: 480,
         };
-        assert_eq!(
-            geometry.clamp(-100, 900, 230, 480),
-            (PANEL_EDGE_MARGIN, 232)
-        );
-    }
-
-    #[test]
-    fn corner_drag_scales_width_and_height_together() {
-        let geometry = PanelGeometry {
-            screen_width: 1920,
-            screen_height: 1080,
-            panel_width: 230,
-            panel_height: 400,
-        };
-        let placement = PlacementRuntime::new(geometry, &MonitorSettings::default());
-        placement.begin_resize(230, 400);
-        placement.resize(115.0, 200.0);
-
-        assert_eq!(placement.scale_milli.get(), 1_500);
-        assert_eq!(placement.width.get(), 345);
-        assert_eq!(placement.height.get(), 600);
-    }
-
-    #[test]
-    fn right_edge_drag_changes_only_width() {
-        let geometry = PanelGeometry {
-            screen_width: 1920,
-            screen_height: 1080,
-            panel_width: 230,
-            panel_height: 400,
-        };
-        let placement = PlacementRuntime::new(geometry, &MonitorSettings::default());
-        let original_height = placement.height.get();
-        let original_scale = placement.scale_milli.get();
-        placement.begin_width_resize(230);
-        placement.resize_width(150.0);
-
-        assert_eq!(placement.width.get(), 380);
-        assert_eq!(placement.height.get(), original_height);
-        assert_eq!(placement.scale_milli.get(), original_scale);
-    }
-
-    #[test]
-    fn bottom_edge_drag_changes_scale_without_changing_width() {
-        let geometry = PanelGeometry {
-            screen_width: 1920,
-            screen_height: 1080,
-            panel_width: 230,
-            panel_height: 400,
-        };
-        let placement = PlacementRuntime::new(geometry, &MonitorSettings::default());
-        placement.begin_resize(380, 400);
-        placement.resize_height(200.0);
-
-        assert_eq!(placement.width.get(), 380);
-        assert_eq!(placement.height.get(), 600);
-        assert_eq!(placement.scale_milli.get(), 1_500);
-    }
-
-    #[test]
-    fn independent_width_is_restored_from_settings() {
-        let geometry = PanelGeometry {
-            screen_width: 1920,
-            screen_height: 1080,
-            panel_width: 230,
-            panel_height: 400,
-        };
-        let settings = MonitorSettings {
-            panel_width: Some(520),
-            ..MonitorSettings::default()
-        };
-
-        assert_eq!(PlacementRuntime::new(geometry, &settings).width.get(), 520);
-    }
-
-    #[test]
-    fn saved_width_is_migrated_to_a_proportional_scale() {
-        let geometry = PanelGeometry {
-            screen_width: 1920,
-            screen_height: 1080,
-            panel_width: 230,
-            panel_height: 400,
-        };
-        let settings = MonitorSettings {
-            legacy_width: Some(460),
-            ..MonitorSettings::default()
-        };
-
-        assert_eq!(geometry.resolve_scale(&settings), 2_000);
+        assert_eq!(geometry.clamp_y(-100, 480), PANEL_EDGE_MARGIN);
+        assert_eq!(geometry.clamp_y(500, 480), 232);
+        assert_eq!(geometry.clamp_y(500, 120), 500);
+        assert_eq!(geometry.clamp_y(500, 900), PANEL_EDGE_MARGIN);
     }
 
     #[test]

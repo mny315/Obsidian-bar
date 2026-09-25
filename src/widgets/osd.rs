@@ -23,7 +23,7 @@ use super::{
     Generation, PopupReveal, RefreshGate,
     audio_backend::{AudioBackend, VolumeState, default_audio_backend, invalidate_audio_caches},
     audio_visual::{ICON_HIGH, volume_icon},
-    detach_application_window, run_background,
+    detach_application_window, make_window_click_through, run_background,
 };
 
 const NAMESPACE: &str = "obsidian-bar-osd";
@@ -94,7 +94,7 @@ impl OsdController {
         window.set_margin(Edge::Bottom, BOTTOM_MARGIN);
         window.set_hide_on_close(true);
         window.set_focusable(false);
-        window.set_can_target(false);
+        make_window_click_through(&window);
 
         let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
         body.add_css_class("osd-body");
