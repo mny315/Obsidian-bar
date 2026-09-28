@@ -66,6 +66,12 @@ window.system-monitor-hotspot-window.background,
   padding: 0 1em 0.91em 0.82em;
 }
 
+.system-monitor-storage-title {
+  margin-top: 0.55em;
+  margin-bottom: 0.25em;
+  font-weight: 600;
+}
+
 .system-monitor-header {
   min-height: 3.27em;
 }
@@ -226,22 +232,32 @@ button.system-monitor-settings-trigger:active {
   font-size: 1.55em;
 }
 
-button.system-monitor-settings-pin {
+button.system-monitor-settings-pin,
+button.system-monitor-settings-pin:focus {
   min-height: 32px;
-  border: 1px solid @soft_overlay_16;
-  border-radius: 10px;
+  padding: 0 9px;
+  border: none;
+  border-radius: 9px;
   color: @fg;
-  background: @soft_overlay_06;
+  background: transparent;
+  background-image: none;
   box-shadow: none;
+  outline: none;
 }
 
-button.system-monitor-settings-pin:hover {
+button.system-monitor-settings-pin:hover,
+button.system-monitor-settings-pin:focus-visible {
   background: @hover_bg;
 }
 
+button.system-monitor-settings-pin:active,
 button.system-monitor-settings-pin:checked {
-  background: @accent_overlay_26;
-  border-color: @glass_border;
+  background: @soft_overlay_16;
+  box-shadow: inset 0 0 0 1px @soft_overlay_12;
+}
+
+button.system-monitor-settings-pin:checked:hover {
+  background: @soft_overlay_18;
 }
 
 .system-monitor-settings-surface {
@@ -255,6 +271,26 @@ button.system-monitor-settings-pin:checked {
 
 .system-monitor-settings-panel {
   min-width: 306px;
+}
+
+.system-monitor-settings-adjustments {
+  padding: 5px 9px;
+  border: 1px solid @soft_overlay_12;
+  border-radius: 11px;
+  color: @fg;
+  background: alpha(@theme_fg_color,0.045);
+}
+
+.system-monitor-settings-adjustments > title {
+  min-height: 28px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.system-monitor-settings-slider-row .system-monitor-settings-section-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 400;
 }
 
 .system-monitor-settings-header {
@@ -301,14 +337,112 @@ button.system-monitor-settings-pin:checked {
   font-weight: 500;
 }
 
-.system-monitor-settings-row-meta,
-.system-monitor-settings-hint {
+.system-monitor-settings-row-meta {
   font-size: 10px;
   opacity: 0.58;
 }
 
 .system-monitor-settings-row-unavailable {
   opacity: 0.42;
+}
+
+button.system-monitor-settings-expand,
+button.system-monitor-settings-expand:focus,
+button.system-monitor-settings-expand:checked {
+  min-width: 0;
+  min-height: 35px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+button.system-monitor-settings-expand:focus-visible {
+  outline: 1px solid @soft_overlay_18;
+  outline-offset: 2px;
+}
+
+.system-monitor-settings-choices {
+  padding-top: 6px;
+  padding-bottom: 2px;
+}
+
+.system-monitor-settings-metric-row {
+  min-height: 32px;
+  padding: 3px 0;
+}
+
+.system-monitor-settings-name,
+.system-monitor-settings-name entry,
+.system-monitor-settings-name label {
+  min-width: 0;
+  font-size: 11px;
+}
+
+.system-monitor-settings-name entry {
+  padding: 4px;
+  border-radius: 5px;
+  background: @soft_overlay_08;
+}
+
+.system-monitor-settings-dropdown,
+.system-monitor-settings-dropdown > button,
+.system-monitor-settings-dropdown label,
+.system-monitor-settings-dropdown image {
+  color: @fg;
+}
+
+.system-monitor-settings-dropdown > button {
+  min-width: 0;
+  padding: 6px 8px;
+  background: @soft_overlay_08;
+  border: 1px solid @soft_overlay_12;
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.system-monitor-settings-dropdown popover,
+.system-monitor-settings-dropdown popover.background,
+.system-monitor-settings-dropdown popover > arrow {
+  color: @fg;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+.system-monitor-settings-dropdown popover > contents {
+  padding: 5px;
+  color: @fg;
+  background: @popup_surface_bg;
+  background-image: none;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  box-shadow: none;
+}
+
+.system-monitor-settings-dropdown popover listview {
+  color: @fg;
+  background: transparent;
+}
+
+.system-monitor-settings-dropdown popover listview > row {
+  min-height: 28px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  color: @fg;
+  background: transparent;
+}
+
+.system-monitor-settings-dropdown popover listview > row:selected {
+  color: @fg;
+  background: @soft_overlay_16;
+}
+
+.system-monitor-settings-dropdown popover listview > row:hover {
+  background: @hover_bg;
 }
 
 button.system-monitor-settings-move,
@@ -352,16 +486,28 @@ button.system-monitor-settings-move:disabled {
   opacity: 0.24;
 }
 
+button.system-monitor-settings-metric,
+button.system-monitor-settings-metric:focus,
+button.system-monitor-settings-metric:checked,
+button.system-monitor-settings-metric:checked:focus {
+  min-height: 28px;
+  padding: 4px 6px;
+  font-size: 11px;
+  background: transparent;
+}
+
+button.system-monitor-settings-metric:hover,
+button.system-monitor-settings-metric:checked:hover,
+button.system-monitor-settings-metric:focus-visible {
+  background: @hover_bg;
+}
+
+button.system-monitor-settings-metric:not(:checked) {
+  color: alpha(@theme_fg_color, 0.5);
+}
+
 .system-monitor-settings-button-icon {
   font-size: 15px;
-}
-
-.system-monitor-settings-footer {
-  min-height: 34px;
-}
-
-.system-monitor-settings-hint {
-  margin-left: 2px;
 }
 
 .audio-spectrum-canvas {
@@ -1908,7 +2054,16 @@ scale.slider-control:active > trough > slider {
   opacity: 0;
 }
 
-scale.slider-control.system-monitor-settings-scale slider {
+scale.slider-control.system-monitor-settings-scale {
+  min-width: 0;
+  min-height: 22px;
+  padding: 3px 0;
+}
+
+scale.slider-control.system-monitor-settings-scale slider,
+scale.slider-control.system-monitor-settings-scale:hover slider,
+scale.slider-control.system-monitor-settings-scale:active slider,
+scale.slider-control.system-monitor-settings-scale:focus-visible slider {
   min-width: 12px;
   min-height: 12px;
   margin: -2px;
@@ -1920,7 +2075,7 @@ scale.slider-control.system-monitor-settings-scale slider {
 scale.system-monitor-settings-scale value {
   min-width: 44px;
   color: @fg;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   opacity: 0.85;
 }

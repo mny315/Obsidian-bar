@@ -251,12 +251,25 @@ impl App {
     }
 
     fn sync_system_monitor_view(&self) {
-        let monitor = self
+        let preferred = self.system_monitor.preferred_output();
+        let monitors = self
             .monitor_model
             .borrow()
             .as_ref()
-            .and_then(|model| model.item(0))
-            .and_then(|item| item.downcast::<gdk::Monitor>().ok());
+            .map(|model| {
+                (0..model.n_items())
+                    .filter_map(|index| model.item(index)?.downcast::<gdk::Monitor>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let monitor = monitors
+            .iter()
+            .find(|monitor| {
+                preferred.as_deref()
+                    == Some(crate::widgets::system_monitor::monitor_output_id(monitor).as_str())
+            })
+            .or_else(|| monitors.first())
+            .cloned();
 
         let mut view = self.system_monitor_view.borrow_mut();
         if !self.system_monitor.enabled() {

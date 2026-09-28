@@ -3285,9 +3285,7 @@ fn mpv_ipc_request_blocking(
     command: serde_json::Value,
     timeout: Duration,
 ) -> Result<MpvIpcMessage, String> {
-    use std::os::unix::net::UnixStream;
-
-    let mut stream = UnixStream::connect(socket)
+    let mut stream = crate::unix_socket::connect(socket, timeout)
         .map_err(|error| format!("failed to connect to mpv IPC: {error}"))?;
     stream
         .set_read_timeout(Some(timeout))

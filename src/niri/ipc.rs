@@ -2,10 +2,7 @@ use std::{
     env,
     io::{self, BufRead, BufReader, Write},
     net::Shutdown,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, net::UnixStream},
-    },
+    os::unix::net::UnixStream,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -14,6 +11,8 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+use crate::unix_socket::connect as connect_socket;
 
 use niri_ipc::{
     Action, Event, LayoutSwitchTarget, Reply, Request, Response, Window, Workspace,
@@ -127,46 +126,6 @@ fn send_action(action: Action) -> io::Result<()> {
     )
 }
 
-fn connect_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
-    // UnixStream::connect has no timeout. A full compositor listen queue can
-    // otherwise block both a worker and EventListener::drop indefinitely.
-    let path = path.as_os_str().as_bytes();
-    // SAFETY: all-zero bytes form a valid sockaddr_un; set its family below.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if path.is_empty() || path.len() >= address.sun_path.len() || path.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid niri socket path",
-        ));
-    }
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (target, byte) in address.sun_path.iter_mut().zip(path) {
-        *target = *byte as libc::c_char;
-    }
-
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: socket returned a fresh, owned descriptor of the requested type.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    stream.set_write_timeout(Some(timeout))?;
-    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
-    // SAFETY: address is initialized and address_len includes the trailing NUL
-    // within its sun_path buffer. stream owns the descriptor for the whole call.
-    let result = unsafe {
-        libc::connect(
-            stream.as_raw_fd(),
-            (&address as *const libc::sockaddr_un).cast(),
-            address_len as libc::socklen_t,
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(stream)
-}
-
 fn send_action_on_stream(
     mut stream: UnixStream,
     action: Action,
@@ -225,34 +184,8 @@ fn read_event_stream(
     if stop.load(Ordering::Acquire) || sender.is_closed() {
         return Ok(());
     }
-    let mut stream = BufReader::new(stream);
-
-    let mut request = serde_json::to_string(&Request::EventStream).map_err(io::Error::other)?;
-    request.push('\n');
-    stream.get_mut().write_all(request.as_bytes())?;
-
+    let mut stream = subscribe_to_events(stream, ACTION_TIMEOUT)?;
     let mut line = String::new();
-    if !read_line(&mut stream, &mut line)? {
-        if stop.load(Ordering::Acquire) || sender.is_closed() {
-            return Ok(());
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "niri closed the socket before replying to EventStream",
-        ));
-    }
-
-    let reply: Reply = serde_json::from_str(&line).map_err(io::Error::other)?;
-    match reply {
-        Ok(Response::Handled) => {}
-        Ok(response) => {
-            return Err(io::Error::other(format!(
-                "unexpected niri EventStream response: {response:?}"
-            )));
-        }
-        Err(message) => return Err(io::Error::other(format!("niri IPC error: {message}"))),
-    }
-    let _ = stream.get_mut().shutdown(Shutdown::Write);
 
     let mut keyboard_state = KeyboardLayoutsState::default();
     let mut windows_state = WindowsState::default();
@@ -314,6 +247,38 @@ fn read_event_stream(
             }
         }
     }
+}
+
+fn subscribe_to_events(stream: UnixStream, timeout: Duration) -> io::Result<BufReader<UnixStream>> {
+    // Only the subscription handshake has a deadline. An established event
+    // stream can legitimately be silent while the desktop is idle.
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let mut stream = BufReader::new(stream);
+    let mut request = serde_json::to_string(&Request::EventStream).map_err(io::Error::other)?;
+    request.push('\n');
+    stream.get_mut().write_all(request.as_bytes())?;
+
+    let mut line = String::new();
+    if !read_line(&mut stream, &mut line)? {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "niri closed the socket before replying to EventStream",
+        ));
+    }
+    let reply: Reply = serde_json::from_str(&line).map_err(io::Error::other)?;
+    match reply {
+        Ok(Response::Handled) => {}
+        Ok(response) => {
+            return Err(io::Error::other(format!(
+                "unexpected niri EventStream response: {response:?}"
+            )));
+        }
+        Err(message) => return Err(io::Error::other(format!("niri IPC error: {message}"))),
+    }
+    stream.get_mut().set_read_timeout(None)?;
+    let _ = stream.get_mut().shutdown(Shutdown::Write);
+    Ok(stream)
 }
 
 struct ActiveStreamGuard(Arc<Mutex<Option<UnixStream>>>);
@@ -404,38 +369,6 @@ mod tests {
     use niri_ipc::KeyboardLayouts;
 
     #[test]
-    fn connecting_to_a_full_compositor_queue_is_bounded() {
-        use std::os::unix::net::UnixListener;
-
-        let path = std::env::temp_dir().join(format!(
-            "obsidian-niri-connect-test-{}.sock",
-            std::process::id()
-        ));
-        let listener = UnixListener::bind(&path).expect("bind local test socket");
-        // One queued connection is enough to fill a zero-backlog listener.
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
-        let _queued = connect_socket(&path, Duration::from_millis(40)).unwrap();
-        let started = std::time::Instant::now();
-        let result = connect_socket(&path, Duration::from_millis(40));
-        std::fs::remove_file(&path).unwrap();
-
-        let error = result.expect_err("a full socket queue must time out");
-        assert!(matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-        ));
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn invalid_socket_paths_are_rejected() {
-        for path in ["", "a\0b", &"a".repeat(108)] {
-            let error = connect_socket(Path::new(path), ACTION_TIMEOUT).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        }
-    }
-
-    #[test]
     fn an_unresponsive_compositor_does_not_hold_a_worker_forever() {
         let (client, _server) = UnixStream::pair().unwrap();
         let started = std::time::Instant::now();
@@ -479,6 +412,39 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap();
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn event_subscription_times_out_if_the_compositor_never_acknowledges() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        let error = subscribe_to_events(client, Duration::from_millis(40)).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn acknowledged_event_stream_keeps_buffered_events_and_has_no_idle_timeout() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let responder = thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(request.trim(), "\"EventStream\"");
+            server
+                .write_all(b"{\"Ok\":\"Handled\"}\nfirst event\n")
+                .unwrap();
+        });
+        let mut reader = subscribe_to_events(client, Duration::from_secs(1)).unwrap();
+        assert_eq!(reader.get_ref().read_timeout().unwrap(), None);
+        let mut event = String::new();
+        assert!(read_line(&mut reader, &mut event).unwrap());
+        assert_eq!(event, "first event\n");
         responder.join().unwrap();
     }
 

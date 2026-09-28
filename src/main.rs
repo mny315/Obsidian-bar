@@ -1,6 +1,7 @@
 mod app;
 mod niri;
 mod ui;
+mod unix_socket;
 mod widgets;
 
 use gtk::glib;

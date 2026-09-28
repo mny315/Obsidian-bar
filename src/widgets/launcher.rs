@@ -2002,6 +2002,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nested_desktop_entries_keep_categories_and_keywords() {
+        const TEST_ROOT: &str = "OBSIDIAN_LAUNCHER_TEST_ROOT";
+        if env::var_os(TEST_ROOT).is_some() {
+            let info = gio::AppInfo::all()
+                .into_iter()
+                .find(|info| info.id().as_deref() == Some("vendor-audit.desktop"))
+                .expect("GIO should discover the nested desktop entry");
+            let app = catalog_app(info, &mut HashSet::new()).expect("visible app");
+            assert_eq!(app.primary_category, Some(LauncherCategory::Games));
+            assert!(app.search_blob.contains("nested-keyword"));
+            return;
+        }
+
+        let root = env::temp_dir().join(format!("obsidian-launcher-nested-{}", std::process::id()));
+        fs::create_dir_all(root.join("applications/vendor")).unwrap();
+        fs::create_dir_all(root.join("empty-data-dir")).unwrap();
+        fs::write(
+            root.join("applications/vendor/audit.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Obsidian audit fixture\nExec=true\nCategories=Game;\nKeywords=nested-keyword;\n",
+        ).unwrap();
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "widgets::launcher::tests::nested_desktop_entries_keep_categories_and_keywords",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(TEST_ROOT, &root)
+            .env("XDG_DATA_HOME", &root)
+            .env("XDG_DATA_DIRS", root.join("empty-data-dir"))
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn normalizes_search_fields_without_intermediate_separators() {
         assert_eq!(
             normalize_fields(["  Foo\tBAR ", "", " Baz  qux "]),

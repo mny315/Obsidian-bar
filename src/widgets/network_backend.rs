@@ -29,6 +29,7 @@ const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
 const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
 const SYSTEMD_UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const VLESS_UNIT: &str = "sing-box.service";
+const VLESS_JOB_TIMEOUT: Duration = Duration::from_secs(30);
 
 const NM_DEVICE_TYPE_WIFI: u32 = 2;
 const NM_AP_FLAGS_PRIVACY: u32 = 0x1;
@@ -365,9 +366,46 @@ impl NetworkBackend {
         let bus = gio::bus_get_future(gio::BusType::System)
             .await
             .map_err(|error| format!("Cannot connect to system services: {error}"))?;
+        // StartUnit/StopUnit only enqueue a job. Subscribe before submitting it
+        // so even a completion delivered before the method reply is retained.
+        let (completed_tx, completed_rx) = async_channel::unbounded();
+        let _subscription = bus.subscribe_to_signal(
+            Some(SYSTEMD_SERVICE),
+            Some(SYSTEMD_MANAGER_INTERFACE),
+            Some("JobRemoved"),
+            Some(SYSTEMD_PATH),
+            None,
+            gio::DBusSignalFlags::NONE,
+            move |signal| {
+                if let Some((_, path, _, result)) =
+                    signal.parameters.get::<(u32, ObjectPath, String, String)>()
+                {
+                    // Match the returned job path later: an alias can emit the
+                    // canonical unit name instead of the name we requested.
+                    let _ = completed_tx.try_send((path, result));
+                }
+            },
+        );
+        if let Err(error) = bus
+            .call_future(
+                Some(SYSTEMD_SERVICE),
+                SYSTEMD_PATH,
+                SYSTEMD_MANAGER_INTERFACE,
+                "Subscribe",
+                None,
+                None,
+                gio::DBusCallFlags::NONE,
+                DBUS_TIMEOUT_MS,
+            )
+            .await
+            && gio::DBusError::remote_error(&error).as_deref()
+                != Some("org.freedesktop.systemd1.AlreadySubscribed")
+        {
+            return Err(format!("Cannot track VLESS operation: {error}"));
+        }
         let method = if active { "StartUnit" } else { "StopUnit" };
         let parameters = (VLESS_UNIT, "replace").to_variant();
-        match bus
+        let job = match bus
             .call_future(
                 Some(SYSTEMD_SERVICE),
                 SYSTEMD_PATH,
@@ -382,7 +420,10 @@ impl NetworkBackend {
             )
             .await
         {
-            Ok(_) => {}
+            Ok(reply) => reply
+                .get::<(ObjectPath,)>()
+                .map(|(path,)| path)
+                .ok_or_else(|| "systemd returned an invalid job object path".to_owned())?,
             Err(error)
                 if matches!(
                     gio::DBusError::remote_error(&error).as_deref(),
@@ -402,8 +443,8 @@ impl NetworkBackend {
                 let action = if active { "start" } else { "stop" };
                 return Err(format!("Could not {action} VLESS: {error}"));
             }
-        }
-        Ok(())
+        };
+        wait_for_systemd_job(&completed_rx, &job, VLESS_JOB_TIMEOUT).await
     }
 
     pub fn forget(&self, network: &WifiNetwork) -> Result<(), String> {
@@ -444,6 +485,27 @@ impl NetworkBackend {
             ))
         }
     }
+}
+
+async fn wait_for_systemd_job(
+    completed: &async_channel::Receiver<(ObjectPath, String)>,
+    job: &ObjectPath,
+    timeout: Duration,
+) -> Result<(), String> {
+    glib::future_with_timeout(timeout, async {
+        while let Ok((path, result)) = completed.recv().await {
+            if &path == job {
+                return if result == "done" {
+                    Ok(())
+                } else {
+                    Err(format!("VLESS operation failed: {result}"))
+                };
+            }
+        }
+        Err("VLESS operation tracking was interrupted".to_owned())
+    })
+    .await
+    .unwrap_or_else(|_| Err("Timed out waiting for VLESS operation to finish".to_owned()))
 }
 
 fn new_wifi_settings(network: &WifiNetwork, password: Option<&str>) -> Result<SettingsMap, String> {
@@ -812,6 +874,47 @@ fn merge_access_point(existing: &mut AccessPointCandidate, candidate: AccessPoin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_jobs_keep_early_replies_and_report_failure_or_timeout() {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                context.block_on(async {
+                    let job = ObjectPath::try_from("/org/freedesktop/systemd1/job/42").unwrap();
+                    let other = ObjectPath::try_from("/org/freedesktop/systemd1/job/41").unwrap();
+                    let (tx, rx) = async_channel::unbounded();
+                    tx.send((other, "failed".to_owned())).await.unwrap();
+                    tx.send((job.clone(), "done".to_owned())).await.unwrap();
+                    wait_for_systemd_job(&rx, &job, Duration::from_secs(1))
+                        .await
+                        .unwrap();
+                    for result in ["failed", "dependency", "canceled", "timeout", "skipped"] {
+                        tx.send((job.clone(), result.to_owned())).await.unwrap();
+                        assert!(
+                            wait_for_systemd_job(&rx, &job, Duration::from_secs(1))
+                                .await
+                                .unwrap_err()
+                                .contains(result)
+                        );
+                    }
+                    assert!(
+                        wait_for_systemd_job(&rx, &job, Duration::from_millis(20))
+                            .await
+                            .unwrap_err()
+                            .contains("Timed out")
+                    );
+                    drop(tx);
+                    assert!(
+                        wait_for_systemd_job(&rx, &job, Duration::from_secs(1))
+                            .await
+                            .unwrap_err()
+                            .contains("interrupted")
+                    );
+                })
+            })
+            .unwrap();
+    }
 
     #[test]
     fn new_wifi_profile_preserves_raw_ssid_and_password() {

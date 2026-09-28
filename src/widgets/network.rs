@@ -21,7 +21,6 @@ use super::{
 const SCAN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNAL_SUBSCRIPTION_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const SIGNAL_SUBSCRIPTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
-const VLESS_ACTION_REFRESH_DELAY: Duration = Duration::from_millis(650);
 const NETWORK_LIST_MIN_HEIGHT: i32 = 96;
 const NETWORK_LIST_MAX_HEIGHT: i32 = 220;
 const NETWORK_POPUP_NAMESPACE: &str = "obsidian-bar-network";
@@ -1248,7 +1247,6 @@ impl NetworkController {
             };
             this.action_busy.set(false);
 
-            let succeeded = result.is_ok();
             match result {
                 Ok(()) => this.set_notice(None),
                 Err(error) => {
@@ -1257,16 +1255,7 @@ impl NetworkController {
                 }
             }
             this.update_header();
-            if succeeded && matches!(refresh_target, RefreshTarget::Vless) {
-                let weak = Rc::downgrade(&this);
-                glib::timeout_add_local_once(VLESS_ACTION_REFRESH_DELAY, move || {
-                    if let Some(this) = weak.upgrade() {
-                        this.refresh_vless();
-                    }
-                });
-            } else {
-                this.refresh_target(refresh_target);
-            }
+            this.refresh_target(refresh_target);
         });
     }
 

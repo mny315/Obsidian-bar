@@ -907,6 +907,9 @@ impl TrayView {
 
     fn dismiss(&self) {
         for button in self.buttons.borrow().values() {
+            if let Some(request) = button.menu_request.borrow_mut().take() {
+                request.cancel();
+            }
             if let Some(popover) = button.root.popover() {
                 popover.popdown();
             }
@@ -919,6 +922,32 @@ struct TrayButton {
     image: gtk::Image,
     tooltip: RefCell<String>,
     icon_signature: RefCell<TrayIconSignature>,
+    menu_request: Rc<RefCell<Option<gio::Cancellable>>>,
+}
+
+struct TrayMenuRequest {
+    anchor: glib::WeakRef<gtk::MenuButton>,
+    cancellable: gio::Cancellable,
+}
+
+impl TrayMenuRequest {
+    fn new(anchor: &gtk::MenuButton, pending: &RefCell<Option<gio::Cancellable>>) -> Self {
+        let cancellable = gio::Cancellable::new();
+        if let Some(previous) = pending.replace(Some(cancellable.clone())) {
+            previous.cancel();
+        }
+        Self {
+            anchor: anchor.downgrade(),
+            cancellable,
+        }
+    }
+
+    fn anchor(&self) -> Option<gtk::MenuButton> {
+        if self.cancellable.is_cancelled() {
+            return None;
+        }
+        self.anchor.upgrade().filter(|anchor| anchor.is_mapped())
+    }
 }
 
 impl TrayButton {
@@ -1016,25 +1045,9 @@ impl TrayItem {
             .or_else(|| cached_property::<String>(&self.proxy, "Id"))
             .unwrap_or_else(|| self.service.clone());
         let tooltip = tooltip_text(&self.proxy).unwrap_or_else(|| title.clone());
-        let attention = status == "NeedsAttention";
-        let icon_name_property = if attention {
-            "AttentionIconName"
-        } else {
-            "IconName"
-        };
-        let icon_pixmap_property = if attention {
-            "AttentionIconPixmap"
-        } else {
-            "IconPixmap"
-        };
-        let icon_name = cached_property::<String>(&self.proxy, icon_name_property)
-            .filter(|name| !name.is_empty());
-        let icon_pixmaps = if icon_name.is_some() {
-            None
-        } else {
-            cached_property::<IconPixmaps>(&self.proxy, icon_pixmap_property)
-                .filter(|pixmaps| !pixmaps.is_empty())
-        };
+        let (icon_name, icon_pixmaps) = tray_icon_properties(status == "NeedsAttention", |name| {
+            self.proxy.cached_property(name)
+        });
         let icon_theme_path =
             cached_property::<String>(&self.proxy, "IconThemePath").filter(|path| !path.is_empty());
         if icon_name.is_none() && icon_pixmaps.is_none() {
@@ -1066,13 +1079,32 @@ impl TrayItem {
 
         button.set_popover(Some(&gtk::Popover::new()));
 
+        let menu_request = Rc::new(RefCell::new(None::<gio::Cancellable>));
+        let pending = Rc::clone(&menu_request);
+        button.connect_unmap(move |_| {
+            if let Some(request) = pending.borrow_mut().take() {
+                request.cancel();
+            }
+        });
+
         let primary = gtk::GestureClick::new();
         primary.set_button(gdk::BUTTON_PRIMARY);
         primary.set_propagation_phase(gtk::PropagationPhase::Capture);
         let item = self.clone();
+        let weak_button = button.downgrade();
+        let pending = Rc::clone(&menu_request);
         primary.connect_pressed(move |gesture, _, _, _| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            item.activate();
+            if cached_property::<bool>(&item.proxy, "ItemIsMenu").unwrap_or(false) {
+                if let Some(button) = weak_button.upgrade() {
+                    item.open_context_menu(
+                        TrayMenuRequest::new(&button, &pending),
+                        BarTooltipSuppression::begin(),
+                    );
+                }
+            } else {
+                item.activate();
+            }
         });
         button.add_controller(primary);
 
@@ -1081,6 +1113,7 @@ impl TrayItem {
         secondary.set_propagation_phase(gtk::PropagationPhase::Capture);
         let item = self.clone();
         let weak_button = button.downgrade();
+        let pending = Rc::clone(&menu_request);
         secondary.connect_pressed(move |gesture, _, _, _| {
             // MenuButton has its own pointer handling and this tray gesture claims
             // the secondary-button sequence. Hide the layer-shell tooltip here
@@ -1088,7 +1121,10 @@ impl TrayItem {
             let tooltip_suppression = BarTooltipSuppression::begin();
             gesture.set_state(gtk::EventSequenceState::Claimed);
             if let Some(button) = weak_button.upgrade() {
-                item.open_context_menu(&button, tooltip_suppression);
+                item.open_context_menu(
+                    TrayMenuRequest::new(&button, &pending),
+                    tooltip_suppression,
+                );
             }
         });
         button.add_controller(secondary);
@@ -1098,6 +1134,7 @@ impl TrayItem {
             image,
             tooltip: RefCell::new(snapshot.tooltip),
             icon_signature: RefCell::new(icon_signature),
+            menu_request,
         }
     }
 
@@ -1107,9 +1144,12 @@ impl TrayItem {
 
     fn open_context_menu(
         self: &Rc<Self>,
-        anchor: &gtk::MenuButton,
+        request: TrayMenuRequest,
         tooltip_suppression: Rc<BarTooltipSuppression>,
     ) {
+        if request.anchor().is_none() {
+            return;
+        }
         let menu_path = cached_property::<glib::variant::ObjectPath>(&self.proxy, "Menu")
             .map(|path| path.as_str().to_owned())
             .filter(|path| path != "/");
@@ -1122,13 +1162,13 @@ impl TrayItem {
             (path == &menu_path && proxy.name_owner().is_some()).then(|| proxy.clone())
         });
         if let Some(proxy) = cached {
-            self.load_context_menu(anchor, proxy, tooltip_suppression);
+            self.load_context_menu(request, proxy, tooltip_suppression);
             return;
         }
 
         let weak_self = Rc::downgrade(self);
-        let weak_anchor = anchor.downgrade();
         let cached_menu_path = menu_path.clone();
+        let cancellable = request.cancellable.clone();
         gio::DBusProxy::for_bus(
             gio::BusType::Session,
             gio::DBusProxyFlags::DO_NOT_AUTO_START,
@@ -1136,17 +1176,19 @@ impl TrayItem {
             &self.service,
             &menu_path,
             DBUSMENU_INTERFACE,
-            None::<&gio::Cancellable>,
+            Some(&cancellable),
             move |result| {
-                let (Some(this), Some(anchor)) = (weak_self.upgrade(), weak_anchor.upgrade())
-                else {
+                let Some(this) = weak_self.upgrade() else {
                     return;
                 };
+                if request.anchor().is_none() {
+                    return;
+                }
                 match result {
                     Ok(proxy) => {
                         this.menu_proxy
                             .replace(Some((cached_menu_path.clone(), proxy.clone())));
-                        this.load_context_menu(&anchor, proxy, tooltip_suppression);
+                        this.load_context_menu(request, proxy, tooltip_suppression);
                     }
                     Err(error) => {
                         debug!(%error, item = %this.id, "failed to connect DBusMenu");
@@ -1159,33 +1201,36 @@ impl TrayItem {
 
     fn load_context_menu(
         self: &Rc<Self>,
-        anchor: &gtk::MenuButton,
+        request: TrayMenuRequest,
         menu_proxy: gio::DBusProxy,
         tooltip_suppression: Rc<BarTooltipSuppression>,
     ) {
         let about_to_show = (0i32,).to_variant();
-        let weak_anchor = anchor.downgrade();
         let fallback_proxy = self.proxy.clone();
         let menu_proxy_for_layout = menu_proxy.clone();
+        let cancellable = request.cancellable.clone();
         menu_proxy.call(
             "AboutToShow",
             Some(&about_to_show),
             gio::DBusCallFlags::NONE,
             DBUS_TIMEOUT_MS,
-            None::<&gio::Cancellable>,
+            Some(&cancellable),
             move |_| {
+                if request.anchor().is_none() {
+                    return;
+                }
                 let parameters = (0i32, -1i32, Vec::<String>::new()).to_variant();
                 let menu_proxy_for_reply = menu_proxy_for_layout.clone();
                 let fallback_proxy_for_reply = fallback_proxy.clone();
-                let weak_anchor_for_reply = weak_anchor.clone();
+                let cancellable = request.cancellable.clone();
                 menu_proxy_for_layout.call(
                     "GetLayout",
                     Some(&parameters),
                     gio::DBusCallFlags::NONE,
                     DBUS_TIMEOUT_MS,
-                    None::<&gio::Cancellable>,
+                    Some(&cancellable),
                     move |result| {
-                        let Some(anchor) = weak_anchor_for_reply.upgrade() else {
+                        let Some(anchor) = request.anchor() else {
                             return;
                         };
                         let root = result.ok().and_then(|reply| parse_menu_layout(&reply));
@@ -1206,6 +1251,30 @@ impl TrayItem {
             },
         );
     }
+}
+
+fn tray_icon_properties(
+    attention: bool,
+    property: impl Fn(&str) -> Option<glib::Variant>,
+) -> (Option<String>, Option<IconPixmaps>) {
+    let read = |name, pixmap| {
+        let icon_name = property(name)
+            .and_then(|value| variant_value::<String>(&value))
+            .filter(|name| !name.is_empty());
+        let icon_pixmaps = property(pixmap)
+            .and_then(|value| variant_value::<IconPixmaps>(&value))
+            .filter(|pixmaps| !pixmaps.is_empty());
+        (icon_name, icon_pixmaps)
+    };
+    if attention {
+        let icon = read("AttentionIconName", "AttentionIconPixmap");
+        if icon.0.is_some() || icon.1.is_some() {
+            return icon;
+        }
+    }
+    // Attention artwork is optional. Do not remove an application from the
+    // tray just because it asks for attention without providing another icon.
+    read("IconName", "IconPixmap")
 }
 
 struct TraySnapshot {
@@ -1495,8 +1564,9 @@ fn send_menu_event(proxy: &gio::DBusProxy, id: i32) {
 fn apply_icon(image: &gtk::Image, snapshot: &TraySnapshot) {
     image.clear();
 
-    if let Some(icon_name) = snapshot.icon_name.as_deref() {
-        apply_icon_name(image, icon_name, snapshot.icon_theme_path.as_deref());
+    if let Some(icon_name) = snapshot.icon_name.as_deref()
+        && apply_icon_name(image, icon_name, snapshot.icon_theme_path.as_deref())
+    {
         return;
     }
 
@@ -1508,23 +1578,27 @@ fn apply_icon(image: &gtk::Image, snapshot: &TraySnapshot) {
     image.set_icon_name(Some("image-missing-symbolic"));
 }
 
-fn apply_icon_name(image: &gtk::Image, icon_name: &str, icon_theme_path: Option<&str>) {
+fn apply_icon_name(image: &gtk::Image, icon_name: &str, icon_theme_path: Option<&str>) -> bool {
     let direct_path = Path::new(icon_name);
     if direct_path.is_file() {
         set_file_icon(image, direct_path);
-        return;
+        return true;
     }
 
     if let Some(theme_path) = icon_theme_path {
         let theme_root = Path::new(theme_path);
         if let Some(path) = find_icon_file(theme_root, icon_name) {
             set_file_icon(image, &path);
-            return;
+            return true;
         }
     }
 
-    let icon = gio::ThemedIcon::new(icon_name);
-    image.set_from_gicon(&icon);
+    if gtk::IconTheme::for_display(&image.display()).has_icon(icon_name) {
+        let icon = gio::ThemedIcon::new(icon_name);
+        image.set_from_gicon(&icon);
+        return true;
+    }
+    false
 }
 
 fn set_file_icon(image: &gtk::Image, path: &Path) {
@@ -1819,6 +1893,121 @@ fn map_property<T: glib::variant::FromVariant>(properties: &PropertyMap, name: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display and session D-Bus; run alone"]
+    fn tray_primary_click_honors_item_is_menu_and_unmap_cancels_requests() {
+        gtk::init().unwrap();
+        let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).unwrap();
+        let service = bus.unique_name().unwrap();
+        let path = "/ObsidianAuditTrayItem";
+        let node = gio::DBusNodeInfo::for_xml(r#"
+            <node><interface name="org.kde.StatusNotifierItem">
+              <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+              <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+            </interface></node>"#).unwrap();
+        let calls = Rc::new(RefCell::new(Vec::<String>::new()));
+        let recorded = calls.clone();
+        let registration = bus
+            .register_object(path, &node.lookup_interface(ITEM_INTERFACE).unwrap())
+            .method_call(move |_, _, _, _, method, _, invocation| {
+                recorded.borrow_mut().push(method.to_owned());
+                invocation.return_value(None);
+            })
+            .build()
+            .unwrap();
+        let proxy = gio::DBusProxy::new_sync(
+            &bus,
+            gio::DBusProxyFlags::DO_NOT_LOAD_PROPERTIES
+                | gio::DBusProxyFlags::DO_NOT_CONNECT_SIGNALS,
+            None,
+            Some(&service),
+            path,
+            ITEM_INTERFACE,
+            gio::Cancellable::NONE,
+        )
+        .unwrap();
+        proxy.set_cached_property("IconName", Some(&"image-missing".to_variant()));
+        proxy.set_cached_property("ItemIsMenu", Some(&true.to_variant()));
+        let (events, _receiver) = async_channel::unbounded();
+        let item = TrayItem::from_proxy(path.into(), service.to_string(), proxy.clone(), &events);
+        let view = TrayView::new();
+        view.sync(&[item]);
+        let window = gtk::Window::builder().child(&view.root).build();
+        window.present();
+        let pump = |ms| {
+            let until = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < until {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        pump(150);
+        let buttons = view.buttons.borrow();
+        let button = buttons.get(path).unwrap();
+        let controllers = button.root.observe_controllers();
+        let primary = (0..controllers.n_items())
+            .filter_map(|index| {
+                controllers
+                    .item(index)?
+                    .downcast::<gtk::GestureClick>()
+                    .ok()
+            })
+            .find(|gesture| gesture.button() == gdk::BUTTON_PRIMARY)
+            .unwrap();
+        primary.emit_by_name::<()>("pressed", &[&1_i32, &0_f64, &0_f64]);
+        pump(150);
+        assert_eq!(*calls.borrow(), ["ContextMenu"]);
+        proxy.set_cached_property("ItemIsMenu", Some(&false.to_variant()));
+        primary.emit_by_name::<()>("pressed", &[&1_i32, &0_f64, &0_f64]);
+        pump(150);
+        assert_eq!(*calls.borrow(), ["ContextMenu", "Activate"]);
+
+        let stale = TrayMenuRequest::new(&button.root, &button.menu_request);
+        let fresh = TrayMenuRequest::new(&button.root, &button.menu_request);
+        assert!(stale.anchor().is_none());
+        assert!(fresh.anchor().is_some());
+        window.set_visible(false);
+        assert!(fresh.cancellable.is_cancelled());
+        assert!(fresh.anchor().is_none());
+        window.present();
+        pump(100);
+        let dismissed = TrayMenuRequest::new(&button.root, &button.menu_request);
+        drop(buttons);
+        view.dismiss();
+        assert!(dismissed.cancellable.is_cancelled());
+        assert!(dismissed.anchor().is_none());
+        window.destroy();
+        bus.unregister_object(registration).unwrap();
+        pump(20);
+    }
+
+    #[test]
+    fn attention_without_artwork_keeps_the_normal_icon_and_its_pixmap_fallback() {
+        let pixmaps = vec![(1, 1, vec![255_u8, 20, 40, 60])];
+        let mut properties = PropertyMap::from([
+            ("IconName".into(), "example-icon".to_variant()),
+            ("IconPixmap".into(), pixmaps.to_variant()),
+            ("AttentionIconName".into(), "".to_variant()),
+        ]);
+        for attention in [false, true] {
+            let (name, fallback) =
+                tray_icon_properties(attention, |key| properties.get(key).cloned());
+            assert_eq!(name.as_deref(), Some("example-icon"));
+            assert_eq!(fallback, Some(pixmaps.clone()));
+        }
+        properties.insert("AttentionIconName".into(), "attention-icon".to_variant());
+        assert_eq!(
+            tray_icon_properties(true, |key| properties.get(key).cloned()),
+            (Some("attention-icon".into()), None)
+        );
+        properties.remove("AttentionIconName");
+        properties.insert("AttentionIconPixmap".into(), pixmaps.to_variant());
+        assert_eq!(
+            tray_icon_properties(true, |key| properties.get(key).cloned()),
+            (None, Some(pixmaps))
+        );
+    }
 
     #[test]
     fn expired_icon_cache_entries_can_be_replaced_without_borrowing_twice() {

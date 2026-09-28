@@ -26,8 +26,8 @@ use crate::widgets::{
 };
 
 const NAMESPACE: &str = "obsidian-bar-main";
-const BAR_VISIBLE_TOP_MARGIN: i32 = 4;
-const BAR_FALLBACK_HEIGHT: i32 = 42;
+pub(crate) const BAR_VISIBLE_TOP_MARGIN: i32 = 4;
+pub(crate) const BAR_FALLBACK_HEIGHT: i32 = 42;
 // At the hidden endpoint the bar bottom is exactly at the output's top edge.
 // The always-enabled automatic exclusive zone follows the animated margin, so
 // the client window moves away at the same time as the bar enters the screen.
