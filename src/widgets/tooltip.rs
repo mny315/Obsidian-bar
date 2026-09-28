@@ -457,10 +457,12 @@ impl TooltipState {
             root_y = geometry.y() + geometry.height() - root_height - margin_bottom;
         }
 
-        let (_, tooltip_width, _, _) = self.frame.measure(gtk::Orientation::Horizontal, -1);
-        let (_, tooltip_height, _, _) = self.frame.measure(gtk::Orientation::Vertical, -1);
-        let tooltip_width = tooltip_width.max(1);
-        let tooltip_height = tooltip_height.max(1);
+        let (tooltip_width, tooltip_height) = tooltip_size(
+            &self.frame,
+            &self.label,
+            geometry.width() - 2 * SCREEN_PADDING,
+        );
+        self.window.set_default_size(tooltip_width, tooltip_height);
 
         let target_x = root_x as f32 + bounds.x();
         let target_width = bounds.width();
@@ -488,6 +490,22 @@ impl TooltipState {
         self.window.set_margin(Edge::Left, left);
         self.window.set_margin(Edge::Top, top);
     }
+}
+
+fn tooltip_size(frame: &gtk::Box, label: &gtk::Label, max_width: i32) -> (i32, i32) {
+    let (_, frame_width, _, _) = frame.measure(gtk::Orientation::Horizontal, -1);
+    let (_, label_width, _, _) = label.measure(gtk::Orientation::Horizontal, -1);
+    let padding = (frame_width - label_width).max(0);
+    let available_width = label_width.min((max_width - padding).max(1));
+    let (_, label_height, _, _) = label.measure(gtk::Orientation::Vertical, available_width);
+
+    // GTK compacts wrapped labels to the width needed at their final height.
+    // Use that same width for the window, otherwise a horizontal box keeps
+    // its original natural width and leaves empty space after the label.
+    let (_, wrapped_width, _, _) = label.measure(gtk::Orientation::Horizontal, label_height);
+    let width = (wrapped_width.min(available_width) + padding).max(1);
+    let (_, height, _, _) = frame.measure(gtk::Orientation::Vertical, width);
+    (width, height.max(1))
 }
 
 fn tooltip_anchor_bottom(

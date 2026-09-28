@@ -2809,7 +2809,7 @@ fn system_monitor_toggle(controller: &Rc<SystemMonitorController>) -> gtk::Toggl
     button.add_css_class("wallpaper-refresh-button");
     button.add_css_class("wallpaper-feature-button");
     button.set_focus_on_click(false);
-    button.set_tooltip_text(Some("Enable or disable system monitoring"));
+    wallpaper_feature_tooltip(&button, "Show system monitor", "Hide system monitor");
 
     let icon = gtk::Label::new(Some(ICON_SYSTEM_MONITOR));
     icon.add_css_class("wallpaper-refresh-icon");
@@ -2856,6 +2856,7 @@ fn audio_spectrum_toggle(controller: &Rc<AudioSpectrumController>) -> gtk::Toggl
     button.add_css_class("wallpaper-refresh-button");
     button.add_css_class("wallpaper-feature-button");
     button.set_focus_on_click(false);
+    wallpaper_feature_tooltip(&button, "Show equalizer", "Hide equalizer");
 
     let icon = gtk::Label::new(Some(ICON_EQUALIZER));
     icon.add_css_class("wallpaper-refresh-icon");
@@ -2905,6 +2906,11 @@ fn bar_feature_toggle(
     button.add_css_class("wallpaper-refresh-button");
     button.add_css_class("wallpaper-feature-button");
     button.set_focus_on_click(false);
+    let (show, hide) = match feature {
+        BarFeature::Player => ("Show player", "Hide player"),
+        BarFeature::Workspace => ("Show workspaces", "Hide workspaces"),
+    };
+    wallpaper_feature_tooltip(&button, show, hide);
 
     let icon = gtk::Label::new(None);
     icon.add_css_class("wallpaper-refresh-icon");
@@ -2955,6 +2961,14 @@ fn bar_feature_toggle(
     button
 }
 
+fn wallpaper_feature_tooltip(button: &gtk::ToggleButton, show: &'static str, hide: &'static str) {
+    let update = move |button: &gtk::ToggleButton| {
+        button.set_bar_tooltip_text(Some(if button.is_active() { hide } else { show }));
+    };
+    update(button);
+    button.connect_active_notify(update);
+}
+
 fn random_menu_button(controller: &Rc<WallpaperController>) -> gtk::MenuButton {
     let button = gtk::MenuButton::new();
     button.add_css_class("wallpaper-random-button");
@@ -2970,15 +2984,26 @@ fn random_menu_button(controller: &Rc<WallpaperController>) -> gtk::MenuButton {
     popover.set_autohide(true);
     popover.set_position(gtk::PositionType::Bottom);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
     content.add_css_class("wallpaper-random-panel");
 
     let title = gtk::Label::new(Some("Random wallpapers"));
     title.add_css_class("wallpaper-random-title");
     title.set_xalign(0.0);
 
-    let now_button = gtk::Button::with_label("Change now");
+    let now_button = gtk::Button::new();
     now_button.add_css_class("wallpaper-random-now");
+    let now_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let now_icon = gtk::Label::new(Some(ICON_SHUFFLE));
+    now_icon.add_css_class("wallpaper-random-action-icon");
+    let now_label = gtk::Label::new(Some("Change now"));
+    now_label.set_xalign(0.0);
+    now_row.append(&now_icon);
+    now_row.append(&now_label);
+    now_button.set_child(Some(&now_row));
+
+    let divider = gtk::Separator::new(gtk::Orientation::Horizontal);
+    divider.add_css_class("wallpaper-random-divider");
 
     let (enabled_value, interval_value) = controller.random_config();
     let enabled = gtk::ToggleButton::new();
@@ -3011,17 +3036,21 @@ fn random_menu_button(controller: &Rc<WallpaperController>) -> gtk::MenuButton {
     );
     interval.add_css_class("wallpaper-random-interval");
     interval.set_numeric(true);
+    interval.set_width_chars(3);
+    interval.set_max_width_chars(4);
     interval.set_value(f64::from(interval_value));
     interval.set_sensitive(enabled_value);
     let syncing = Rc::new(Cell::new(false));
 
     let minutes_label = gtk::Label::new(Some("min"));
+    minutes_label.add_css_class("wallpaper-random-unit");
     interval_row.append(&every_label);
     interval_row.append(&interval);
     interval_row.append(&minutes_label);
 
     content.append(&title);
     content.append(&now_button);
+    content.append(&divider);
     content.append(&enabled);
     content.append(&interval_row);
     popover.set_child(Some(&content));

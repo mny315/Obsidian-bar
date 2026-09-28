@@ -1332,7 +1332,7 @@ impl MonitorLayout {
         self.settings.replace(settings.clone());
         if self.applied_scale.replace(settings.scale_milli) != settings.scale_milli {
             self.scale_provider.load_from_data(&format!(
-                ".system-monitor-body {{ font-size: {:.2}px; }}",
+                ".system-monitor-body, .system-monitor-settings-surface {{ font-size: {:.2}px; }}",
                 11.0 * f64::from(settings.scale_milli) / 1000.0
             ));
             self.root
@@ -2772,7 +2772,7 @@ struct MonitorRuntime {
     drag_start_y: Cell<i32>,
     hide_generation: Generation,
     panel_width: Cell<i32>,
-    scale_geometry: Cell<Option<(i32, i32, i32)>>,
+    adjusting_scale: Cell<bool>,
 }
 
 impl MonitorRuntime {
@@ -2815,11 +2815,15 @@ impl MonitorRuntime {
     fn apply_size(&self) {
         let geometry = self.geometry();
         let (min_height, max_height) = geometry.height_limits();
-        let frozen = self.scale_geometry.get();
         let settings_open =
             self.settings_reveal.reveals_child() || self.settings_reveal.is_child_revealed();
         let settings_width = if settings_open {
-            SETTINGS_PANEL_WIDTH + 1 + PANEL_EDGE_MARGIN
+            // Larger settings fonts may need more than the default 330 px.
+            self.settings_reveal
+                .child()
+                .map(|surface| surface.measure(gtk::Orientation::Horizontal, -1).0)
+                .unwrap_or(SETTINGS_PANEL_WIDTH)
+                + PANEL_EDGE_MARGIN
         } else {
             0
         };
@@ -2832,10 +2836,7 @@ impl MonitorRuntime {
             .max(header_width)
             .max(PANEL_MIN_WIDTH)
             .min(maximum_width);
-        let width = frozen.map_or_else(
-            || geometry.panel_width.clamp(minimum_width, maximum_width),
-            |(width, _, _)| width.min(maximum_width),
-        );
+        let width = geometry.panel_width.clamp(minimum_width, maximum_width);
         self.panel_width.set(width);
         self.card.set_size_request(width, -1);
         let (_, header_height, _, _) = self.header.measure(gtk::Orientation::Vertical, width);
@@ -2843,17 +2844,12 @@ impl MonitorRuntime {
         // bottom padding. A saved height must not hide any of that content.
         let minimum_height =
             (header_height + self.layout.natural_height(width)).clamp(min_height, max_height);
-        let height = frozen.map_or_else(
-            || {
-                self.requested_height
-                    .get()
-                    .unwrap_or(minimum_height)
-                    .clamp(minimum_height, max_height)
-            },
-            |(_, height, _)| height.min(max_height),
-        );
-        // Scrolling is only necessary when the content exceeds the screen (or
-        // temporarily while the settings are held still during a slider drag).
+        let height = self
+            .requested_height
+            .get()
+            .unwrap_or(minimum_height)
+            .clamp(minimum_height, max_height);
+        // Scrolling is only necessary when the content exceeds the screen.
         self.scroller.set_propagate_natural_height(false);
         self.scroller.set_min_content_height(1);
         self.scroller.set_max_content_height(-1);
@@ -2864,20 +2860,14 @@ impl MonitorRuntime {
             (minimum_height, max_height),
             natural,
         );
-        let mut height = natural.max(drawer::TAIL_TOP + drawer::TAIL_HEIGHT);
-        if let Some((_, fixed_height, _)) = frozen {
-            height = fixed_height.min(max_height);
-        }
+        let height = natural.max(drawer::TAIL_TOP + drawer::TAIL_HEIGHT);
         let settings_height = (height - SETTINGS_PANEL_PADDING * 2).max(1);
         self.settings_scroller.set_min_content_height(-1);
         self.settings_scroller
             .set_max_content_height(settings_height);
         self.settings_scroller
             .set_min_content_height(settings_height);
-        let y = frozen.map_or_else(
-            || geometry.clamp_y(self.requested_y.get(), height),
-            |(_, _, y)| geometry.clamp_y(y, height),
-        );
+        let y = geometry.clamp_y(self.requested_y.get(), height);
         self.y.set(y);
         self.window.set_default_size(1, height);
         self.window.set_margin(Edge::Top, y);
@@ -2944,7 +2934,7 @@ impl MonitorRuntime {
             || self.hovered.get()
             || self.hotspot_hovered.get()
             || self.dragging.get()
-            || self.scale_geometry.get().is_some()
+            || self.adjusting_scale.get()
             || self.settings_hovered.get()
             || self.settings_panel.is_interacting()
     }
@@ -2952,7 +2942,7 @@ impl MonitorRuntime {
     fn keep_settings_open(&self) -> bool {
         self.settings_hovered.get()
             || self.dragging.get()
-            || self.scale_geometry.get().is_some()
+            || self.adjusting_scale.get()
             || self.settings_panel.is_interacting()
     }
 
@@ -3218,7 +3208,7 @@ impl SystemMonitorView {
             drag_start_y: Cell::new(0),
             hide_generation: Generation::default(),
             panel_width: Cell::new(geometry.panel_width),
-            scale_geometry: Cell::new(None),
+            adjusting_scale: Cell::new(false),
         });
         runtime.install_drag(&hotspot, controller);
         {
@@ -3278,26 +3268,25 @@ impl SystemMonitorView {
             &runtime.settings_panel.hide_delay,
             &runtime.settings_panel.interval,
         ] {
-            // Keep the settings stationary under the pointer while the slider
-            // changes dimensions or font metrics. Apply outer size on release.
+            // Keep the panel open while dragging, but let both dimensions
+            // preview every value change before the pointer is released.
             let events = gtk::EventControllerLegacy::new();
             events.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let pressed = Rc::new(Cell::new(false));
+            let active = Rc::clone(&pressed);
             let weak = Rc::downgrade(&runtime);
             events.connect_event(move |_, event| {
                 if let Some(runtime) = weak.upgrade() {
                     match event.event_type() {
                         gdk::EventType::ButtonPress | gdk::EventType::TouchBegin => {
-                            runtime.scale_geometry.set(Some((
-                                runtime.panel_width.get(),
-                                runtime.surface.height().max(1),
-                                runtime.y.get(),
-                            )));
+                            active.set(true);
+                            runtime.adjusting_scale.set(true);
                             runtime.sync_reveal();
                         }
                         gdk::EventType::ButtonRelease
                         | gdk::EventType::TouchEnd
                         | gdk::EventType::TouchCancel
-                            if runtime.scale_geometry.take().is_some() =>
+                            if active.replace(false) && runtime.adjusting_scale.replace(false) =>
                         {
                             runtime.apply_size();
                             runtime.sync_reveal();
@@ -3311,7 +3300,8 @@ impl SystemMonitorView {
             let weak = Rc::downgrade(&runtime);
             slider.connect_unmap(move |_| {
                 if let Some(runtime) = weak.upgrade()
-                    && runtime.scale_geometry.take().is_some()
+                    && pressed.replace(false)
+                    && runtime.adjusting_scale.replace(false)
                 {
                     runtime.apply_size();
                 }
@@ -5155,6 +5145,17 @@ mod tests {
         runtime.set_settings_open(true);
         runtime.settings_hovered.set(true);
         pump(300);
+        let adjustments = runtime
+            .settings_panel
+            .root
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Expander>()
+            .unwrap();
+        adjustments.set_expanded(true);
+        pump(200);
         runtime
             .settings_panel
             .height
@@ -5168,6 +5169,90 @@ mod tests {
         assert_monitor_height_fits(runtime);
         controller.set_dimensions(364, 650, SCALE_MILLI_DEFAULT);
         pump(50);
+        // Exercise value-changed with the pointer still held: releasing the
+        // drag must not be necessary to preview either growing or shrinking.
+        let before_drag = runtime.window.height();
+        runtime.adjusting_scale.set(true);
+        for height in [before_drag + 120, before_drag + 60, before_drag] {
+            runtime.settings_panel.height.set_value(f64::from(height));
+            pump(100);
+            assert!(runtime.adjusting_scale.get());
+            assert_eq!(runtime.card.height(), height, "height previews during drag");
+            assert_eq!(
+                runtime.window.height(),
+                height,
+                "outer surface previews during drag"
+            );
+            assert_monitor_height_fits(runtime);
+        }
+        runtime.adjusting_scale.set(false);
+        runtime.apply_size();
+        pump(50);
+        assert_eq!(
+            runtime.window.height(),
+            before_drag,
+            "release must not change the preview"
+        );
+
+        let before_width = runtime.card.width();
+        let settings_width = runtime.window.width() - before_width;
+        runtime.adjusting_scale.set(true);
+        for width in [before_width + 120, before_width + 60, before_width] {
+            runtime.settings_panel.width.set_value(f64::from(width));
+            pump(100);
+            assert!(runtime.adjusting_scale.get());
+            assert_eq!(runtime.card.width(), width, "width previews during drag");
+            assert_eq!(runtime.window.width(), width + settings_width);
+            assert_monitor_text_fits(runtime.card.upcast_ref());
+        }
+        runtime.adjusting_scale.set(false);
+        runtime.apply_size();
+        pump(50);
+        assert_eq!(runtime.card.width(), before_width);
+
+        // GTK applies CSS font attributes to label layouts; a bare Box's
+        // default Pango context is not a measure of the rendered text.
+        let text_height = |label: &gtk::Label| label.layout().pixel_size().1;
+        let settings_text = [
+            runtime
+                .settings_panel
+                .root
+                .first_child()
+                .unwrap()
+                .first_child()
+                .unwrap()
+                .next_sibling()
+                .unwrap()
+                .downcast::<gtk::Label>()
+                .unwrap(),
+            runtime.settings_panel.groups.borrow()[&MonitorSection::Cpu]
+                .meta
+                .clone(),
+            runtime
+                .settings_panel
+                .width
+                .parent()
+                .unwrap()
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Label>()
+                .unwrap(),
+        ];
+        let original_fonts = settings_text.iter().map(text_height).collect::<Vec<_>>();
+        runtime.settings_panel.scale.set_value(22.0);
+        pump(200);
+        assert_eq!(controller.settings().scale_milli, 2000);
+        for (widget, original) in settings_text.iter().zip(original_fonts) {
+            assert!(
+                (text_height(widget) - original * 2).abs() <= 3,
+                "settings text follows the monitoring font scale: {} -> {}",
+                original,
+                text_height(widget)
+            );
+        }
+        assert!(runtime.window.width() <= monitor.geometry().width());
+        controller.set_dimensions(364, 650, SCALE_MILLI_DEFAULT);
+        pump(200);
         let height = runtime.window.height();
         let panel = &runtime.settings_panel;
         let width = runtime.window.width();

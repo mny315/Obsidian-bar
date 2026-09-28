@@ -283,13 +283,13 @@ button.system-monitor-settings-pin:checked:hover {
 
 .system-monitor-settings-adjustments > title {
   min-height: 28px;
-  font-size: 12px;
+  font-size: 1.09em;
   font-weight: 500;
 }
 
 .system-monitor-settings-slider-row .system-monitor-settings-section-title {
   margin: 0;
-  font-size: 11px;
+  font-size: 1em;
   font-weight: 400;
 }
 
@@ -299,12 +299,12 @@ button.system-monitor-settings-pin:checked:hover {
 
 .system-monitor-settings-icon {
   min-width: 20px;
-  font-size: 18px;
+  font-size: 1.64em;
   opacity: 0.92;
 }
 
 .system-monitor-settings-title {
-  font-size: 15px;
+  font-size: 1.36em;
   font-weight: 600;
 }
 
@@ -317,7 +317,7 @@ button.system-monitor-settings-pin:checked:hover {
 
 .system-monitor-settings-section-title {
   margin: 0 2px;
-  font-size: 12px;
+  font-size: 1.09em;
   font-weight: 600;
   opacity: 0.76;
 }
@@ -333,12 +333,12 @@ button.system-monitor-settings-pin:checked:hover {
 }
 
 .system-monitor-settings-row-title {
-  font-size: 12px;
+  font-size: 1.09em;
   font-weight: 500;
 }
 
 .system-monitor-settings-row-meta {
-  font-size: 10px;
+  font-size: 0.91em;
   opacity: 0.58;
 }
 
@@ -379,7 +379,7 @@ button.system-monitor-settings-expand:focus-visible {
 .system-monitor-settings-name entry,
 .system-monitor-settings-name label {
   min-width: 0;
-  font-size: 11px;
+  font-size: 1em;
 }
 
 .system-monitor-settings-name entry {
@@ -492,7 +492,7 @@ button.system-monitor-settings-metric:checked,
 button.system-monitor-settings-metric:checked:focus {
   min-height: 28px;
   padding: 4px 6px;
-  font-size: 11px;
+  font-size: 1em;
   background: transparent;
 }
 
@@ -507,7 +507,7 @@ button.system-monitor-settings-metric:not(:checked) {
 }
 
 .system-monitor-settings-button-icon {
-  font-size: 15px;
+  font-size: 1.36em;
 }
 
 .audio-spectrum-canvas {
@@ -1165,8 +1165,10 @@ menubutton.wallpaper-random-button button.toggle:checked {
 }
 
 popover.wallpaper-random-popover,
+popover.wallpaper-random-popover.background,
 popover.wallpaper-random-popover > arrow {
   background: transparent;
+  background-color: transparent;
   background-image: none;
   border: none;
   box-shadow: none;
@@ -1176,8 +1178,11 @@ popover.wallpaper-random-popover > contents {
   padding: 10px;
   color: @fg;
   background: @popup_surface_bg;
+  background-color: @popup_surface_bg;
+  background-image: none;
   border: 1px solid @popup_surface_border;
-  border-radius: 14px;
+  border-radius: 18px;
+  background-clip: padding-box;
   box-shadow: none;
 }
 
@@ -1188,60 +1193,56 @@ popover.wallpaper-random-popover > arrow {
 }
 
 .wallpaper-random-panel {
-  min-width: 190px;
+  min-width: 218px;
+  font-size: 13px;
 }
 
 .wallpaper-random-title {
-  font-size: 14px;
+  margin: 2px 8px 6px;
+  font-size: 13px;
   font-weight: 600;
+  opacity: 0.78;
 }
 
 button.wallpaper-random-now,
-button.wallpaper-random-now:focus {
-  min-height: 30px;
-  padding: 0 10px;
+button.wallpaper-random-now:focus,
+button.wallpaper-random-toggle,
+button.wallpaper-random-toggle:focus {
+  min-height: 32px;
+  padding: 0 8px;
   border-radius: 9px;
-  background: @soft_overlay_08;
-  border: 1px solid @soft_overlay_16;
+  color: @fg;
+  background: transparent;
+  background-image: none;
+  border: none;
   box-shadow: none;
   outline: none;
 }
 
 button.wallpaper-random-now:hover,
-button.wallpaper-random-now:focus-visible {
-  background: @soft_overlay_12;
-}
-
-button.wallpaper-random-now:active {
-  background: @soft_overlay_18;
-}
-
-button.wallpaper-random-toggle,
-button.wallpaper-random-toggle:focus {
-  min-height: 32px;
-  padding: 0 9px;
-  border-radius: 9px;
-  color: @fg;
-  background: @soft_overlay_09;
-  background-image: none;
-  border: 1px solid @soft_overlay_12;
-  box-shadow: none;
-  outline: none;
-}
-
+button.wallpaper-random-now:focus-visible,
 button.wallpaper-random-toggle:hover,
 button.wallpaper-random-toggle:focus-visible {
-  background: @soft_overlay_12;
-  border-color: @soft_overlay_16;
+  background: @hover_bg;
 }
 
-button.wallpaper-random-toggle:active,
-button.wallpaper-random-toggle:checked {
-  color: @fg;
-  background: @soft_overlay_16;
+button.wallpaper-random-now:active,
+button.wallpaper-random-toggle:active {
+  background: @active_bg;
+}
+
+.wallpaper-random-action-icon {
+  min-width: 16px;
+  font-size: 14px;
+  opacity: 0.82;
+}
+
+separator.wallpaper-random-divider {
+  min-height: 1px;
+  margin: 4px 8px;
+  background: @soft_overlay_09;
   background-image: none;
-  border-color: @soft_overlay_18;
-  box-shadow: none;
+  border: none;
 }
 
 .wallpaper-random-toggle-label {
@@ -1253,27 +1254,61 @@ button.wallpaper-random-toggle:checked {
   padding: 2px 7px;
   border-radius: 999px;
   color: alpha(@fg,0.62);
-  background: @soft_overlay_12;
+  background: @soft_overlay_06;
   font-size: 11px;
   font-weight: 600;
 }
 
 button.wallpaper-random-toggle:checked .wallpaper-random-toggle-state {
   color: @fg;
-  background: @soft_overlay_18;
+  background: @accent_overlay_26;
 }
 
 .wallpaper-random-interval-row {
   min-height: 30px;
+  margin: 2px 8px 4px;
+}
+
+.wallpaper-random-unit {
+  opacity: 0.62;
 }
 
 spinbutton.wallpaper-random-interval {
-  min-width: 72px;
+  min-width: 0;
   min-height: 28px;
   border-radius: 8px;
-  background: @soft_overlay_08;
-  border: 1px solid @soft_overlay_16;
+  color: @fg;
+  background: @popup_list_bg;
+  background-image: none;
+  border: 1px solid @soft_overlay_12;
   box-shadow: none;
+}
+
+spinbutton.wallpaper-random-interval text,
+spinbutton.wallpaper-random-interval button {
+  min-width: 20px;
+  min-height: 26px;
+  padding: 0 4px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 7px;
+  box-shadow: none;
+  outline: none;
+}
+
+spinbutton.wallpaper-random-interval button:hover,
+spinbutton.wallpaper-random-interval button:focus-visible {
+  background: @hover_bg;
+}
+
+spinbutton.wallpaper-random-interval button:active {
+  background: @active_bg;
+}
+
+spinbutton.wallpaper-random-interval:focus-within {
+  border-color: @popup_surface_border;
 }
 
 spinbutton.wallpaper-random-interval:disabled {
@@ -2073,9 +2108,9 @@ scale.slider-control.system-monitor-settings-scale:focus-visible slider {
 }
 
 scale.system-monitor-settings-scale value {
-  min-width: 44px;
+  min-width: 4em;
   color: @fg;
-  font-size: 11px;
+  font-size: 1em;
   font-weight: 600;
   opacity: 0.85;
 }
