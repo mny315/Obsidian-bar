@@ -119,8 +119,13 @@ impl Bar {
 
         let tooltip = BarTooltip::new(application, monitor);
         let keyboard = KeyboardIndicator::new(initial_layout);
-        let player =
-            PlayerIndicator::new(dependencies.player_controller, dependencies.bar_features);
+        let player = PlayerIndicator::new(
+            application,
+            &window,
+            monitor,
+            dependencies.player_controller,
+            dependencies.bar_features,
+        );
         let wallpaper = WallpaperIndicator::new(
             application,
             &window,

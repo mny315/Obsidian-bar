@@ -236,3 +236,80 @@ fn local_clock_text() -> String {
         now.day_of_month(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widgets::test_support::{capture_if_requested, pump};
+    use gtk4_layer_shell::{Layer, LayerShell};
+
+    #[test]
+    #[ignore = "requires a GTK display and Wayland layer-shell; run alone"]
+    fn calendar_uses_theme_colors_and_animates_both_directions() {
+        gtk::init().unwrap();
+        let display = gdk::Display::default().unwrap();
+        let css = gtk::CssProvider::new();
+        css.connect_parsing_error(|_, _, error| panic!("calendar CSS: {error}"));
+        css.load_from_data(include_str!("../../assets/window.css"));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        let application = gtk::Application::builder()
+            .application_id("dev.obsidian.CalendarAudit")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let monitor = display
+            .monitors()
+            .item(0)
+            .unwrap()
+            .downcast::<gdk::Monitor>()
+            .unwrap();
+        let bar = build_bar_popup_left(
+            &application,
+            &monitor,
+            "obsidian-calendar-audit",
+            "bar-window",
+        );
+        bar.set_layer(Layer::Overlay);
+        let clock = ClockIndicator::new(&application, &bar, &monitor);
+        let controller = &clock._controller;
+        controller.popup.set_layer(Layer::Overlay);
+        bar.set_child(Some(clock.widget()));
+        bar.present();
+        pump(150);
+        clock.widget().emit_clicked();
+        pump(350);
+        assert!(controller.popup_reveal.0.child.opacity() > 0.99);
+
+        fn check_labels(widget: &gtk::Widget) -> usize {
+            let mut count = 0;
+            if widget.is::<gtk::Label>() {
+                let color = widget.color();
+                assert!(
+                    color.red() > 0.9 && color.green() > 0.9 && color.blue() > 0.9,
+                    "calendar text must inherit the light foreground: {color}"
+                );
+                count += 1;
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                count += check_labels(&widget);
+                child = widget.next_sibling();
+            }
+            count
+        }
+        assert!(check_labels(&controller.popup_reveal.0.child) >= 42);
+        capture_if_requested(&controller.popup, "calendar");
+        clock.dismiss();
+        assert!(
+            controller.popup.is_visible(),
+            "closing must animate before unmapping"
+        );
+        pump(250);
+        assert!(!controller.popup.is_visible());
+        bar.destroy();
+    }
+}

@@ -66,7 +66,7 @@ impl GpuRequest {
     }
 }
 
-pub(super) fn metric_id(device: &str, metric: &str) -> String {
+fn metric_id(device: &str, metric: &str) -> String {
     format!("gpu@{device}:{metric}")
 }
 

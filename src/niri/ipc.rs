@@ -50,6 +50,7 @@ const KNOWN_LAYOUTS: &[(&[&str], &str)] = &[
 
 #[derive(Debug, Clone)]
 pub enum Update {
+    Disconnected,
     KeyboardLayout(String),
     Windows(Vec<Window>),
     Workspaces(Vec<Workspace>),
@@ -158,6 +159,10 @@ fn listen_for_events(
             Ok(()) if stop.load(Ordering::Acquire) || sender.is_closed() => break,
             Ok(()) => tracing::warn!("niri event stream closed; reconnecting"),
             Err(error) => tracing::debug!(%error, "niri event stream unavailable; retrying"),
+        }
+
+        if stop.load(Ordering::Acquire) || sender.send_blocking(Update::Disconnected).is_err() {
+            break;
         }
 
         thread::park_timeout(RECONNECT_DELAY);

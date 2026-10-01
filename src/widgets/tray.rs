@@ -1369,6 +1369,14 @@ fn build_menu_box(
     root_popover: &gtk::Popover,
 ) -> gtk::Box {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let has_indicators = nodes.iter().any(|node| {
+        node.visible
+            && node.item_type != "separator"
+            && (!node.toggle_type.is_empty() || node.toggle_state > 0)
+    });
+    let has_icons = nodes
+        .iter()
+        .any(|node| node.visible && node.item_type != "separator" && node.icon_name.is_some());
     for node in nodes.iter().filter(|node| node.visible) {
         if node.item_type == "separator" {
             content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -1379,7 +1387,12 @@ fn build_menu_box(
             let menu_button = gtk::MenuButton::new();
             menu_button.add_css_class("tray-menu-row");
             menu_button.set_sensitive(node.enabled);
-            menu_button.set_child(Some(&menu_row_content(node, true)));
+            menu_button.set_child(Some(&menu_row_content(
+                node,
+                true,
+                has_indicators,
+                has_icons,
+            )));
 
             let submenu = gtk::Popover::new();
             submenu.add_css_class("tray-menu-popover-window");
@@ -1397,7 +1410,12 @@ fn build_menu_box(
         let button = gtk::Button::new();
         button.add_css_class("tray-menu-row");
         button.set_sensitive(node.enabled);
-        button.set_child(Some(&menu_row_content(node, false)));
+        button.set_child(Some(&menu_row_content(
+            node,
+            false,
+            has_indicators,
+            has_icons,
+        )));
         let id = node.id;
         let proxy = proxy.clone();
         let weak_root_popover = root_popover.downgrade();
@@ -1452,33 +1470,46 @@ fn install_menu_reveal(popover: &gtk::Popover) {
     });
 }
 
-fn menu_row_content(node: &MenuNode, submenu: bool) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+fn menu_row_content(
+    node: &MenuNode,
+    submenu: bool,
+    has_indicators: bool,
+    has_icons: bool,
+) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_halign(gtk::Align::Fill);
     row.set_hexpand(true);
 
-    let indicator = gtk::Label::new(None);
-    indicator.add_css_class("tray-menu-indicator");
-    indicator.set_width_chars(1);
-    indicator.set_label(if node.toggle_state > 0 {
-        if node.toggle_type == "radio" {
-            "●"
+    // Reserve leading columns only when this menu uses them, and keep every
+    // label at the same left edge even when only some items have an icon.
+    if has_indicators {
+        let indicator = gtk::Label::new(None);
+        indicator.add_css_class("tray-menu-indicator");
+        indicator.set_width_chars(1);
+        indicator.set_label(if node.toggle_state > 0 {
+            if node.toggle_type == "radio" {
+                "●"
+            } else {
+                "✓"
+            }
         } else {
-            "✓"
-        }
-    } else {
-        ""
-    });
-    row.append(&indicator);
+            ""
+        });
+        row.append(&indicator);
+    }
 
-    if let Some(icon_name) = node.icon_name.as_deref() {
-        let icon = gtk::Image::from_icon_name(icon_name);
+    if has_icons {
+        let icon = gtk::Image::new();
+        icon.set_icon_name(node.icon_name.as_deref());
         icon.set_pixel_size(16);
+        icon.set_size_request(16, -1);
         row.append(&icon);
     }
 
     let label = gtk::Label::new(Some(&normalize_menu_label(&node.label)));
     label.add_css_class("tray-menu-label");
     label.set_xalign(0.0);
+    label.set_halign(gtk::Align::Start);
     label.set_hexpand(true);
     row.append(&label);
 

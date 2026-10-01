@@ -83,10 +83,24 @@ window.system-monitor-hotspot-window.background,
   opacity: 0.76;
 }
 
-.system-monitor-tail {
+button.system-monitor-tail {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: none;
   background: alpha(@theme_bg_color,0.14);
+  background-image: none;
+  box-shadow: none;
   border-radius: 7px 0 0 7px;
   transition: background-color 160ms ease;
+}
+
+button.system-monitor-tail:hover {
+  background: @hover_bg;
+}
+
+button.system-monitor-tail:active {
+  background: @active_bg;
 }
 
 .system-monitor-tail-grip {
@@ -747,12 +761,26 @@ window.calendar-popup-window box.widget-popup-frame.calendar-popover-window,
   box-shadow: none;
 }
 
-.calendar-widget {
+calendar.calendar-widget,
+calendar.calendar-widget.view {
   padding: 2px;
   color: @fg;
   background: transparent;
+  background-image: none;
   border: none;
+  box-shadow: none;
   font-size: 13px;
+}
+
+calendar.calendar-widget > header,
+calendar.calendar-widget > grid,
+calendar.calendar-widget label {
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  text-shadow: none;
 }
 
 .calendar-widget button,
@@ -862,21 +890,21 @@ button.keyboard-button:focus-visible {
   outline-offset: -2px;
 }
 
-.pinned-player-container {
+.player-container {
   min-height: 30px;
   min-width: 0;
   margin-left: 3px;
   padding: 0 4px;
 }
 
-.pinned-player-inline,
+.player-inline,
 .player-meta-revealer,
-.pinned-player-meta {
+.player-meta {
   background: transparent;
   min-width: 0;
 }
 
-.pinned-player-controls {
+.player-controls {
   min-width: 0;
   margin-right: 3px;
 }
@@ -937,6 +965,7 @@ button.player-main-button:hover {
 }
 
 button.player-source-button:active,
+button.player-source-button.player-popup-open,
 button.player-transport-button:active,
 button.player-main-button:active {
   background: @active_bg;
@@ -961,6 +990,110 @@ button.player-main-button:focus-visible {
   outline: 1px solid alpha(@theme_fg_color,0.42);
   outline-offset: -2px;
 }
+window.player-popup-window,
+window.player-popup-window.background {
+  padding: 0;
+  color: @fg;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+window.player-popup-window .player-source-frame {
+  min-width: 380px;
+  padding: 8px;
+  color: @fg;
+  background: @popup_surface_bg;
+  border: 1px solid @popup_surface_border;
+  border-radius: 18px;
+  box-shadow: none;
+}
+
+.player-sources-title {
+  margin: 4px 10px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+
+
+window.player-popup-window separator {
+  min-height: 1px;
+  margin: 3px 8px;
+  background: @popup_surface_border;
+}
+
+.player-source-row {
+  padding-right: 6px;
+  border-radius: 12px;
+}
+
+.player-source-row:hover {
+  background: @hover_bg;
+}
+
+.player-source-row.player-source-selected,
+button.player-source-automatic.player-source-selected {
+  background: @active_bg;
+}
+
+button.player-source-select,
+button.player-source-automatic,
+button.player-source-transport {
+  margin: 0;
+  padding: 6px 8px;
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 10px;
+  box-shadow: none;
+  outline: none;
+  text-shadow: none;
+}
+
+button.player-source-select,
+button.player-source-automatic {
+  min-height: 40px;
+}
+
+button.player-source-transport {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 2px;
+}
+
+button.player-source-automatic:hover,
+button.player-source-transport:hover {
+  background: @hover_bg;
+}
+
+button.player-source-select:focus-visible,
+button.player-source-automatic:focus-visible,
+button.player-source-transport:focus-visible {
+  outline: 1px solid alpha(@theme_fg_color,0.42);
+  outline-offset: -2px;
+}
+
+button.player-source-transport:disabled {
+  opacity: 0.45;
+}
+
+.player-source-mark {
+  min-width: 14px;
+  font-size: 13px;
+}
+
+.player-source-name {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.player-source-metadata {
+  font-size: 12px;
+  opacity: 0.72;
+}
+
 button.wallpaper-widget-trigger {
   min-width: 22px;
   min-height: 22px;
@@ -3217,7 +3350,7 @@ popover.tray-menu-popover-window > arrow {
   border: none;
 }
 
-popover.tray-menu-popover-window contents {
+popover.tray-menu-popover-window > contents {
   padding: 8px;
   color: @fg;
   background: @popup_surface_bg;
@@ -3229,9 +3362,9 @@ popover.tray-menu-popover-window contents {
   box-shadow: none;
 }
 
-popover.tray-menu-popover-window contents box,
-popover.tray-menu-popover-window contents label,
-popover.tray-menu-popover-window contents image {
+popover.tray-menu-popover-window > contents box,
+popover.tray-menu-popover-window > contents label,
+popover.tray-menu-popover-window > contents image {
   background: transparent;
   background-color: transparent;
   background-image: none;
@@ -3263,11 +3396,11 @@ popover.tray-menu-popover-window contents image {
   }
 }
 
-.tray-menu-popover-window.tray-menu-opening contents {
+.tray-menu-popover-window.tray-menu-opening > contents {
   animation: tray-menu-open-motion 220ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-popover.tray-submenu-popover-window.tray-menu-opening contents {
+popover.tray-submenu-popover-window.tray-menu-opening > contents {
   animation-name: tray-submenu-open-motion;
 }
 

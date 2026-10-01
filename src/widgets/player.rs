@@ -5,10 +5,14 @@ use std::{
     time::Duration,
 };
 
-use super::{bar_features::BarFeatureController, dbus::variant_value, tooltip::BarTooltipExt};
+use super::dbus::variant_value;
 use gio::prelude::*;
-use gtk::{glib, prelude::*};
+use gtk::glib;
 use tracing::{debug, warn};
+
+mod ui;
+pub use ui::PlayerIndicator;
+use ui::PlayerUi;
 
 const DBUS_NAME: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
@@ -20,194 +24,6 @@ const DBUS_TIMEOUT_MS: i32 = 1_000;
 const META_CHAR_LIMIT: usize = 80;
 const DBUS_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const DBUS_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
-
-const ICON_PREVIOUS: &str = "\u{f04ae}";
-const ICON_PLAY: &str = "\u{f040a}";
-const ICON_PAUSE: &str = "\u{f03e4}";
-const ICON_NEXT: &str = "\u{f04ad}";
-const ICON_SWITCH_SOURCE: &str = "\u{f04e1}";
-
-struct PlayerUi {
-    root: gtk::Box,
-    source: gtk::Button,
-    previous: gtk::Button,
-    play_pause: gtk::Button,
-    play_pause_icon: gtk::Label,
-    next: gtk::Button,
-    metadata: gtk::Button,
-    metadata_label: gtk::Label,
-    revealer: gtk::Revealer,
-    available: Cell<bool>,
-    enabled: Cell<bool>,
-    rendered: RefCell<Option<PlayerView>>,
-}
-
-impl PlayerUi {
-    fn new() -> Self {
-        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        root.add_css_class("section");
-        root.add_css_class("pinned-player-container");
-        root.set_valign(gtk::Align::Center);
-        root.set_visible(false);
-
-        let inline = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        inline.add_css_class("pinned-player-inline");
-        inline.set_valign(gtk::Align::Center);
-
-        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        controls.add_css_class("pinned-player-controls");
-        controls.set_valign(gtk::Align::Center);
-
-        let source = gtk::Button::new();
-        source.add_css_class("player-source-button");
-        source.set_bar_tooltip_text(Some("Switch media source"));
-        source.set_child(Some(&transport_icon(ICON_SWITCH_SOURCE)));
-        source.set_visible(false);
-
-        let previous = transport_button(ICON_PREVIOUS, "Previous track");
-
-        let play_pause_icon = transport_icon(ICON_PLAY);
-        let play_pause = gtk::Button::new();
-        play_pause.add_css_class("player-transport-button");
-        play_pause.add_css_class("player-transport-primary");
-        play_pause.set_bar_tooltip_text(Some("Play or pause"));
-        play_pause.set_child(Some(&play_pause_icon));
-
-        let next = transport_button(ICON_NEXT, "Next track");
-
-        previous.set_sensitive(false);
-        play_pause.set_sensitive(false);
-        next.set_sensitive(false);
-
-        controls.append(&source);
-        controls.append(&previous);
-        controls.append(&play_pause);
-        controls.append(&next);
-
-        let metadata_label = gtk::Label::new(None);
-        metadata_label.add_css_class("player-main-label");
-        metadata_label.set_xalign(0.0);
-        metadata_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-
-        let metadata = gtk::Button::new();
-        metadata.add_css_class("player-main-button");
-        metadata.set_child(Some(&metadata_label));
-
-        let meta_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        meta_box.add_css_class("pinned-player-meta");
-        meta_box.append(&metadata);
-
-        let revealer = gtk::Revealer::new();
-        revealer.add_css_class("player-meta-revealer");
-        revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
-        revealer.set_transition_duration(500);
-        revealer.set_reveal_child(false);
-        revealer.set_child(Some(&meta_box));
-
-        let motion = gtk::EventControllerMotion::new();
-        let reveal = revealer.clone();
-        motion.connect_enter(move |_, _, _| reveal.set_reveal_child(true));
-        let reveal = revealer.clone();
-        motion.connect_leave(move |_| reveal.set_reveal_child(false));
-        inline.add_controller(motion);
-
-        inline.append(&controls);
-        inline.append(&revealer);
-        root.append(&inline);
-
-        Self {
-            root,
-            source,
-            previous,
-            play_pause,
-            play_pause_icon,
-            next,
-            metadata,
-            metadata_label,
-            revealer,
-            available: Cell::new(false),
-            enabled: Cell::new(true),
-            rendered: RefCell::new(None),
-        }
-    }
-
-    fn set_enabled(&self, enabled: bool) {
-        self.enabled.set(enabled);
-        self.update_visibility();
-    }
-
-    fn update_visibility(&self) {
-        self.root
-            .set_visible(self.enabled.get() && self.available.get());
-    }
-
-    fn clear(&self) {
-        self.rendered.borrow_mut().take();
-        self.available.set(false);
-        self.update_visibility();
-        self.source.set_visible(false);
-        self.source.set_sensitive(false);
-        self.source.set_bar_tooltip_text(None);
-        self.previous.set_sensitive(false);
-        self.play_pause.set_sensitive(false);
-        self.next.set_sensitive(false);
-        self.metadata_label.set_label("");
-        self.metadata.set_bar_tooltip_text(None);
-        self.metadata.set_focusable(false);
-        self.revealer.set_reveal_child(false);
-    }
-
-    fn render(&self, view: &PlayerView) {
-        if self.rendered.borrow().as_ref() == Some(view) {
-            return;
-        }
-        self.rendered.replace(Some(view.clone()));
-        let can_switch_source = view.source_count > 1;
-        self.source.set_visible(can_switch_source);
-        self.source.set_sensitive(can_switch_source);
-        if can_switch_source {
-            self.source.set_bar_tooltip_text(Some(&format!(
-                "Current source: {}. Click to switch",
-                view.source_identity
-            )));
-        } else {
-            self.source.set_bar_tooltip_text(None);
-        }
-
-        self.play_pause_icon
-            .set_label(if view.status == PlaybackStatus::Playing {
-                ICON_PAUSE
-            } else {
-                ICON_PLAY
-            });
-
-        self.previous.set_sensitive(view.can_previous);
-        self.play_pause.set_sensitive(view.can_play_pause);
-        self.next.set_sensitive(view.can_next);
-
-        self.metadata_label.set_label(&view.display_metadata);
-        self.metadata.set_bar_tooltip_text(Some(&view.metadata));
-        self.metadata.set_focusable(view.can_raise);
-        self.available.set(true);
-        self.update_visibility();
-    }
-}
-
-fn transport_icon(glyph: &str) -> gtk::Label {
-    let label = gtk::Label::new(Some(glyph));
-    label.add_css_class("player-transport-icon");
-    label.set_xalign(0.5);
-    label.set_yalign(0.5);
-    label
-}
-
-fn transport_button(glyph: &str, tooltip: &str) -> gtk::Button {
-    let button = gtk::Button::new();
-    button.add_css_class("player-transport-button");
-    button.set_bar_tooltip_text(Some(tooltip));
-    button.set_child(Some(&transport_icon(glyph)));
-    button
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlaybackStatus {
@@ -314,22 +130,37 @@ impl PlayerHandle {
         }
     }
 
-    fn view(&self, source_count: usize) -> PlayerView {
+    fn view(&self, source_count: usize, automatic: bool) -> PlayerView {
         let status = self.playback_status();
         let capabilities = self.capabilities(status);
         let metadata = metadata_text(&self.player, &self.root);
         let display_metadata = truncate_text(&metadata, META_CHAR_LIMIT);
 
         PlayerView {
+            bus_name: self.bus_name.clone(),
+            automatic,
             status,
             source_count,
-            source_identity: self.identity(),
             can_previous: capabilities.previous,
             can_play_pause: capabilities.play_pause,
             can_next: capabilities.next,
             can_raise: capabilities.raise,
             metadata,
             display_metadata,
+        }
+    }
+
+    fn source_view(&self) -> PlayerSourceView {
+        let status = self.playback_status();
+        let capabilities = self.capabilities(status);
+        PlayerSourceView {
+            bus_name: self.bus_name.clone(),
+            identity: self.identity(),
+            metadata: metadata_text(&self.player, &self.root),
+            status,
+            can_play_pause: capabilities.play_pause,
+            can_previous: capabilities.previous,
+            can_next: capabilities.next,
         }
     }
 }
@@ -357,6 +188,32 @@ fn became_playing(previous: Option<PlayerSourceState>, current: PlayerSourceStat
     current.is_playing() && !previous.is_some_and(|state| state.is_playing())
 }
 
+fn preferred_source<'a>(
+    sources: &[(&'a str, PlayerSourceState)],
+    current: Option<&str>,
+    pinned: bool,
+) -> Option<&'a str> {
+    let selected = sources
+        .iter()
+        .find(|(bus, state)| Some(*bus) == current && state.selectable);
+    if let Some((bus, state)) = selected
+        && (pinned || state.is_playing())
+    {
+        return Some(bus);
+    }
+    sources
+        .iter()
+        .find(|(_, state)| state.is_playing())
+        .or(selected)
+        .or_else(|| {
+            sources
+                .iter()
+                .find(|(_, state)| state.selectable && state.status == PlaybackStatus::Paused)
+        })
+        .or_else(|| sources.iter().find(|(_, state)| state.selectable))
+        .map(|(bus, _)| *bus)
+}
+
 enum PlayerEvent {
     Discovered(Vec<String>),
     OwnerChanged {
@@ -380,15 +237,26 @@ fn enqueue_player_event(sender: &async_channel::Sender<PlayerEvent>, event: Play
 
 #[derive(Clone, PartialEq, Eq)]
 struct PlayerView {
+    bus_name: String,
+    automatic: bool,
     status: PlaybackStatus,
     source_count: usize,
-    source_identity: String,
     can_previous: bool,
     can_play_pause: bool,
     can_next: bool,
     can_raise: bool,
     metadata: String,
     display_metadata: String,
+}
+
+struct PlayerSourceView {
+    bus_name: String,
+    identity: String,
+    metadata: String,
+    status: PlaybackStatus,
+    can_play_pause: bool,
+    can_previous: bool,
+    can_next: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -417,6 +285,7 @@ struct PlayerState {
     next_request_id: u64,
     source_states: HashMap<String, PlayerSourceState>,
     active_bus: Option<String>,
+    pinned: bool,
     views: Vec<Weak<PlayerUi>>,
 }
 
@@ -593,7 +462,7 @@ impl PlayerState {
         self.players.push(player);
         self.players
             .sort_by(|left, right| left.bus_name.cmp(&right.bus_name));
-        if started_playing {
+        if started_playing && !self.pinned {
             self.active_bus = Some(bus_name);
         }
         self.refresh_views();
@@ -612,23 +481,22 @@ impl PlayerState {
         let previous = self.source_states.insert(bus_name.to_owned(), current);
         let started_playing = became_playing(previous, current);
 
-        if started_playing {
+        if started_playing && !self.pinned {
             self.active_bus = Some(bus_name.to_owned());
         }
 
         self.refresh_views();
     }
 
-    fn root_properties_changed(&mut self, bus_name: &str) {
-        if self.active_bus.as_deref() == Some(bus_name) {
-            self.refresh_views();
-        }
+    fn root_properties_changed(&mut self, _bus_name: &str) {
+        self.refresh_views();
     }
 
     fn refresh_views(&mut self) {
         self.prune_ownerless_players();
         self.ensure_active_bus();
         let view = self.current_view();
+        let sources = self.source_views();
 
         self.views.retain(|weak_ui| {
             let Some(ui) = weak_ui.upgrade() else {
@@ -636,7 +504,7 @@ impl PlayerState {
             };
 
             match view.as_ref() {
-                Some(view) => ui.render(view),
+                Some(view) => ui.render(view, &sources),
                 None => ui.clear(),
             }
             true
@@ -651,7 +519,7 @@ impl PlayerState {
         let view = self.current_view();
 
         match view.as_ref() {
-            Some(view) => ui.render(view),
+            Some(view) => ui.render(view, &self.source_views()),
             None => ui.clear(),
         }
     }
@@ -666,68 +534,62 @@ impl PlayerState {
         self.players
             .iter()
             .find(|player| player.bus_name == active_bus && player.is_selectable())
-            .map(|player| player.view(source_count))
+            .map(|player| player.view(source_count, !self.pinned))
+    }
+
+    fn source_views(&self) -> Vec<PlayerSourceView> {
+        self.players
+            .iter()
+            .filter(|player| player.is_selectable())
+            .map(PlayerHandle::source_view)
+            .collect()
     }
 
     fn ensure_active_bus(&mut self) {
-        let current_is_selectable = self.active_bus.as_deref().is_some_and(|active_bus| {
-            self.players
-                .iter()
-                .any(|player| player.bus_name == active_bus && player.is_selectable())
-        });
-
-        if !current_is_selectable {
-            self.active_bus = self.pick_initial_bus();
-        }
-    }
-
-    fn pick_initial_bus(&self) -> Option<String> {
-        if let Some(player) = self.first_selectable_with_status(PlaybackStatus::Playing) {
-            return Some(player.bus_name.clone());
-        }
-
-        if let Some(player) = self.first_selectable_with_status(PlaybackStatus::Paused) {
-            return Some(player.bus_name.clone());
-        }
-
-        if let Some(player) = self.players.iter().find(|player| player.is_selectable()) {
-            return Some(player.bus_name.clone());
-        }
-
-        None
-    }
-
-    fn cycle_active(&mut self, offset: isize) {
-        let selectable = self
+        let sources = self
             .players
             .iter()
-            .filter(|player| player.is_selectable())
-            .map(|player| player.bus_name.clone())
+            .map(|player| (player.bus_name.as_str(), player.source_state()))
             .collect::<Vec<_>>();
-
-        if selectable.len() < 2 {
-            return;
+        let next =
+            preferred_source(&sources, self.active_bus.as_deref(), self.pinned).map(str::to_owned);
+        if next != self.active_bus {
+            // A disappearing or uncontrollable pinned source returns to Auto.
+            self.pinned = false;
         }
+        self.active_bus = next;
+    }
 
-        self.ensure_active_bus();
-        let current_index = self
-            .active_bus
-            .as_deref()
-            .and_then(|active_bus| {
-                selectable
-                    .iter()
-                    .position(|bus_name| bus_name == active_bus)
-            })
-            .unwrap_or(0);
-        let next_index = (current_index as isize + offset).rem_euclid(selectable.len() as isize);
-        self.active_bus = Some(selectable[next_index as usize].clone());
+    fn select_source(&mut self, bus_name: Option<&str>) {
+        if let Some(bus_name) = bus_name {
+            if !self
+                .players
+                .iter()
+                .any(|player| player.bus_name == bus_name && player.is_selectable())
+            {
+                return;
+            }
+            self.active_bus = Some(bus_name.to_owned());
+        }
+        self.pinned = bus_name.is_some();
         self.refresh_views();
     }
 
-    fn first_selectable_with_status(&self, status: PlaybackStatus) -> Option<&PlayerHandle> {
-        self.players
+    fn cycle_source(&mut self) {
+        let sources = self
+            .players
             .iter()
-            .find(|player| player.is_selectable() && player.playback_status() == status)
+            .filter(|player| player.is_selectable())
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            return;
+        }
+        let index = sources
+            .iter()
+            .position(|player| Some(player.bus_name.as_str()) == self.active_bus.as_deref())
+            .map_or(0, |index| (index + 1) % sources.len());
+        let next = sources[index].bus_name.clone();
+        self.select_source(Some(&next));
     }
 
     fn prune_ownerless_players(&mut self) {
@@ -741,13 +603,16 @@ impl PlayerState {
     }
 
     fn call_active(&self, action: PlayerAction) {
-        let Some(active_bus) = self.active_bus.as_deref() else {
-            return;
-        };
+        if let Some(bus_name) = self.active_bus.as_deref() {
+            self.call_source(bus_name, action);
+        }
+    }
+
+    fn call_source(&self, bus_name: &str, action: PlayerAction) {
         let Some(player) = self
             .players
             .iter()
-            .find(|player| player.bus_name == active_bus)
+            .find(|player| player.bus_name == bus_name && player.has_owner())
         else {
             return;
         };
@@ -806,6 +671,7 @@ impl PlayerController {
             next_request_id: 0,
             source_states: HashMap::new(),
             active_bus: None,
+            pinned: false,
             views: Vec::new(),
         }));
 
@@ -904,28 +770,40 @@ fn initialize_player_manager(
                 );
             });
 
-            manager_proxy.call(
-                "ListNames",
-                None,
-                gio::DBusCallFlags::NONE,
-                DBUS_TIMEOUT_MS,
-                None::<&gio::Cancellable>,
-                move |result| {
-                    let names = match result {
-                        Ok(reply) => reply
-                            .get::<(Vec<String>,)>()
-                            .map(|(names,)| names)
-                            .unwrap_or_default(),
-                        Err(error) => {
-                            warn!(%error, "failed to enumerate MPRIS players");
-                            return;
-                        }
-                    };
-
-                    enqueue_player_event(&events_tx, PlayerEvent::Discovered(names));
-                },
-            );
+            discover_players(&manager_proxy, events_tx, 0);
             manager_slot.replace(Some(manager_proxy));
+        },
+    );
+}
+
+fn discover_players(
+    manager: &gio::DBusProxy,
+    events: async_channel::Sender<PlayerEvent>,
+    attempt: u32,
+) {
+    let weak_manager = manager.downgrade();
+    manager.call(
+        "ListNames",
+        None,
+        gio::DBusCallFlags::NONE,
+        DBUS_TIMEOUT_MS,
+        gio::Cancellable::NONE,
+        move |result| match result {
+            Ok(reply) => {
+                if let Some((names,)) = reply.get::<(Vec<String>,)>() {
+                    enqueue_player_event(&events, PlayerEvent::Discovered(names));
+                }
+            }
+            Err(error) => {
+                warn!(%error, "failed to enumerate MPRIS players; retrying");
+                glib::timeout_add_local_once(retry_delay(attempt), move || {
+                    if !events.is_closed()
+                        && let Some(manager) = weak_manager.upgrade()
+                    {
+                        discover_players(&manager, events, attempt.saturating_add(1));
+                    }
+                });
+            }
         },
     );
 }
@@ -952,74 +830,6 @@ fn retry_delay(attempt: u32) -> Duration {
     DBUS_RETRY_BASE_DELAY
         .saturating_mul(multiplier)
         .min(DBUS_RETRY_MAX_DELAY)
-}
-
-pub struct PlayerIndicator {
-    ui: Rc<PlayerUi>,
-}
-
-impl PlayerIndicator {
-    pub fn new(controller: &PlayerController, bar_features: &Rc<BarFeatureController>) -> Self {
-        let ui = Rc::new(PlayerUi::new());
-        connect_actions(&controller.state, &ui);
-        controller.state.borrow_mut().attach_view(&ui);
-
-        let weak_ui = Rc::downgrade(&ui);
-        bar_features.subscribe(move |state| {
-            let Some(ui) = weak_ui.upgrade() else {
-                return false;
-            };
-            ui.set_enabled(state.player_visible);
-            true
-        });
-
-        Self { ui }
-    }
-
-    pub fn widget(&self) -> &gtk::Box {
-        &self.ui.root
-    }
-
-    pub fn dismiss(&self) {
-        self.ui.revealer.set_reveal_child(false);
-    }
-}
-
-fn connect_actions(state: &Rc<RefCell<PlayerState>>, ui: &PlayerUi) {
-    let weak_state = Rc::downgrade(state);
-    ui.source.connect_clicked(move |_| {
-        if let Some(state) = weak_state.upgrade() {
-            state.borrow_mut().cycle_active(1);
-        }
-    });
-
-    let weak_state = Rc::downgrade(state);
-    ui.previous.connect_clicked(move |_| {
-        if let Some(state) = weak_state.upgrade() {
-            state.borrow().call_active(PlayerAction::Previous);
-        }
-    });
-
-    let weak_state = Rc::downgrade(state);
-    ui.play_pause.connect_clicked(move |_| {
-        if let Some(state) = weak_state.upgrade() {
-            state.borrow().call_active(PlayerAction::PlayPause);
-        }
-    });
-
-    let weak_state = Rc::downgrade(state);
-    ui.next.connect_clicked(move |_| {
-        if let Some(state) = weak_state.upgrade() {
-            state.borrow().call_active(PlayerAction::Next);
-        }
-    });
-
-    let weak_state = Rc::downgrade(state);
-    ui.metadata.connect_clicked(move |_| {
-        if let Some(state) = weak_state.upgrade() {
-            state.borrow().call_active(PlayerAction::Raise);
-        }
-    });
 }
 
 fn playback_status(proxy: &gio::DBusProxy) -> PlaybackStatus {
@@ -1102,45 +912,4 @@ fn property_bool(proxy: &gio::DBusProxy, name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{PlaybackStatus, PlayerSourceState, became_playing, truncate_text};
-
-    fn source(status: PlaybackStatus, selectable: bool) -> PlayerSourceState {
-        PlayerSourceState { status, selectable }
-    }
-
-    #[test]
-    fn activates_only_when_a_selectable_source_starts_playing() {
-        assert!(became_playing(
-            Some(source(PlaybackStatus::Paused, true)),
-            source(PlaybackStatus::Playing, true),
-        ));
-        assert!(became_playing(
-            Some(source(PlaybackStatus::Playing, false)),
-            source(PlaybackStatus::Playing, true),
-        ));
-
-        assert!(!became_playing(
-            Some(source(PlaybackStatus::Playing, true)),
-            source(PlaybackStatus::Playing, true),
-        ));
-        assert!(!became_playing(
-            Some(source(PlaybackStatus::Paused, true)),
-            source(PlaybackStatus::Playing, false),
-        ));
-    }
-
-    #[test]
-    fn newly_discovered_playing_source_is_an_activation_candidate() {
-        assert!(became_playing(None, source(PlaybackStatus::Playing, true),));
-        assert!(!became_playing(None, source(PlaybackStatus::Paused, true),));
-    }
-
-    #[test]
-    fn metadata_truncation_is_character_safe() {
-        assert_eq!(truncate_text("абвг", 3), "аб…");
-        assert_eq!(truncate_text("abc", 3), "abc");
-        assert_eq!(truncate_text("abc", 1), "…");
-        assert_eq!(truncate_text("abc", 0), "");
-    }
-}
+mod tests;

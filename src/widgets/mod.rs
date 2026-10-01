@@ -536,6 +536,9 @@ impl PopupReveal {
             self.reset_hidden();
             return;
         }
+        if !self.0.revealed.get() {
+            return;
+        }
 
         let generation = self.0.generation.bump();
         self.0.revealed.set(false);
@@ -785,6 +788,8 @@ pub mod clock;
 mod command;
 mod css_transition;
 mod dbus;
+#[cfg(test)]
+mod test_support;
 use css_transition::CssTransition;
 pub mod keyboard;
 pub mod launcher;

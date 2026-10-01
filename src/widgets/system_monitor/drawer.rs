@@ -1,9 +1,10 @@
+use super::{PANEL_EDGE_MARGIN, PANEL_MAX_WIDTH, PANEL_MIN_HEIGHT, PANEL_MIN_WIDTH};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
 };
 
-use gtk::{glib, prelude::*};
+use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, LayerShell};
 
 use super::super::{Generation, popup_animation_progress};
@@ -156,6 +157,16 @@ impl MonitorDrawer {
         self.revealed.get() && self.progress.get() == 1.0
     }
 
+    pub(super) fn is_revealed(&self) -> bool {
+        self.revealed.get()
+    }
+
+    pub(super) fn hide_immediately(&self) {
+        self.generation.bump();
+        self.revealed.set(false);
+        self.finish(false);
+    }
+
     pub(super) fn connect_settled(&self, callback: impl Fn() + 'static) {
         self.settled.replace(Some(Box::new(callback)));
     }
@@ -243,4 +254,61 @@ fn slide_margin(width: i32, progress: f64) -> f64 {
     // The hidden endpoint is immediately unmapped.
     let hidden = EDGE_TRIGGER_WIDTH - width.max(EDGE_TRIGGER_WIDTH);
     f64::from(hidden) + f64::from(RIGHT_MARGIN - hidden) * progress
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PanelGeometry {
+    pub(super) screen_width: i32,
+    pub(super) screen_height: i32,
+    pub(super) panel_width: i32,
+    pub(super) top_margin: i32,
+}
+
+impl PanelGeometry {
+    pub(super) fn for_monitor(monitor: &gdk::Monitor, requested_width: i32) -> Self {
+        let geometry = monitor.geometry();
+        let screen_width = geometry.width().max(1);
+        let screen_height = geometry.height().max(1);
+        let panel_width = requested_width
+            .clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH)
+            .min((screen_width - RIGHT_MARGIN).max(1));
+        Self {
+            screen_width,
+            screen_height,
+            panel_width,
+            top_margin: crate::ui::bar::BAR_VISIBLE_TOP_MARGIN
+                + crate::ui::bar::BAR_FALLBACK_HEIGHT
+                + PANEL_EDGE_MARGIN,
+        }
+    }
+
+    pub(super) fn height_limits(self) -> (i32, i32) {
+        let maximum = (self.screen_height - self.top_margin - PANEL_EDGE_MARGIN).max(1);
+        (PANEL_MIN_HEIGHT.min(maximum), maximum)
+    }
+
+    pub(super) fn clamp_y(self, y: i32, height: i32) -> i32 {
+        let minimum = self.top_margin.min((self.screen_height - 1).max(0));
+        let maximum = (self.screen_height - height - PANEL_EDGE_MARGIN).max(minimum);
+        y.clamp(minimum, maximum)
+    }
+
+    pub(super) fn default_y(self) -> i32 {
+        ((f64::from(self.screen_height) * 0.26).round() as i32).max(self.top_margin)
+    }
+}
+
+pub(crate) fn monitor_output_id(monitor: &gdk::Monitor) -> String {
+    monitor
+        .connector()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| {
+            let geometry = monitor.geometry();
+            format!(
+                "{}-{}-{}",
+                monitor.model().unwrap_or_default(),
+                geometry.x(),
+                geometry.y()
+            )
+        })
 }

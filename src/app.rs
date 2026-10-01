@@ -29,6 +29,29 @@ const APP_ID: &str = "dev.obsidian.Bar";
 const WINDOW_CSS: &str = include_str!("../assets/window.css");
 const FULLSCREEN_SYNC_DELAY: Duration = Duration::from_millis(75);
 
+fn monitor_desktop_is_empty(
+    output: Option<&str>,
+    windows: &[Window],
+    workspaces: &[Workspace],
+) -> bool {
+    let Some(output) = output else {
+        return false;
+    };
+    let Some(workspace) = workspaces
+        .iter()
+        .find(|workspace| workspace.is_active && workspace.output.as_deref() == Some(output))
+    else {
+        return false;
+    };
+    // Check both snapshots: Niri can report a new active window before its
+    // window list update. A window being moved without a workspace is also
+    // insufficient evidence of an empty desktop.
+    workspace.active_window_id.is_none()
+        && !windows
+            .iter()
+            .any(|window| window.workspace_id.is_none_or(|id| id == workspace.id))
+}
+
 pub struct App {
     application: gtk::Application,
     bars: RefCell<Vec<Bar>>,
@@ -40,6 +63,8 @@ pub struct App {
     keyboard_layout: RefCell<String>,
     windows: RefCell<Vec<Window>>,
     workspaces: RefCell<Vec<Workspace>>,
+    niri_windows_ready: Cell<bool>,
+    niri_workspaces_ready: Cell<bool>,
     fullscreen_sync_generation: Cell<u64>,
     bluetooth_agent: BluetoothAgent,
     bar_features: Rc<BarFeatureController>,
@@ -72,6 +97,8 @@ impl App {
             keyboard_layout: RefCell::new("--".to_owned()),
             windows: RefCell::new(Vec::new()),
             workspaces: RefCell::new(Vec::new()),
+            niri_windows_ready: Cell::new(false),
+            niri_workspaces_ready: Cell::new(false),
             fullscreen_sync_generation: Cell::new(0),
             bluetooth_agent: BluetoothAgent::default(),
             bar_features: BarFeatureController::new(),
@@ -280,19 +307,32 @@ impl App {
             drop(view.take());
             return;
         };
-        if view
+        if !view
             .as_ref()
             .is_some_and(|current| current.monitor() == &monitor)
         {
-            return;
+            drop(view.take());
+            *view = Some(SystemMonitorView::new(
+                &self.application,
+                &monitor,
+                &self.system_monitor,
+            ));
         }
+        drop(view);
+        self.sync_monitor_desktop();
+    }
 
-        drop(view.take());
-        *view = Some(SystemMonitorView::new(
-            &self.application,
-            &monitor,
-            &self.system_monitor,
-        ));
+    fn sync_monitor_desktop(&self) {
+        if let Some(view) = self.system_monitor_view.borrow().as_ref() {
+            let available = self.niri_windows_ready.get()
+                && self.niri_workspaces_ready.get()
+                && monitor_desktop_is_empty(
+                    view.monitor().connector().as_deref(),
+                    &self.windows.borrow(),
+                    &self.workspaces.borrow(),
+                );
+            view.set_desktop_available(available);
+        }
     }
 
     fn ensure_niri_listener(self: &Rc<Self>) {
@@ -321,6 +361,8 @@ impl App {
                     }
                     ipc::Update::Windows(windows) => {
                         this.windows.replace(windows);
+                        this.niri_windows_ready.set(true);
+                        this.sync_monitor_desktop();
                         this.schedule_bar_fullscreen_sync();
                     }
                     ipc::Update::Workspaces(workspaces) => {
@@ -328,7 +370,14 @@ impl App {
                             bar.set_workspaces(&workspaces);
                         }
                         this.workspaces.replace(workspaces);
+                        this.niri_workspaces_ready.set(true);
+                        this.sync_monitor_desktop();
                         this.schedule_bar_fullscreen_sync();
+                    }
+                    ipc::Update::Disconnected => {
+                        this.niri_windows_ready.set(false);
+                        this.niri_workspaces_ready.set(false);
+                        this.sync_monitor_desktop();
                     }
                 }
             }
@@ -511,5 +560,83 @@ impl App {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace(id: u64, output: &str, active: bool) -> Workspace {
+        Workspace {
+            id,
+            idx: id as u8,
+            name: None,
+            output: Some(output.into()),
+            is_urgent: false,
+            is_active: active,
+            is_focused: false,
+            active_window_id: None,
+        }
+    }
+
+    fn window(workspace_id: Option<u64>) -> Window {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "workspace_id": workspace_id,
+            "is_focused": false, "is_floating": false, "is_urgent": false,
+            "layout": { "tile_size": [800.0, 600.0], "window_size": [800, 600],
+                "window_offset_in_tile": [0.0, 0.0] }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn monitor_requires_an_empty_active_workspace_on_its_own_output() {
+        let mut workspaces = vec![
+            workspace(1, "DP-1", true),
+            workspace(2, "DP-1", false),
+            workspace(3, "DP-2", true),
+        ];
+        let other_windows = vec![window(Some(2)), window(Some(3))];
+        assert!(monitor_desktop_is_empty(
+            Some("DP-1"),
+            &other_windows,
+            &workspaces
+        ));
+        assert!(!monitor_desktop_is_empty(
+            Some("DP-2"),
+            &other_windows,
+            &workspaces
+        ));
+        assert!(!monitor_desktop_is_empty(None, &[], &workspaces));
+        assert!(!monitor_desktop_is_empty(Some("missing"), &[], &workspaces));
+        assert!(!monitor_desktop_is_empty(Some("DP-1"), &[], &[]));
+        for floating in [false, true] {
+            let mut occupant = window(Some(1));
+            occupant.is_floating = floating;
+            assert!(!monitor_desktop_is_empty(
+                Some("DP-1"),
+                &[occupant],
+                &workspaces
+            ));
+        }
+        assert!(!monitor_desktop_is_empty(
+            Some("DP-1"),
+            &[window(None)],
+            &workspaces
+        ));
+        workspaces[0].active_window_id = Some(9);
+        assert!(
+            !monitor_desktop_is_empty(Some("DP-1"), &[], &workspaces),
+            "wait for both IPC snapshots after an open/close"
+        );
+        workspaces[0].active_window_id = None;
+        workspaces[0].is_active = false;
+        workspaces[1].is_active = true;
+        assert!(!monitor_desktop_is_empty(
+            Some("DP-1"),
+            &other_windows,
+            &workspaces
+        ));
     }
 }
