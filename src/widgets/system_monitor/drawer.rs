@@ -2,6 +2,7 @@ use super::{PANEL_EDGE_MARGIN, PANEL_MAX_WIDTH, PANEL_MIN_HEIGHT, PANEL_MIN_WIDT
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    time::Duration,
 };
 
 use gtk::{gdk, glib, prelude::*};
@@ -23,6 +24,7 @@ mod imp {
     pub struct SlideSurface {
         pub offset: Cell<f64>,
         pub animating: Cell<bool>,
+        pub prepared: Cell<bool>,
         pub texture: RefCell<Option<gtk::gdk::Texture>>,
     }
 
@@ -84,6 +86,7 @@ mod imp {
                     self.obj().snapshot_child(&child, snapshot);
                 }
                 snapshot.restore();
+                self.prepared.set(true);
             }
         }
     }
@@ -114,8 +117,14 @@ impl SlideSurface {
             // Rasterize the card once per slide instead of redrawing every
             // label, meter and rounded clip for each fractional-pixel step.
             self.imp().texture.borrow_mut().take();
+            self.imp().prepared.set(false);
             self.queue_draw();
         }
+    }
+
+    fn is_prepared(&self) -> bool {
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+        self.imp().prepared.get()
     }
 }
 
@@ -202,11 +211,28 @@ impl MonitorDrawer {
             self.hotspot.set_visible(false);
             self.hotspot.present();
         }
-        if !animate {
+        if !animate || start == target {
             self.finish(revealed);
             return;
         }
         let duration_ms = (if revealed { 260.0 } else { 200.0 }) * (target - start).abs();
+        if !revealed {
+            // Fully covered bottom-layer surfaces may receive no frame
+            // callbacks. Still unmap after the slide, so a later reveal starts
+            // from the hidden endpoint instead of a stalled closing frame.
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_local_once(
+                Duration::from_millis(duration_ms.ceil() as u64 + 100),
+                move || {
+                    if let Some(drawer) = weak.upgrade()
+                        && drawer.generation.is_current(generation)
+                        && drawer.window.is_visible()
+                    {
+                        drawer.hide_immediately();
+                    }
+                },
+            );
+        }
         let weak = Rc::downgrade(self);
         let start_time = Cell::new(None::<i64>);
         self.window.add_tick_callback(move |_, clock| {
@@ -215,6 +241,13 @@ impl MonitorDrawer {
             };
             if !drawer.generation.is_current(generation) {
                 return glib::ControlFlow::Break;
+            }
+            // The first tick precedes layout, font upload and rasterization.
+            // Let that frame finish before starting the animation clock: cold
+            // renderer setup must not consume the entire opening transition.
+            if start_time.get().is_none() && !drawer.slide.is_prepared() {
+                drawer.slide.queue_draw();
+                return glib::ControlFlow::Continue;
             }
             let now = clock.frame_time();
             let started = start_time.get().unwrap_or_else(|| {

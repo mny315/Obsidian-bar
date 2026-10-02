@@ -1045,15 +1045,23 @@ fn monitor_drawer_animation_keeps_width_and_survives_reversal() {
             std::thread::sleep(Duration::from_millis(1));
         }
     };
-    // Warm up the renderer before checking intermediate animation frames.
-    runtime.drawer.set_revealed(true);
-    pump(800);
-    runtime.drawer.set_revealed(false);
-    pump(300);
+    // Simulate cold renderer setup taking longer than the whole transition.
+    // The first opening still needs intermediate frames after this first paint.
+    runtime.window.connect_realize(|window| {
+        let delayed = Cell::new(false);
+        window.frame_clock().unwrap().connect_after_paint(move |_| {
+            if !delayed.replace(true) {
+                std::thread::sleep(Duration::from_millis(350));
+            }
+        });
+    });
     let frames = Rc::new(RefCell::new(Vec::new()));
     let sampled_frames = Rc::clone(&frames);
     let tick = runtime.window.add_tick_callback(move |window, clock| {
-        if let Some(surface) = window.surface() {
+        if let Some(surface) = window.surface()
+            && window.margin(Edge::Right) > drawer::EDGE_TRIGGER_WIDTH - surface.width()
+            && window.margin(Edge::Right) < drawer::RIGHT_MARGIN
+        {
             sampled_frames
                 .borrow_mut()
                 .push((clock.frame_time(), surface.width()));
@@ -1061,6 +1069,14 @@ fn monitor_drawer_animation_keeps_width_and_survives_reversal() {
         glib::ControlFlow::Continue
     });
     runtime.drawer.set_revealed(true);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while frames.borrow().is_empty() && Instant::now() < deadline {
+        pump(5);
+    }
+    assert!(
+        !frames.borrow().is_empty(),
+        "the first opening must animate even when its first paint is slow"
+    );
     pump(80);
     let width = runtime.window.surface().unwrap().width();
     let opening_margin = runtime.window.margin(Edge::Right);
@@ -1526,7 +1542,7 @@ fn laptop_thermal_zone_names_are_humanized() {
 
 #[test]
 #[ignore = "requires Wayland layer-shell and XDG_STATE_HOME=/tmp/obsidian-monitor-items-test-state"]
-fn monitor_opens_only_on_click_and_closes_on_occupied_desktop() {
+fn monitor_pin_restores_after_occlusion_and_respects_manual_close() {
     use crate::widgets::test_support::pump;
     assert!(settings_path().starts_with("/tmp/obsidian-monitor-items-test-state"));
     gtk::init().unwrap();
@@ -1558,6 +1574,7 @@ fn monitor_opens_only_on_click_and_closes_on_occupied_desktop() {
     let runtime = &view.runtime;
     runtime.window.set_layer(Layer::Overlay);
     runtime.hotspot_window.set_layer(Layer::Overlay);
+    runtime.window.settings().set_gtk_enable_animations(true);
     assert!(
         !runtime.hotspot_window.is_visible(),
         "wait for known desktop state at startup"
@@ -1602,32 +1619,73 @@ fn monitor_opens_only_on_click_and_closes_on_occupied_desktop() {
     runtime.tail.emit_clicked();
     pump(50);
     view.set_desktop_available(false);
-    assert!(!runtime.window.is_visible());
+    assert!(runtime.window.is_visible(), "occlusion must animate closed");
     assert!(!runtime.hotspot_window.is_visible());
     pump(350);
-    assert!(
-        !runtime.drawer.is_revealed(),
-        "a cancelled animation must not restore the monitor"
-    );
+    assert!(!runtime.drawer.is_revealed());
+    assert!(!runtime.window.is_visible());
+    assert!(runtime.pinned.get());
     runtime.tail.emit_clicked();
     assert!(!runtime.window.is_visible());
+    // Duplicate occupied-workspace updates must not clear the restore request.
+    view.set_desktop_available(false);
     view.set_desktop_available(true);
     pump(350);
     assert!(runtime.hotspot_window.is_visible());
     assert!(
-        !runtime.window.is_visible(),
-        "returning to an empty desktop still requires a click"
+        runtime.drawer.is_open(),
+        "the pinned panel must return when the desktop is free"
     );
+
+    // A quick workspace round trip reverses the slide without jumping, and
+    // the covered-surface timeout must not close the restored panel later.
+    view.set_desktop_available(false);
+    pump(50);
+    let closing_margin = runtime.window.margin(Edge::Right);
+    assert!(closing_margin < drawer::RIGHT_MARGIN);
+    view.set_desktop_available(true);
+    assert_eq!(runtime.window.margin(Edge::Right), closing_margin);
+    pump(350);
+    assert!(runtime.drawer.is_open());
+
+    // Explicitly closing a pinned panel cancels automatic restoration.
+    runtime.tail.emit_clicked();
+    view.set_desktop_available(false);
+    pump(350);
+    view.set_desktop_available(true);
+    pump(350);
+    assert!(!runtime.window.is_visible());
+
     runtime.tail.emit_clicked();
     pump(350);
     runtime.set_settings_open(true);
     pump(250);
     view.set_desktop_available(false);
+    pump(350);
     assert!(!runtime.settings_reveal.reveals_child());
     assert!(!runtime.window.is_visible());
     assert_eq!(
         runtime.window.keyboard_mode(),
         gtk4_layer_shell::KeyboardMode::None
+    );
+    assert!(controller.set_pinned(false));
+    view.set_desktop_available(true);
+    pump(350);
+    assert!(
+        !runtime.window.is_visible(),
+        "unpinning while covered cancels automatic restoration"
+    );
+
+    runtime.tail.emit_clicked();
+    pump(350);
+    assert!(runtime.drawer.is_open());
+    view.set_desktop_available(false);
+    pump(350);
+    view.set_desktop_available(true);
+    pump(350);
+    assert!(
+        !runtime.window.is_visible(),
+        "an unpinned panel still requires a click after occlusion"
     );
     drop(view);
 }

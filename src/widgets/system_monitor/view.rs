@@ -60,6 +60,7 @@ pub(super) struct MonitorRuntime {
     pub(super) hotspot: gtk::Box,
     pub(super) tail: gtk::Button,
     pub(super) desktop_available: Cell<bool>,
+    restore_on_desktop: Cell<bool>,
     pub(super) card: gtk::Box,
     pub(super) header: gtk::Box,
     pub(super) scroller: gtk::ScrolledWindow,
@@ -89,10 +90,14 @@ impl MonitorRuntime {
         self.tail.set_sensitive(available);
         self.hide_generation.bump();
         if available {
-            // Returning to an empty workspace only restores the tab. Even a
-            // pinned monitor must be opened explicitly on that workspace.
             self.hotspot_window.present();
+            if self.restore_on_desktop.replace(false) && self.pinned.get() {
+                self.drawer.set_revealed(true);
+            }
         } else {
+            // Occlusion suspends an open pinned panel; it isn't a manual close.
+            self.restore_on_desktop
+                .set(self.pinned.get() && self.drawer.is_revealed());
             self.hotspot_window.set_visible(false);
             self.hovered.set(false);
             self.hotspot_hovered.set(false);
@@ -104,10 +109,9 @@ impl MonitorRuntime {
                 popover.popdown();
             }
             self.window.set_keyboard_mode(KeyboardMode::None);
-            // A workspace change must unmap immediately, including a slide
-            // already in progress, instead of continuing underneath windows.
-            self.drawer.hide_immediately();
+            self.drawer.set_revealed(false);
         }
+        self.sync_input_region();
     }
 
     fn toggle_open(self: &Rc<Self>) {
@@ -115,6 +119,7 @@ impl MonitorRuntime {
             return;
         }
         self.hide_generation.bump();
+        self.restore_on_desktop.set(false);
         let open = !self.drawer.is_revealed();
         if !open {
             self.window.set_keyboard_mode(KeyboardMode::None);
@@ -545,6 +550,7 @@ impl SystemMonitorView {
             hotspot: hotspot.clone(),
             tail: tail.clone(),
             desktop_available: Cell::new(false),
+            restore_on_desktop: Cell::new(false),
             card,
             header,
             scroller,
@@ -788,6 +794,9 @@ impl SystemMonitorView {
                 let font_changed = runtime.layout.applied_scale.get() != settings.scale_milli;
                 runtime.layout.apply_settings(settings);
                 runtime.pinned.set(settings.pinned);
+                if !settings.pinned {
+                    runtime.restore_on_desktop.set(false);
+                }
                 runtime
                     .hide_delay
                     .set(Duration::from_millis(settings.hide_delay_ms as u64));
