@@ -357,7 +357,6 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
         settings_surface.remove_controller(&motion);
     }
     view.set_desktop_available(true);
-    runtime.tail.emit_clicked();
     let pump = |ms: u64| {
         let until = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < until {
@@ -1542,7 +1541,7 @@ fn laptop_thermal_zone_names_are_humanized() {
 
 #[test]
 #[ignore = "requires Wayland layer-shell and XDG_STATE_HOME=/tmp/obsidian-monitor-items-test-state"]
-fn monitor_pin_restores_after_occlusion_and_respects_manual_close() {
+fn monitor_pin_restores_after_restart_and_occlusion_and_respects_manual_close() {
     use crate::widgets::test_support::pump;
     assert!(settings_path().starts_with("/tmp/obsidian-monitor-items-test-state"));
     gtk::init().unwrap();
@@ -1565,11 +1564,14 @@ fn monitor_pin_restores_after_occlusion_and_respects_manual_close() {
         .unwrap()
         .downcast::<gdk::Monitor>()
         .unwrap();
-    let controller = SystemMonitorController::new();
-    controller.settings.replace(MonitorSettings {
+    MonitorSettings {
         pinned: true,
         ..MonitorSettings::default()
-    });
+    }
+    .save()
+    .unwrap();
+    let controller = SystemMonitorController::new();
+    assert!(controller.settings().pinned);
     let view = SystemMonitorView::new(&application, &monitor, &controller);
     let runtime = &view.runtime;
     runtime.window.set_layer(Layer::Overlay);
@@ -1579,25 +1581,17 @@ fn monitor_pin_restores_after_occlusion_and_respects_manual_close() {
         !runtime.hotspot_window.is_visible(),
         "wait for known desktop state at startup"
     );
-    view.set_desktop_available(true);
-    pump(100);
-    let controllers = runtime.hotspot.observe_controllers();
-    let motion = (0..controllers.n_items())
-        .find_map(|index| {
-            controllers
-                .item(index)?
-                .downcast::<gtk::EventControllerMotion>()
-                .ok()
-        })
-        .unwrap();
-    motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
-    pump(350);
+    view.set_desktop_available(false);
+    view.set_desktop_available(false);
     assert!(
         !runtime.window.is_visible(),
-        "hover and pin must not open a closed monitor"
+        "a saved pin must wait while the desktop is covered or unknown"
     );
-    runtime.tail.emit_clicked();
-    assert!(runtime.drawer.is_revealed());
+    view.set_desktop_available(true);
+    assert!(
+        runtime.drawer.is_revealed(),
+        "a saved pin must restore the panel without a click or pin toggle"
+    );
     let deadline = Instant::now() + Duration::from_secs(2);
     while !runtime.drawer.is_open() && Instant::now() < deadline {
         pump(10);
@@ -1615,6 +1609,21 @@ fn monitor_pin_restores_after_occlusion_and_respects_manual_close() {
     assert!(
         !runtime.window.is_visible(),
         "the same tab closes even a pinned panel"
+    );
+    let controllers = runtime.hotspot.observe_controllers();
+    let motion = (0..controllers.n_items())
+        .find_map(|index| {
+            controllers
+                .item(index)?
+                .downcast::<gtk::EventControllerMotion>()
+                .ok()
+        })
+        .unwrap();
+    motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+    pump(350);
+    assert!(
+        !runtime.window.is_visible(),
+        "hover and pin must not reopen a manually closed monitor"
     );
     runtime.tail.emit_clicked();
     pump(50);
@@ -1688,4 +1697,14 @@ fn monitor_pin_restores_after_occlusion_and_respects_manual_close() {
         "an unpinned panel still requires a click after occlusion"
     );
     drop(view);
+
+    let controller = SystemMonitorController::new();
+    assert!(!controller.settings().pinned);
+    let view = SystemMonitorView::new(&application, &monitor, &controller);
+    view.set_desktop_available(true);
+    pump(350);
+    assert!(
+        !view.runtime.window.is_visible(),
+        "an unpinned panel must remain closed after restart"
+    );
 }

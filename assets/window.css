@@ -3298,7 +3298,7 @@ menubutton.tray-item {
 
 menubutton.tray-item > button.toggle,
 menubutton.tray-item > button.toggle:focus {
-  min-width: 30px;
+  min-width: 24px;
   min-height: 30px;
   padding: 0 4px;
   margin: 0;

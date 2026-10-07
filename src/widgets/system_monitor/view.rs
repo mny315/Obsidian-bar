@@ -550,7 +550,8 @@ impl SystemMonitorView {
             hotspot: hotspot.clone(),
             tail: tail.clone(),
             desktop_available: Cell::new(false),
-            restore_on_desktop: Cell::new(false),
+            // Restore a saved pin once the compositor reports a free desktop.
+            restore_on_desktop: Cell::new(settings.pinned),
             card,
             header,
             scroller,
