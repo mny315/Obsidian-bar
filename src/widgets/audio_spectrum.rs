@@ -5,7 +5,7 @@ use std::{
     mem::size_of,
     rc::Rc,
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use gtk::{gdk, glib, prelude::*};
@@ -27,8 +27,7 @@ const NAMESPACE: &str = "desktop-audio-thread";
 const SPECTRUM_BANDS: usize = 144;
 const FFT_SIZE: usize = 2048;
 const ANALYZER_FPS: usize = 48;
-const RENDER_FPS: usize = 60;
-const RENDER_FRAME_INTERVAL: Duration = Duration::from_micros(1_000_000 / RENDER_FPS as u64);
+const RENDER_FPS: i64 = 120;
 const WORKER_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const WORKER_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const MIN_FREQUENCY_HZ: f32 = 40.0;
@@ -386,16 +385,18 @@ impl RenderState {
         self.current.fill(0.0);
     }
 
-    fn step(&mut self) -> bool {
+    fn step(&mut self, elapsed_seconds: f32) -> bool {
         let mut active = false;
+        // Preserve the envelope speed at any monitor refresh rate. The
+        // coefficients were originally tuned for a 60 Hz render clock.
+        let attack = 1.0 - (1.0 - LEVEL_ATTACK).powf(elapsed_seconds * 60.0);
+        let release = 1.0 - (1.0 - LEVEL_RELEASE).powf(elapsed_seconds * 60.0);
         for (current, target) in self.current.iter_mut().zip(self.target) {
-            let speed = if target > *current {
-                LEVEL_ATTACK
-            } else {
-                LEVEL_RELEASE
-            };
+            let speed = if target > *current { attack } else { release };
             let next = *current + (target - *current) * speed;
-            *current = if next.abs() < LEVEL_EPSILON {
+            // Only truncate a fading band. Rounding an attack back to zero on
+            // each small frame step prevents quiet targets from ever appearing.
+            *current = if target <= LEVEL_EPSILON && next.abs() < LEVEL_EPSILON {
                 0.0
             } else {
                 next
@@ -410,6 +411,30 @@ impl RenderState {
     }
 }
 
+#[derive(Default)]
+struct RenderCadence {
+    last_frame: Option<i64>,
+    next_frame: i64,
+}
+
+impl RenderCadence {
+    fn advance(&mut self, now: i64) -> Option<f32> {
+        // Keep the deadline on a fixed 120 Hz timeline. Restarting the interval
+        // at every rendered frame would reduce 120 FPS to 100 on a 300 Hz display.
+        let phase = now * RENDER_FPS;
+        if self.last_frame.is_none() {
+            self.next_frame = phase;
+        } else if phase + 100 * RENDER_FPS < self.next_frame {
+            // Allow 100 us of frame-clock jitter on native 120/240 Hz displays.
+            return None;
+        }
+        self.next_frame += ((phase - self.next_frame).max(0) / 1_000_000 + 1) * 1_000_000;
+        Some(self.last_frame.replace(now).map_or(0.0, |previous| {
+            ((now - previous).max(0) as f32 / 1_000_000.0).min(0.1)
+        }))
+    }
+}
+
 fn start_render_clock(
     area: &gtk::DrawingArea,
     render_state: Rc<RefCell<RenderState>>,
@@ -419,18 +444,12 @@ fn start_render_clock(
         return;
     }
 
-    let last_frame = Cell::new(None);
-    area.add_tick_callback(move |area, _| {
-        let now = Instant::now();
-        if last_frame
-            .get()
-            .is_some_and(|previous| now.duration_since(previous) < RENDER_FRAME_INTERVAL)
-        {
+    let cadence = RefCell::new(RenderCadence::default());
+    area.add_tick_callback(move |area, clock| {
+        let Some(elapsed) = cadence.borrow_mut().advance(clock.frame_time()) else {
             return glib::ControlFlow::Continue;
-        }
-        last_frame.set(Some(now));
-
-        let active = render_state.borrow_mut().step();
+        };
+        let active = render_state.borrow_mut().step(elapsed);
         area.queue_draw();
         if active {
             glib::ControlFlow::Continue
@@ -961,6 +980,78 @@ fn settings_path() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_cadence_keeps_120_fps_across_monitor_refresh_rates() {
+        for refresh in [60, 120, 144, 165, 240, 300, 360] {
+            let mut cadence = RenderCadence::default();
+            let rendered = (0..refresh * 3)
+                .filter(|frame| cadence.advance(frame * 1_000_000 / refresh).is_some())
+                .count();
+            let expected = refresh.min(RENDER_FPS) as usize * 3;
+            assert!(
+                rendered.abs_diff(expected) <= 1,
+                "{refresh} Hz: {rendered} frames, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_cadence_skips_missed_frames_after_a_stall() {
+        let mut cadence = RenderCadence::default();
+        assert_eq!(cadence.advance(0), Some(0.0));
+        assert_eq!(cadence.advance(2000), None);
+        assert_eq!(cadence.advance(1_000_000), Some(0.1));
+        assert_eq!(cadence.advance(1_000_001), None);
+        assert!(cadence.advance(1_008_333).is_some());
+    }
+
+    #[test]
+    fn envelope_speed_is_independent_of_display_refresh_rate() {
+        let simulate = |fps: u32| {
+            let mut state = RenderState {
+                target: [0.8; SPECTRUM_BANDS],
+                ..Default::default()
+            };
+            for _ in 0..fps / 5 {
+                state.step(1.0 / fps as f32);
+            }
+            let peak = state.current[0];
+            state.target.fill(0.0);
+            for _ in 0..fps / 5 {
+                state.step(1.0 / fps as f32);
+            }
+            (peak, state.current[0])
+        };
+        let baseline = simulate(60);
+        for rate in [120, 165, 240, 300, 360] {
+            let actual = simulate(rate);
+            assert!((actual.0 - baseline.0).abs() < 0.0001);
+            assert!((actual.1 - baseline.1).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn quiet_bands_can_rise_above_the_render_cutoff() {
+        for fps in [60, 120, 300] {
+            let mut state = RenderState {
+                target: [LEVEL_EPSILON * 1.5; SPECTRUM_BANDS],
+                ..Default::default()
+            };
+            for _ in 0..fps {
+                assert!(state.step(1.0 / fps as f32));
+            }
+            assert!(
+                state.current[0] > LEVEL_EPSILON,
+                "a quiet nonzero target must not be rounded away on every {fps} Hz frame"
+            );
+            state.target.fill(0.0);
+            for _ in 0..fps {
+                state.step(1.0 / fps as f32);
+            }
+            assert_eq!(state.current, [0.0; SPECTRUM_BANDS]);
+        }
+    }
 
     #[test]
     fn silence_produces_zero_spectrum() {

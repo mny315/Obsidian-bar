@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use super::run_background;
 
+mod batteries;
 mod drawer;
 mod gpu;
 mod nvidia;
@@ -495,6 +496,7 @@ struct SystemSnapshot {
     power: Vec<SensorReading>,
     fans: Vec<SensorReading>,
     battery: Option<BatterySnapshot>,
+    device_batteries: Vec<batteries::DeviceBattery>,
 }
 
 type SnapshotSubscriber = Box<dyn Fn(&SystemSnapshot) -> bool>;
@@ -667,6 +669,7 @@ impl SystemMonitorController {
                         power = snapshot.power.len(),
                         fans = snapshot.fans.len(),
                         battery = snapshot.battery.is_some(),
+                        device_batteries = snapshot.device_batteries.len(),
                         "system monitor received its first hardware snapshot"
                     );
                 }

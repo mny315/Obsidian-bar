@@ -5,6 +5,105 @@ use gtk::{gdk, prelude::*};
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
 #[test]
+fn peripheral_battery_names_and_selection_stay_independent() {
+    let mut snapshot = SystemSnapshot::default();
+    for (id, name, percent) in [
+        ("bolt:mouse", "MX Anywhere 3S", 73.0),
+        ("bolt:keyboard", "MX Keys S", 84.0),
+        ("steam:controller", "Steam Controller", 62.0),
+        ("hyperx:headset", "HyperX Cloud III S Wireless", 95.0),
+    ] {
+        snapshot.device_batteries.push(batteries::DeviceBattery {
+            id: id.into(),
+            name: name.into(),
+            percent: Some(percent),
+            detail: "Discharging".into(),
+        });
+    }
+    let (metrics, meter) = display_metrics(MonitorSection::Battery, &snapshot);
+    assert_eq!(metrics.len(), 4);
+    assert!(
+        meter.is_none(),
+        "unrelated device batteries must not be averaged"
+    );
+    for (metric, battery) in metrics.iter().zip(&snapshot.device_batteries) {
+        assert_eq!(metric.id, battery.id);
+        assert_eq!(metric.label, battery.name);
+    }
+    let mut settings = MonitorSettings::default();
+    settings.set_metric_visible(MonitorSection::Battery, "bolt:mouse", false);
+    let (selected, _, _) = selected_metrics(MonitorSection::Battery, &snapshot, &settings);
+    assert_eq!(selected.len(), 3);
+    assert_eq!(selected[0].label, "MX Keys S");
+    assert_eq!(selected[2].value, "95%");
+}
+
+#[test]
+#[ignore = "requires a GTK display; renders peripheral names at the minimum panel width"]
+fn peripheral_battery_labels_fit_narrow_panel() {
+    gtk::init().unwrap();
+    let application = gtk::Application::builder()
+        .application_id("dev.obsidian.BatteryNamesTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    application.register(None::<&gio::Cancellable>).unwrap();
+    let css = gtk::CssProvider::new();
+    css.load_from_data(include_str!("../../../assets/window.css"));
+    gtk::style_context_add_provider_for_display(
+        &gdk::Display::default().unwrap(),
+        &css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    let section = SectionView::new(MonitorSection::Battery);
+    section.update(
+        [
+            ("mouse", "MX Anywhere 3S", "55%"),
+            ("keyboard", "MX Keys S", "80%"),
+            ("steam", "Steam Controller", "62%"),
+            ("headset", "HyperX Cloud III S Wireless", "95%"),
+        ]
+        .into_iter()
+        .map(|(id, name, value)| DisplayMetric::new(id, name, value))
+        .collect(),
+        None,
+        false,
+    );
+    let window = gtk::ApplicationWindow::builder()
+        .application(&application)
+        .title("Battery names check")
+        .default_width(PANEL_MIN_WIDTH)
+        .child(&section.root)
+        .build();
+    window.init_layer_shell();
+    window.set_namespace(Some("obsidian-battery-test"));
+    window.set_layer(Layer::Overlay);
+    window.set_anchor(Edge::Left, true);
+    window.set_anchor(Edge::Top, true);
+    window.present();
+    super::super::test_support::pump(350);
+    assert_eq!(window.width(), PANEL_MIN_WIDTH);
+    let mut child = section.rows.first_child();
+    while let Some(row) = child {
+        let label = row
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        let value = row.last_child().unwrap().downcast::<gtk::Label>().unwrap();
+        assert!(!label.layout().is_ellipsized());
+        let bounds = label.compute_bounds(&row).unwrap();
+        let value_bounds = value.compute_bounds(&row).unwrap();
+        assert!(bounds.x() + bounds.width() <= value_bounds.x());
+        assert!(value_bounds.x() + value_bounds.width() <= row.width() as f32);
+        child = row.next_sibling();
+    }
+    super::super::test_support::capture_if_requested(&window, "battery-names");
+    window.close();
+}
+
+#[test]
 fn battery_total_uses_capacities_and_excludes_peripherals_and_absent_packs() {
     let root = std::env::temp_dir().join(format!("obsidian-batteries-{}", std::process::id()));
     let battery = |name: &str, fields: &[(&str, &str)]| {

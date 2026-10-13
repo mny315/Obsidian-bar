@@ -1,4 +1,5 @@
 use super::{Generation, run_background};
+use gio::prelude::FileExt;
 use gtk::glib;
 use std::{
     cell::{Cell, RefCell},
@@ -43,6 +44,7 @@ struct WallpaperSettings {
     current: Option<PathBuf>,
     random_enabled: bool,
     random_interval_minutes: u32,
+    gallery_orders: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for WallpaperSettings {
@@ -52,17 +54,22 @@ impl Default for WallpaperSettings {
             current: None,
             random_enabled: false,
             random_interval_minutes: DEFAULT_RANDOM_INTERVAL_MINUTES,
+            gallery_orders: Default::default(),
         }
     }
 }
 
 impl WallpaperSettings {
     fn load() -> Self {
+        Self::load_from(&settings_path())
+    }
+
+    fn load_from(path: &Path) -> Self {
         let defaults = Self::default();
         let key_file = glib::KeyFile::new();
 
         if key_file
-            .load_from_file(settings_path(), glib::KeyFileFlags::NONE)
+            .load_from_file(path, glib::KeyFileFlags::NONE)
             .is_err()
         {
             return defaults;
@@ -97,11 +104,19 @@ impl WallpaperSettings {
             current,
             random_enabled,
             random_interval_minutes,
+            gallery_orders: key_file
+                .string(SETTINGS_GROUP, "gallery_orders")
+                .ok()
+                .and_then(|value| serde_json::from_str(value.as_str()).ok())
+                .unwrap_or_default(),
         }
     }
 
     fn save(&self) -> Result<(), WallpaperError> {
-        let path = settings_path();
+        self.save_to(&settings_path())
+    }
+
+    fn save_to(&self, path: &Path) -> Result<(), WallpaperError> {
         let parent = path.parent().ok_or(WallpaperError::StatePath)?;
         fs::create_dir_all(parent).map_err(WallpaperError::Io)?;
 
@@ -115,6 +130,11 @@ impl WallpaperSettings {
             key_file.set_string(SETTINGS_GROUP, "current", &current.to_string_lossy());
         }
         key_file.set_boolean(SETTINGS_GROUP, "random_enabled", self.random_enabled);
+        key_file.set_string(
+            SETTINGS_GROUP,
+            "gallery_orders",
+            &serde_json::to_string(&self.gallery_orders).expect("string orders are serializable"),
+        );
         key_file.set_integer(
             SETTINGS_GROUP,
             "random_interval_minutes",
@@ -126,7 +146,7 @@ impl WallpaperSettings {
             let _ = fs::remove_file(&temporary);
             return Err(WallpaperError::Glib(error));
         }
-        if let Err(error) = fs::rename(&temporary, &path) {
+        if let Err(error) = fs::rename(&temporary, path) {
             let _ = fs::remove_file(&temporary);
             return Err(WallpaperError::Io(error));
         }
@@ -138,6 +158,8 @@ impl WallpaperSettings {
 struct WallpaperSnapshot {
     directory: PathBuf,
     current: Option<PathBuf>,
+    gallery_order: Vec<String>,
+    gallery_revision: u64,
 }
 
 struct PendingApply {
@@ -160,6 +182,7 @@ pub struct WallpaperController {
     pending_apply: RefCell<Option<PendingApply>>,
     lifecycle_generation: Generation,
     selection_generation: Generation,
+    gallery_generation: Generation,
     random_source: RefCell<Option<glib::SourceId>>,
     random_pick_busy: Cell<bool>,
     random_nonce: Cell<u64>,
@@ -181,6 +204,7 @@ impl WallpaperController {
             pending_apply: RefCell::new(None),
             lifecycle_generation: Generation::default(),
             selection_generation: Generation::default(),
+            gallery_generation: Generation::default(),
             random_source: RefCell::new(None),
             random_pick_busy: Cell::new(false),
             random_nonce: Cell::new(0),
@@ -229,8 +253,14 @@ impl WallpaperController {
     fn snapshot(&self) -> WallpaperSnapshot {
         let settings = self.settings.borrow();
         WallpaperSnapshot {
+            gallery_revision: self.gallery_generation.current(),
             directory: settings.directory.clone(),
             current: settings.current.clone(),
+            gallery_order: settings
+                .gallery_orders
+                .get(&wallpaper_key(&settings.directory))
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 
@@ -273,9 +303,63 @@ impl WallpaperController {
         Ok(())
     }
 
+    fn set_gallery_order(&self, order: Vec<String>) -> Result<(), WallpaperError> {
+        let directory = self.settings.borrow().directory.clone();
+        // A drop only reorders this folder's existing entries; it never moves files.
+        if order.iter().any(|key| {
+            gio::File::for_uri(key)
+                .path()
+                .is_none_or(|path| path.parent() != Some(directory.as_path()))
+        }) {
+            return Err(WallpaperError::InvalidDirectory(directory));
+        }
+        self.persist_settings_update(|settings| {
+            settings
+                .gallery_orders
+                .insert(wallpaper_key(&directory), order);
+        })?;
+        self.broadcast();
+        Ok(())
+    }
+
     fn random_config(&self) -> (bool, u32) {
         let settings = self.settings.borrow();
         (settings.random_enabled, settings.random_interval_minutes)
+    }
+
+    fn delete_wallpaper(&self, path: &Path) -> Result<(), WallpaperError> {
+        if !path.is_absolute()
+            || path.parent() != Some(self.settings.borrow().directory.as_path())
+            || !is_supported_wallpaper(path)
+        {
+            return Err(WallpaperError::InvalidWallpaper(path.to_path_buf()));
+        }
+        // Do not let an in-flight transition save a file after it was deleted.
+        if self.applying.get() {
+            return Err(WallpaperError::Backend(
+                "Wait for the wallpaper transition to finish, then try again".into(),
+            ));
+        }
+        fs::remove_file(path).map_err(WallpaperError::Io)?;
+        self.selection_generation.bump();
+        let saved = {
+            let mut settings = self.settings.borrow_mut();
+            if settings.current.as_deref() == Some(path) {
+                settings.current = None;
+            }
+            let key = wallpaper_key(path);
+            for order in settings.gallery_orders.values_mut() {
+                order.retain(|item| item != &key);
+            }
+            settings.save()
+        };
+        self.gallery_generation.bump();
+        self.broadcast();
+        // The file is already gone: a state-save error must not undo the UI removal.
+        if let Err(error) = saved {
+            warn!(%error, path = %path.display(), "wallpaper deleted but settings could not be saved");
+        }
+        Ok(())
     }
 
     fn set_random_enabled(self: &Rc<Self>, enabled: bool) -> Result<(), WallpaperError> {
@@ -956,6 +1040,10 @@ fn list_wallpapers(directory: &Path) -> Result<Vec<PathBuf>, WallpaperError> {
             .to_ascii_lowercase()
     });
     Ok(paths)
+}
+
+fn wallpaper_key(path: &Path) -> String {
+    gio::File::for_path(path).uri().into()
 }
 
 fn is_supported_wallpaper(path: &Path) -> bool {

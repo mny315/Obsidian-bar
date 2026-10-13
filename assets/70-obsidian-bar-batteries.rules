@@ -1,0 +1,7 @@
+# Battery telemetry for the active local session only.
+# Match USB device and interface in separate rules (different sysfs parents).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c548", ENV{.OBSIDIAN_BOLT}="1"
+SUBSYSTEM=="hidraw", ENV{.OBSIDIAN_BOLT}=="1", ATTRS{bInterfaceNumber}=="02", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="03f0", ATTRS{idProduct}=="06be|02cc", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304|1305", ENV{.OBSIDIAN_PUCK}="1"
+SUBSYSTEM=="hidraw", ENV{.OBSIDIAN_PUCK}=="1", ATTRS{bInterfaceNumber}=="02|03|04|05", TAG+="uaccess"

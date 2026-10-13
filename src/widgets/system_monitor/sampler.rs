@@ -31,6 +31,7 @@ pub(super) struct SystemSampler {
     pub(super) gpu_sampling_enabled: Arc<AtomicBool>,
     pub(super) cached: SystemSnapshot,
     pub(super) gpus: gpu::GpuSampler,
+    pub(super) batteries: super::batteries::BatterySampler,
 }
 
 impl Default for SystemSampler {
@@ -41,6 +42,7 @@ impl Default for SystemSampler {
             gpu_sampling_enabled: Arc::new(AtomicBool::new(true)),
             cached: SystemSnapshot::default(),
             gpus: gpu::GpuSampler::default(),
+            batteries: super::batteries::BatterySampler::default(),
         }
     }
 }
@@ -115,6 +117,7 @@ impl SystemSampler {
         }
         if wants(MonitorSection::Battery) {
             next.battery = read_battery_snapshot();
+            next.device_batteries = self.batteries.sample();
         } else {
             next.section_states
                 .insert(MonitorSection::Battery, gpu::DataState::Paused);

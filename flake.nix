@@ -18,6 +18,10 @@
             src = ./.;
 
             cargoLock.lockFile = ./Cargo.lock;
+            postInstall = ''
+              install -Dm644 assets/70-obsidian-bar-batteries.rules \
+                $out/lib/udev/rules.d/70-obsidian-bar-batteries.rules
+            '';
 
             nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
             buildInputs = [ pkgs.gdk-pixbuf pkgs.gtk4 pkgs.gtk4-layer-shell pkgs.pipewire ];

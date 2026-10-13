@@ -788,6 +788,7 @@ pub mod clock;
 mod command;
 mod css_transition;
 mod dbus;
+mod reorder;
 #[cfg(test)]
 mod test_support;
 use css_transition::CssTransition;

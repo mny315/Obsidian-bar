@@ -756,6 +756,13 @@ pub(super) fn display_metrics(
             None
         }
         MonitorSection::Battery => {
+            for battery in &snapshot.device_batteries {
+                metrics.push(DisplayMetric::new(
+                    &battery.id,
+                    &battery.name,
+                    battery.display_value(),
+                ));
+            }
             if let Some(battery) = snapshot.battery.as_ref() {
                 metrics.push(DisplayMetric::new(
                     "battery",

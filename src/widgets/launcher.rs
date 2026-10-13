@@ -10,6 +10,7 @@ use std::{
 use gtk::{gdk, gio, glib, pango, prelude::*};
 use tracing::warn;
 
+use super::reorder::{ReorderGrid, merge_visible_order, sort_by_order};
 use super::tooltip::BarTooltipExt;
 use super::{
     BAR_POPUP_WIDTH, CssTransition, Generation, PopupReveal, SmoothScrollConfig,
@@ -22,6 +23,7 @@ const LIST_HEIGHT: i32 = 300;
 const SMOOTH_SCROLL: SmoothScrollConfig = SmoothScrollConfig::new(72.0, 150.0, 90.0);
 const LAUNCHER_POPUP_NAMESPACE: &str = "obsidian-bar-launcher";
 const FAVORITES_STATE_FILE: &str = "favorite-launcher-apps.json";
+const FAVORITES_ORDER_FILE: &str = "favorite-launcher-order.json";
 const HIDDEN_STATE_FILE: &str = "hidden-launcher-apps.json";
 const VIEW_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const FAVORITES_SLOT_WIDTH: i32 = 42;
@@ -203,13 +205,20 @@ impl LaunchableApp {
 struct LauncherUserState {
     hidden: HashSet<String>,
     favorites: HashSet<String>,
+    favorite_order: Vec<String>,
 }
 
 impl LauncherUserState {
     fn read() -> Self {
+        let favorites = read_state_keys(FAVORITES_STATE_FILE);
+        let favorite_order = read_ordered_keys(FAVORITES_ORDER_FILE)
+            .into_iter()
+            .filter(|key| favorites.contains(key))
+            .collect();
         Self {
             hidden: read_state_keys(HIDDEN_STATE_FILE),
-            favorites: read_state_keys(FAVORITES_STATE_FILE),
+            favorites,
+            favorite_order,
         }
     }
 
@@ -524,6 +533,8 @@ struct LauncherController {
     list: gtk::Box,
     favorites_grid: gtk::Box,
     favorites_grid_keys: RefCell<Vec<String>>,
+    favorite_reorder: ReorderGrid,
+    scroll_generation: Generation,
     empty_label: gtk::Label,
     scroller: gtk::ScrolledWindow,
     category_buttons: Vec<(LauncherCategory, gtk::Button)>,
@@ -678,6 +689,8 @@ impl LauncherIndicator {
         list.append(&empty_label);
 
         let favorites_grid = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let (favorite_reorder, drag_overlay) =
+            ReorderGrid::new(&scroller, FAVORITES_COLUMNS as usize, 14, 4);
         favorites_grid.add_css_class("launcher-favorites-grid");
         favorites_grid.set_hexpand(false);
         favorites_grid.set_halign(gtk::Align::Start);
@@ -691,7 +704,7 @@ impl LauncherIndicator {
 
         scroller.set_child(Some(&content_body));
         install_smooth_scroll(&scroller, SMOOTH_SCROLL);
-        view.append(&scroller);
+        view.append(&drag_overlay);
         content.append(&view);
 
         let category_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -788,6 +801,8 @@ impl LauncherIndicator {
             list,
             favorites_grid,
             favorites_grid_keys: RefCell::new(Vec::new()),
+            favorite_reorder,
+            scroll_generation: Generation::default(),
             empty_label,
             scroller,
             category_buttons,
@@ -804,6 +819,13 @@ impl LauncherIndicator {
         });
 
         catalog.subscribe(&controller);
+        {
+            let weak = Rc::downgrade(&controller);
+            controller.favorite_reorder.on_commit(move |order| {
+                weak.upgrade()
+                    .is_some_and(|controller| controller.reorder_favorites(&order))
+            });
+        }
         LauncherController::connect(&controller, bar_window);
         controller.prune_state_keys();
         controller.ensure_valid_category();
@@ -1069,6 +1091,34 @@ impl LauncherController {
         }
     }
 
+    fn reorder_favorites(&self, visible: &[String]) -> bool {
+        let current = self.favorites_grid_keys.borrow();
+        if visible.len() != current.len() || current.iter().any(|key| !visible.contains(key)) {
+            return false;
+        }
+        drop(current);
+        let mut state = LauncherUserState::read();
+        let mut all = self
+            .catalog
+            .data
+            .borrow()
+            .apps
+            .iter()
+            .filter(|app| state.favorites.contains(&app.key))
+            .map(|app| app.key.clone())
+            .collect::<Vec<_>>();
+        sort_by_order(&mut all, &state.favorite_order, Clone::clone);
+        if visible.iter().any(|key| !all.contains(key)) {
+            return false;
+        }
+        state.favorite_order = merge_visible_order(&all, visible);
+        if !save_ordered_keys(FAVORITES_ORDER_FILE, &state.favorite_order) {
+            return false;
+        }
+        self.catalog.notify_user_state_changed(&state);
+        true
+    }
+
     fn default_category(&self) -> LauncherCategory {
         self.user_state.borrow().default_category()
     }
@@ -1243,11 +1293,16 @@ impl LauncherController {
         }
 
         let hidden_count = state.hidden.len();
+        sort_by_order(&mut favorite_apps, &state.favorite_order, |app| {
+            app.key.clone()
+        });
         drop(rows);
         drop(state);
 
         if favorites_view {
             self.sync_favorites_grid(favorite_apps);
+        } else {
+            self.favorite_reorder.cancel();
         }
 
         let show_empty = visible_count == 0;
@@ -1277,6 +1332,11 @@ impl LauncherController {
             return;
         }
 
+        self.favorite_reorder
+            .set_order(apps.iter().map(|app| app.key.clone()).collect());
+        let adjustment = self.scroller.vadjustment();
+        let previous_scroll = adjustment.value();
+        let generation = self.scroll_generation.bump();
         clear_box(&self.favorites_grid);
         self.favorites_grid_keys
             .replace(apps.iter().map(|app| app.key.clone()).collect::<Vec<_>>());
@@ -1294,6 +1354,18 @@ impl LauncherController {
 
             self.favorites_grid.append(&row);
         }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            if !this.scroll_generation.is_current(generation) {
+                return;
+            }
+            let lower = adjustment.lower();
+            let upper = (adjustment.upper() - adjustment.page_size()).max(lower);
+            adjustment.set_value(previous_scroll.clamp(lower, upper));
+        });
     }
 
     fn ensure_rows(self: &Rc<Self>) {
@@ -1350,7 +1422,7 @@ impl LauncherController {
         }
     }
 
-    fn build_favorite_tile(self: &Rc<Self>, app: Rc<LaunchableApp>) -> gtk::Overlay {
+    fn build_favorite_tile(self: &Rc<Self>, app: Rc<LaunchableApp>) -> gtk::Box {
         let overlay = gtk::Overlay::new();
         overlay.add_css_class("launcher-favorite-tile-wrap");
         overlay.set_halign(gtk::Align::Center);
@@ -1386,6 +1458,9 @@ impl LauncherController {
         let weak = Rc::downgrade(self);
         button.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
+                if !this.favorite_reorder.activation_allowed() {
+                    return;
+                }
                 this.launch_app(&app_for_launch);
             }
         });
@@ -1437,7 +1512,11 @@ impl LauncherController {
         overlay.add_overlay(&favorite_toggle);
         overlay.set_measure_overlay(&favorite_toggle, false);
 
-        overlay
+        let slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        slot.append(&overlay);
+        self.favorite_reorder
+            .attach(app.key.clone(), &slot, &overlay, &button);
+        slot
     }
 
     fn build_app_row(self: &Rc<Self>, app: Rc<LaunchableApp>) -> LauncherAppRow {
@@ -1610,6 +1689,9 @@ impl LauncherController {
     }
 
     fn scroll_to_top(&self) {
+        // A category/search reset takes precedence over a queued restoration
+        // from rebuilding the favorites grid in the same event handler.
+        self.scroll_generation.bump();
         let adjustment = self.scroller.vadjustment();
         adjustment.set_value(adjustment.lower());
     }
@@ -1958,20 +2040,38 @@ fn launcher_state_path(file_name: &str) -> PathBuf {
 }
 
 fn read_state_keys(file_name: &str) -> HashSet<String> {
-    let Ok(contents) = fs::read_to_string(launcher_state_path(file_name)) else {
-        return HashSet::new();
-    };
+    read_ordered_keys(file_name).into_iter().collect()
+}
 
+fn read_ordered_keys(file_name: &str) -> Vec<String> {
+    read_ordered_keys_at(&launcher_state_path(file_name))
+}
+
+fn read_ordered_keys_at(path: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
     serde_json::from_str::<Vec<String>>(&contents)
         .unwrap_or_default()
         .into_iter()
         .map(|key| key.trim().to_owned())
         .filter(|key| !key.is_empty())
+        .filter(|key| seen.insert(key.clone()))
         .collect()
 }
 
 fn save_state_keys(file_name: &str, keys: &HashSet<String>) -> bool {
-    let path = launcher_state_path(file_name);
+    let mut keys = keys.iter().cloned().collect::<Vec<_>>();
+    keys.sort();
+    save_ordered_keys(file_name, &keys)
+}
+
+fn save_ordered_keys(file_name: &str, keys: &[String]) -> bool {
+    save_ordered_keys_at(&launcher_state_path(file_name), keys)
+}
+
+fn save_ordered_keys_at(path: &Path, keys: &[String]) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
@@ -1980,14 +2080,12 @@ fn save_state_keys(file_name: &str, keys: &HashSet<String>) -> bool {
         return false;
     }
 
-    let mut keys = keys.iter().cloned().collect::<Vec<_>>();
-    keys.sort();
     let Ok(contents) = serde_json::to_string(&keys) else {
         return false;
     };
 
     let temporary = path.with_extension("json.tmp");
-    match fs::write(&temporary, contents).and_then(|_| fs::rename(&temporary, &path)) {
+    match fs::write(&temporary, contents).and_then(|_| fs::rename(&temporary, path)) {
         Ok(()) => true,
         Err(error) => {
             let _ = fs::remove_file(&temporary);
@@ -2000,6 +2098,84 @@ fn save_state_keys(file_name: &str, keys: &HashSet<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a GTK display; uses unmapped widgets and does not move the pointer"]
+    fn favorite_rebuild_respects_explicit_scroll_reset() {
+        gtk::init().unwrap();
+        let application = gtk::Application::builder()
+            .application_id("dev.obsidian.LauncherScrollTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(None::<&gio::Cancellable>).unwrap();
+        let bar = gtk::ApplicationWindow::builder()
+            .application(&application)
+            .build();
+        let monitor = gdk::Display::default()
+            .unwrap()
+            .monitors()
+            .item(0)
+            .and_downcast::<gdk::Monitor>()
+            .unwrap();
+        let indicator =
+            LauncherIndicator::new(&application, &bar, &monitor, &LauncherCatalog::new());
+        let controller = &indicator._controller;
+        let make_app = |key: &str| {
+            Rc::new(LaunchableApp {
+                key: key.into(),
+                name: key.into(),
+                meta: String::new(),
+                primary_category: None,
+                search_blob: key.into(),
+                info: gio::AppInfo::create_from_commandline(
+                    "true",
+                    Some(key),
+                    gio::AppInfoCreateFlags::NONE,
+                )
+                .unwrap(),
+            })
+        };
+        let adjustment = controller.scroller.vadjustment();
+        adjustment.configure(300.0, 0.0, 1000.0, 10.0, 100.0, 100.0);
+        controller.sync_favorites_grid(vec![make_app("first")]);
+        controller.scroll_to_top();
+        super::super::test_support::pump(20);
+        assert_eq!(
+            adjustment.value(),
+            0.0,
+            "a rebuild must not undo a category/search reset"
+        );
+
+        adjustment.configure(300.0, 0.0, 1000.0, 10.0, 100.0, 100.0);
+        controller.sync_favorites_grid(vec![make_app("second")]);
+        super::super::test_support::pump(20);
+        assert_eq!(
+            adjustment.value(),
+            300.0,
+            "a plain reorder must preserve scrolling"
+        );
+        drop(indicator);
+        detach_application_window(&bar);
+    }
+
+    #[test]
+    fn favorite_order_round_trips_without_sorting_or_changing_membership() {
+        let root =
+            std::env::temp_dir().join(format!("obsidian-favorite-order-{}", std::process::id()));
+        let path = root.join("order.json");
+        let order = vec![
+            "z.desktop".into(),
+            "a.desktop".into(),
+            "middle.desktop".into(),
+        ];
+        assert!(save_ordered_keys_at(&path, &order));
+        assert_eq!(read_ordered_keys_at(&path), order);
+        fs::write(&path, r#"["z.desktop", "", "a.desktop", "z.desktop"]"#).unwrap();
+        assert_eq!(read_ordered_keys_at(&path), ["z.desktop", "a.desktop"]);
+        fs::write(&path, "broken JSON").unwrap();
+        assert!(read_ordered_keys_at(&path).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn nested_desktop_entries_keep_categories_and_keywords() {

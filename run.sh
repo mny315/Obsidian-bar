@@ -40,15 +40,15 @@ clean_project_artifacts() {
   local link_target=''
 
   printf '\n==> removing project build artifacts\n'
-  rm -rf -- "$ROOT/target" "$ROOT/result" "$ROOT"/result-* "$ROOT/run.log"
-
   if [[ -L "$command_path" ]]; then
-    link_target="$(readlink -f -- "$command_path" 2>/dev/null || true)"
-    if [[ "$link_target" == "$ROOT/target/"* || ! -e "$command_path" ]]; then
+    link_target="$(readlink -m -- "$command_path" 2>/dev/null || true)"
+    if [[ "$link_target" == "$ROOT/target/"* ]]; then
       rm -f -- "$command_path"
       printf 'removed command symlink: %s\n' "$command_path"
     fi
   fi
+
+  rm -rf -- "$ROOT/target" "$ROOT/result" "$ROOT"/result-* "$ROOT/run.log"
 
   printf 'project artifacts removed\n'
 }
@@ -307,28 +307,6 @@ run_step() {
   "$@"
 }
 
-install_command_link() {
-  local bin_dir="${OBSIDIAN_BAR_BIN_DIR:-$HOME/.local/bin}"
-  local command_path="$bin_dir/obsidian-bar"
-  local target="$ROOT/target/debug/obsidian-bar"
-
-  mkdir -p "$bin_dir"
-
-  if [[ -e "$command_path" && ! -L "$command_path" ]]; then
-    printf 'warning: %s already exists and is not a symlink; leaving it unchanged\n' \
-      "$command_path" >&2
-    return
-  fi
-
-  ln -sfn "$target" "$command_path"
-  printf 'command: %s -> %s\n' "$command_path" "$target"
-
-  if [[ ":${PATH:-}:" != *":$bin_dir:"* ]]; then
-    printf 'warning: %s is not in PATH; niri must include it to use spawn "obsidian-bar"\n' \
-      "$bin_dir" >&2
-  fi
-}
-
 environment="$(choose_environment)"
 
 if [[ "$environment" == "clean" ]]; then
@@ -381,7 +359,6 @@ else
 fi
 
 run_step 'cargo build' cargo build
-install_command_link
 
-printf '\n==> launching obsidian-bar\n'
+printf '\n==> launching local debug build\n'
 exec "$ROOT/target/debug/obsidian-bar" "$@"

@@ -15,6 +15,152 @@ use std::process::{Command, Stdio};
 
 use super::*;
 
+#[test]
+fn wallpaper_deletion_helper() {
+    let Some(root) = env::var_os("OBSIDIAN_WALLPAPER_DELETE_TEST_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let directory = root.join("wallpapers");
+    fs::create_dir_all(&directory).unwrap();
+    let first = directory.join("first.png");
+    let second = directory.join("second.webm");
+    let outside = root.join("outside.png");
+    let text = directory.join("notes.txt");
+    for path in [&first, &second, &outside, &text] {
+        fs::write(path, b"fixture").unwrap();
+    }
+    let controller = WallpaperController::new();
+    controller.settings.replace(WallpaperSettings {
+        directory: directory.clone(),
+        current: Some(first.clone()),
+        gallery_orders: [(
+            wallpaper_key(&directory),
+            vec![wallpaper_key(&first), wallpaper_key(&second)],
+        )]
+        .into(),
+        ..Default::default()
+    });
+    let receiver = controller.subscribe();
+    for path in [&outside, &text, &directory.join("missing.png")] {
+        assert!(controller.delete_wallpaper(path).is_err());
+    }
+    assert!(outside.exists());
+    assert!(text.exists());
+    assert_eq!(controller.snapshot().gallery_revision, 0);
+    assert!(receiver.try_recv().is_err());
+    controller.applying.set(true);
+    assert!(controller.delete_wallpaper(&first).is_err());
+    assert!(first.exists());
+    controller.applying.set(false);
+
+    controller.delete_wallpaper(&first).unwrap();
+    assert!(!first.exists());
+    assert!(second.exists());
+    let snapshot = receiver.try_recv().unwrap();
+    assert_eq!(snapshot.current, None);
+    assert_eq!(snapshot.gallery_revision, 1);
+    assert_eq!(snapshot.gallery_order, [wallpaper_key(&second)]);
+    let saved = WallpaperSettings::load();
+    assert_eq!(saved.current, None);
+    assert_eq!(
+        saved.gallery_orders[&wallpaper_key(&directory)],
+        [wallpaper_key(&second)]
+    );
+    assert!(controller.delete_wallpaper(&first).is_err());
+    assert_eq!(controller.snapshot().gallery_revision, 1);
+    controller.delete_wallpaper(&second).unwrap();
+    assert!(!second.exists());
+    assert_eq!(controller.snapshot().gallery_revision, 2);
+
+    #[cfg(unix)]
+    {
+        let link = directory.join("link.png");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        controller.delete_wallpaper(&link).unwrap();
+        assert!(!link.exists());
+        assert!(
+            outside.exists(),
+            "deletion must unlink the selected entry only"
+        );
+    }
+}
+
+#[test]
+fn wallpaper_deletion_removes_only_confirmed_files_and_updates_saved_state() {
+    let directory =
+        env::temp_dir().join(format!("obsidian-wallpaper-delete-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let result = std::process::Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "widgets::wallpaper::tests::wallpaper_deletion_helper",
+            "--nocapture",
+        ])
+        .env("OBSIDIAN_WALLPAPER_DELETE_TEST_DIR", &directory)
+        .env("XDG_STATE_HOME", &directory)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(directory).unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn wallpaper_order_persists_per_folder_and_new_files_follow_saved_items() {
+    let root =
+        std::env::temp_dir().join(format!("obsidian-wallpaper-order-{}", std::process::id()));
+    fs::create_dir_all(root.join("first")).unwrap();
+    fs::create_dir_all(root.join("second")).unwrap();
+    let first = root.join("first");
+    let second = root.join("second");
+    for name in ["a.png", "b.png", "c.png"] {
+        fs::write(first.join(name), b"fixture").unwrap();
+    }
+    let expected = vec![
+        wallpaper_key(&first.join("c.png")),
+        wallpaper_key(&first.join("a.png")),
+        wallpaper_key(&first.join("b.png")),
+    ];
+    let mut settings = WallpaperSettings {
+        directory: first.clone(),
+        current: Some(first.join("a.png")),
+        ..Default::default()
+    };
+    settings
+        .gallery_orders
+        .insert(wallpaper_key(&first), expected.clone());
+    settings.gallery_orders.insert(
+        wallpaper_key(&second),
+        vec![wallpaper_key(&second.join("favorite.png"))],
+    );
+    let path = root.join("wallpaper.ini");
+    settings.save_to(&path).unwrap();
+    let loaded = WallpaperSettings::load_from(&path);
+    assert_eq!(loaded.gallery_orders, settings.gallery_orders);
+    assert_eq!(loaded.current, settings.current);
+    fs::write(first.join("0-new.png"), b"fixture").unwrap();
+    fs::remove_file(first.join("a.png")).unwrap();
+    let mut files = list_wallpapers(&first).unwrap();
+    super::super::reorder::sort_by_order(
+        &mut files,
+        &loaded.gallery_orders[&wallpaper_key(&first)],
+        |path| wallpaper_key(path),
+    );
+    assert_eq!(
+        files,
+        [
+            first.join("c.png"),
+            first.join("b.png"),
+            first.join("0-new.png")
+        ]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 const PDEATH_HELPER_FILE: &str = "OBSIDIAN_BAR_PDEATH_HELPER_FILE";
 

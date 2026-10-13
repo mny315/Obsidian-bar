@@ -1,6 +1,6 @@
 use super::{AWWW_TRANSITION_DURATION, WallpaperError, is_image_wallpaper, is_video_wallpaper};
 use crate::widgets::{command, run_background_async};
-use gtk::glib;
+use gtk::{gdk, glib, prelude::*};
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Write};
@@ -30,7 +30,6 @@ static AWWW_DAEMON: command::ExternalProgram = command::ExternalProgram::new(
 );
 const AWWW_LAYER: &str = "background";
 const MPVPAPER_LAYER: &str = "background";
-const AWWW_TRANSITION_FPS: &str = "120";
 const AWWW_TRANSITION_STEP: &str = "45";
 const AWWW_TRANSPARENT: &str = "00000000";
 pub(super) const AWWW_TRANSITIONS: [&str; 7] =
@@ -439,13 +438,31 @@ pub(super) async fn apply_awww_image(
         OsString::from("--transition-duration"),
         OsString::from(AWWW_TRANSITION_DURATION.as_secs_f64().to_string()),
         OsString::from("--transition-fps"),
-        OsString::from(AWWW_TRANSITION_FPS),
+        OsString::from(awww_transition_fps().to_string()),
         OsString::from("--transition-step"),
         OsString::from(AWWW_TRANSITION_STEP),
     ];
     append_awww_outputs(&mut args);
     args.push(path.into_os_string());
     run_awww_command(args, "img").await
+}
+
+fn awww_transition_fps() -> u32 {
+    // awww requires a numeric rate. Re-read the monitors for each transition
+    // so mode changes and newly attached high-refresh displays take effect.
+    let fastest = if gtk::is_initialized_main_thread() {
+        gdk::Display::default().and_then(|display| {
+            let monitors = display.monitors();
+            (0..monitors.n_items())
+                .filter_map(|index| monitors.item(index).and_downcast::<gdk::Monitor>())
+                .map(|monitor| monitor.refresh_rate())
+                .filter(|rate| *rate > 0)
+                .max()
+        })
+    } else {
+        None
+    };
+    fastest.map_or(120, |rate| (rate as u32).div_ceil(1_000))
 }
 
 pub(super) async fn apply_awww_image_immediate(

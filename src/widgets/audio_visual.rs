@@ -9,7 +9,7 @@ pub(super) fn volume_icon(volume: f64, muted: bool) -> &'static str {
         ICON_MUTED
     } else if volume <= 0.01 {
         ICON_ZERO
-    } else if volume < 0.5 {
+    } else if volume < 0.3 {
         ICON_LOW
     } else {
         ICON_HIGH
