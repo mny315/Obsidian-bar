@@ -18,6 +18,8 @@ fn peripheral_battery_names_and_selection_stay_independent() {
             name: name.into(),
             percent: Some(percent),
             detail: "Discharging".into(),
+            power_off: (id == "steam:controller")
+                .then(|| batteries::PowerOffTarget::SteamController { id: id.into() }),
         });
     }
     let (metrics, meter) = display_metrics(MonitorSection::Battery, &snapshot);
@@ -29,13 +31,22 @@ fn peripheral_battery_names_and_selection_stay_independent() {
     for (metric, battery) in metrics.iter().zip(&snapshot.device_batteries) {
         assert_eq!(metric.id, battery.id);
         assert_eq!(metric.label, battery.name);
+        assert_eq!(metric.power_off, battery.power_off);
     }
     let mut settings = MonitorSettings::default();
     settings.set_metric_visible(MonitorSection::Battery, "bolt:mouse", false);
+    settings
+        .metric_names
+        .insert("battery:steam:controller".into(), "Gamepad".into());
     let (selected, _, _) = selected_metrics(MonitorSection::Battery, &snapshot, &settings);
     assert_eq!(selected.len(), 3);
     assert_eq!(selected[0].label, "MX Keys S");
     assert_eq!(selected[2].value, "95%");
+    assert_eq!(selected[1].label, "Gamepad");
+    assert_eq!(
+        selected[1].power_off,
+        snapshot.device_batteries[2].power_off
+    );
 }
 
 #[test]
@@ -63,7 +74,15 @@ fn peripheral_battery_labels_fit_narrow_panel() {
             ("headset", "HyperX Cloud III S Wireless", "95%"),
         ]
         .into_iter()
-        .map(|(id, name, value)| DisplayMetric::new(id, name, value))
+        .map(|(id, name, value)| {
+            let mut metric = DisplayMetric::new(id, name, value);
+            if id == "steam" {
+                metric.power_off = Some(batteries::PowerOffTarget::SteamController {
+                    id: "steam:test-missing-receiver:1".into(),
+                });
+            }
+            metric
+        })
         .collect(),
         None,
         false,
@@ -82,6 +101,8 @@ fn peripheral_battery_labels_fit_narrow_panel() {
     window.present();
     super::super::test_support::pump(350);
     assert_eq!(window.width(), PANEL_MIN_WIDTH);
+    super::super::test_support::capture_if_requested(&window, "battery-names");
+    let mut power_button = None;
     let mut child = section.rows.first_child();
     while let Some(row) = child {
         let label = row
@@ -91,15 +112,81 @@ fn peripheral_battery_labels_fit_narrow_panel() {
             .unwrap()
             .downcast::<gtk::Label>()
             .unwrap();
-        let value = row.last_child().unwrap().downcast::<gtk::Label>().unwrap();
+        let value = label
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
         assert!(!label.layout().is_ellipsized());
         let bounds = label.compute_bounds(&row).unwrap();
         let value_bounds = value.compute_bounds(&row).unwrap();
         assert!(bounds.x() + bounds.width() <= value_bounds.x());
         assert!(value_bounds.x() + value_bounds.width() <= row.width() as f32);
+        if label.text() == "Steam Controller" {
+            let button = value
+                .next_sibling()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            let bounds = button.compute_bounds(&row).unwrap();
+            assert!(value_bounds.x() + value_bounds.width() <= bounds.x());
+            assert!(
+                bounds.x() + bounds.width() <= row.width() as f32,
+                "button bounds {bounds:?}, row width {}, button width {}",
+                row.width(),
+                button.width()
+            );
+            assert_eq!(
+                button.tooltip_text().as_deref(),
+                Some("Turn off Steam Controller")
+            );
+            power_button = Some(button);
+        } else {
+            assert!(value.next_sibling().is_none());
+        }
         child = row.next_sibling();
     }
-    super::super::test_support::capture_if_requested(&window, "battery-names");
+    // A nonexistent receiver exercises the background error/retry path without
+    // sending a command to any attached device.
+    let button = power_button.unwrap();
+    button.emit_clicked();
+    assert!(!button.is_sensitive());
+    button.emit_clicked();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !button.is_sensitive() && std::time::Instant::now() < deadline {
+        super::super::test_support::pump(20);
+    }
+    assert!(button.is_sensitive());
+    assert!(button.has_css_class("error"));
+    assert!(
+        button
+            .tooltip_text()
+            .unwrap()
+            .contains("receiver unavailable")
+    );
+    let mut metric = DisplayMetric::new("steam", "Steam Controller", "61%");
+    section.update(vec![metric.clone()], None, false);
+    assert!(
+        section
+            .rows
+            .first_child()
+            .unwrap()
+            .last_child()
+            .unwrap()
+            .is::<gtk::Label>()
+    );
+    metric.power_off = Some(batteries::PowerOffTarget::SteamController {
+        id: "steam:test-missing-receiver:1".into(),
+    });
+    section.update(vec![metric.clone()], None, false);
+    let button = section.rows.first_child().unwrap().last_child().unwrap();
+    assert!(button.is::<gtk::Button>());
+    metric.value = "60%".into();
+    section.update(vec![metric], None, false);
+    assert_eq!(
+        section.rows.first_child().unwrap().last_child().unwrap(),
+        button
+    );
     window.close();
 }
 

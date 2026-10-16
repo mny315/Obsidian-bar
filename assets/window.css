@@ -158,6 +158,29 @@ separator.system-monitor-divider {
   opacity: 0.98;
 }
 
+button.system-monitor-device-power {
+  min-width: 1.45em;
+  min-height: 1.45em;
+  padding: 0;
+  border: none;
+  border-radius: 0.36em;
+  background: transparent;
+  color: @fg;
+  box-shadow: none;
+}
+
+button.system-monitor-device-power:hover {
+  background: alpha(@theme_fg_color,0.14);
+}
+
+button.system-monitor-device-power:disabled {
+  opacity: 0.5;
+}
+
+button.system-monitor-device-power.error {
+  color: #ef9a9a;
+}
+
 .system-monitor-network-graph {
   min-height: 6.55em;
   color: @fg;

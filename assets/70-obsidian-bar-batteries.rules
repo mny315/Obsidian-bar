@@ -1,4 +1,4 @@
-# Battery telemetry for the active local session only.
+# Battery telemetry and explicit Steam Controller power-off for the active local session only.
 # Match USB device and interface in separate rules (different sysfs parents).
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c548", ENV{.OBSIDIAN_BOLT}="1"
 SUBSYSTEM=="hidraw", ENV{.OBSIDIAN_BOLT}=="1", ATTRS{bInterfaceNumber}=="02", TAG+="uaccess"

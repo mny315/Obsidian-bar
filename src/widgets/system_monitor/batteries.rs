@@ -13,12 +13,33 @@ use std::{
 
 mod hid;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PowerOffTarget {
+    SteamController { id: String },
+}
+
+impl PowerOffTarget {
+    pub(super) fn turn_off(&self) -> Result<(), String> {
+        let result = match self {
+            Self::SteamController { id } => hid::power_off_steam_controller(id),
+        };
+        result.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "Access needed: apply the receiver udev rules and reconnect it".into()
+            } else {
+                error.to_string()
+            }
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct DeviceBattery {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) percent: Option<f64>,
     pub(super) detail: String,
+    pub(super) power_off: Option<PowerOffTarget>,
 }
 
 impl DeviceBattery {
@@ -148,6 +169,7 @@ fn read_sysfs(root: &Path) -> Vec<DeviceBattery> {
                 name,
                 percent,
                 detail,
+                power_off: None,
             })
         })
         .collect()
@@ -261,6 +283,7 @@ fn from_upower(path: &str, props: &Properties) -> Option<DeviceBattery> {
         name,
         percent,
         detail,
+        power_off: None,
     })
 }
 
@@ -275,6 +298,7 @@ mod tests {
             name: name.into(),
             percent,
             detail: detail.into(),
+            power_off: None,
         };
         for reverse in [false, true] {
             let mut readings = vec![

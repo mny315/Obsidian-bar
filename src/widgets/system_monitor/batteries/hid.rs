@@ -1,10 +1,10 @@
-//! Battery-only receiver protocols; no pairing, input mappings or device settings.
-use super::{DeviceBattery, read_trimmed, sorted_directory_paths};
+//! Receiver telemetry and explicitly requested Steam Controller power-off.
+use super::{DeviceBattery, PowerOffTarget, read_trimmed, sorted_directory_paths};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU8, Ordering},
     time::{Duration, Instant},
 };
@@ -60,6 +60,7 @@ fn unavailable(id: String, name: &str, detail: &str) -> DeviceBattery {
         name: name.into(),
         percent: None,
         detail: detail.into(),
+        power_off: None,
     }
 }
 
@@ -102,19 +103,14 @@ pub(super) fn read_devices() -> Vec<DeviceBattery> {
                 ),
                 Err(_) => {}
             }
-        } else if matches!(id, "0003:000028DE:00001304" | "0003:000028DE:00001305")
-            && let Some(slot) = phys
-                .rsplit_once("/input")
-                .and_then(|(_, n)| n.parse::<u8>().ok())
-                .filter(|n| (2..=5).contains(n))
-        {
+        } else if let Some((id, slot)) = steam_identity(&event) {
             // Each Puck interface is a distinct controller slot. Opening hidraw
             // read-only gives us our own event queue without touching Steam's.
             if let Ok(file) = open(&node, false) {
                 steam.push(SteamSlot {
                     file,
-                    id: format!("steam:{serial}:{}", slot - 1),
-                    slot: slot - 1,
+                    id,
+                    slot,
                     battery: None,
                 });
             }
@@ -340,7 +336,90 @@ fn read_hyperx(file: &mut File, id: String) -> Option<DeviceBattery> {
             "Discharging"
         }
         .into(),
+        power_off: None,
     })
+}
+
+fn steam_identity(event: &str) -> Option<(String, u8)> {
+    let field = |key| event.lines().find_map(|line| line.strip_prefix(key));
+    if !matches!(
+        field("HID_ID=")?,
+        "0003:000028DE:00001304" | "0003:000028DE:00001305"
+    ) {
+        return None;
+    }
+    let phys = field("HID_PHYS=")?;
+    let interface = phys.rsplit_once("/input")?.1.parse::<u8>().ok()?;
+    if !(2..=5).contains(&interface) {
+        return None;
+    }
+    let serial = field("HID_UNIQ=").filter(|s| !s.is_empty()).unwrap_or(phys);
+    let slot = interface - 1;
+    Some((format!("steam:{serial}:{slot}"), slot))
+}
+
+fn steam_device_path(root: &Path, id: &str) -> io::Result<PathBuf> {
+    sorted_directory_paths(root)
+        .into_iter()
+        .find(|path| {
+            read_trimmed(path.join("device/uevent"))
+                .and_then(|event| steam_identity(&event))
+                .is_some_and(|(candidate, _)| candidate == id)
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Steam Controller receiver unavailable",
+            )
+        })
+}
+
+fn steam_power_off_report() -> [u8; 64] {
+    // Puck feature report 1 relays 0x9f + length + "off!" to THIS slot.
+    // https://github.com/safijari/openpuck/blob/main/OpenPuck/puck_hid.cpp
+    let mut report = [0_u8; 64];
+    report[..7].copy_from_slice(&[0x01, 0x9f, 0x04, b'o', b'f', b'f', b'!']);
+    report
+}
+
+pub(super) fn power_off_steam_controller(id: &str) -> io::Result<()> {
+    // Resolve again at click time: hidraw numbers can change after reconnecting.
+    let path = steam_device_path(Path::new("/sys/class/hidraw"), id)?;
+    let device = std::fs::canonicalize(path.join("device"))?;
+    let node = Path::new("/dev").join(path.file_name().expect("hidraw entry has a filename"));
+    let file = open(&node, true)?;
+    if std::fs::canonicalize(path.join("device"))? != device
+        || read_trimmed(path.join("device/uevent"))
+            .and_then(|event| steam_identity(&event))
+            .is_none_or(|(candidate, _)| candidate != id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Steam Controller receiver changed",
+        ));
+    }
+    let mut report = steam_power_off_report();
+    // Linux HIDIOCSFEATURE(64), including the report ID byte.
+    let request = (3_u32 << 30) | (64 << 16) | (u32::from(b'H') << 8) | 6;
+    // SAFETY: file is open and the request encodes the size of this live buffer.
+    let written = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            request as libc::c_ulong,
+            report.as_mut_ptr(),
+        )
+    };
+    if written < 0 {
+        Err(io::Error::last_os_error())
+    } else if written as usize != report.len() {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "Incomplete power-off command",
+        ))
+    } else {
+        // USB delivery succeeded; the next battery poll observes disappearance.
+        Ok(())
+    }
 }
 
 struct SteamSlot {
@@ -417,6 +496,9 @@ fn read_steam(slots: &mut [SteamSlot]) -> Vec<DeviceBattery> {
                     name,
                     percent: Some(percent),
                     detail: detail.into(),
+                    power_off: Some(PowerOffTarget::SteamController {
+                        id: slot.id.clone(),
+                    }),
                 });
             } else if report.len() >= 2 && matches!(report[0], 0x46 | 0x79) && report[1] == 1 {
                 slot.battery = None;
@@ -435,6 +517,87 @@ fn read_steam(slots: &mut [SteamSlot]) -> Vec<DeviceBattery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn puck_event(product: &str, serial: &str, interface: u8) -> String {
+        format!(
+            "HID_ID=0003:000028DE:{product}\nHID_PHYS=usb-test/input{interface}\nHID_UNIQ={serial}\n"
+        )
+    }
+
+    #[test]
+    fn steam_power_off_is_limited_to_puck_controller_interfaces() {
+        for product in ["00001304", "00001305"] {
+            for interface in 0..=6 {
+                let identity = steam_identity(&puck_event(product, "receiver", interface));
+                if (2..=5).contains(&interface) {
+                    assert_eq!(
+                        identity,
+                        Some((format!("steam:receiver:{}", interface - 1), interface - 1))
+                    );
+                } else {
+                    assert!(identity.is_none());
+                }
+            }
+        }
+        assert!(steam_identity(&puck_event("00001142", "receiver", 2)).is_none());
+        assert!(steam_identity("HID_ID=0003:000028DE:00001304").is_none());
+        assert_eq!(
+            steam_identity(&puck_event("00001304", "", 3)),
+            Some(("steam:usb-test/input3:2".into(), 2))
+        );
+
+        // Captured Puck feature report: ID 1, TURN_OFF_CONTROLLER, payload size 4, "off!".
+        let report = steam_power_off_report();
+        assert_eq!(&report[..7], b"\x01\x9f\x04off!");
+        assert_eq!(report.len(), 64);
+        assert!(report[7..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn steam_power_off_resolves_receiver_and_slot_again_after_reconnect() {
+        let root =
+            std::env::temp_dir().join(format!("obsidian-steam-power-{}", std::process::id()));
+        let add = |node: &str, serial: &str, interface| {
+            let path = root.join(node).join("device");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("uevent"),
+                puck_event("00001304", serial, interface),
+            )
+            .unwrap();
+        };
+        add("hidraw1", "first", 2);
+        add("hidraw2", "first", 3);
+        add("hidraw3", "second", 2);
+        assert_eq!(
+            steam_device_path(&root, "steam:first:1").unwrap(),
+            root.join("hidraw1")
+        );
+        assert_eq!(
+            steam_device_path(&root, "steam:first:2").unwrap(),
+            root.join("hidraw2")
+        );
+        assert_eq!(
+            steam_device_path(&root, "steam:second:1").unwrap(),
+            root.join("hidraw3")
+        );
+        std::fs::rename(root.join("hidraw1"), root.join("hidraw8")).unwrap();
+        add("hidraw1", "replacement", 2);
+        assert_eq!(
+            steam_device_path(&root, "steam:first:1").unwrap(),
+            root.join("hidraw8")
+        );
+        assert_eq!(
+            steam_device_path(&root, "steam:missing:1")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(steam_device_path(&root, "steam:first:3").is_err());
+        assert!(steam_device_path(&root, "device:mouse").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn hidpp_client_ids_do_not_collide_with_kernel_or_common_clients() {
         let mut previous = None;

@@ -1,10 +1,11 @@
+use super::batteries::PowerOffTarget;
 use super::gpu;
 use super::{
     ICON_MONITOR, METRIC_METER, MonitorSection, MonitorSettings, SCALE_MILLI_DEFAULT,
     SystemSnapshot, scaled_pixels,
 };
-use crate::widgets::clear_box;
-use gtk::{gdk, prelude::*};
+use crate::widgets::{clear_box, run_background};
+use gtk::{gdk, glib, prelude::*};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
@@ -19,6 +20,7 @@ pub(super) struct DisplayMetric {
     pub(super) value: String,
     pub(super) group: Option<MetricGroup>,
     pub(super) fraction: Option<f64>,
+    pub(super) power_off: Option<PowerOffTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +41,7 @@ impl DisplayMetric {
             value: value.into(),
             group: None,
             fraction: None,
+            power_off: None,
         }
     }
 }
@@ -182,6 +185,7 @@ pub(super) struct SectionView {
     pub(super) rows: gtk::Box,
     pub(super) signature: RefCell<Vec<(String, String)>>,
     pub(super) metric_groups: RefCell<Vec<Option<MetricGroup>>>,
+    power_off_targets: RefCell<Vec<Option<PowerOffTarget>>>,
     pub(super) metric_views: RefCell<Vec<MetricView>>,
     pub(super) meter: Option<MeterView>,
     pub(super) graph: Option<gtk::DrawingArea>,
@@ -240,6 +244,7 @@ impl SectionView {
             rows,
             signature: RefCell::new(Vec::new()),
             metric_groups: RefCell::new(Vec::new()),
+            power_off_targets: RefCell::new(Vec::new()),
             metric_views: RefCell::new(Vec::new()),
             meter,
             graph,
@@ -264,7 +269,14 @@ impl SectionView {
             .iter()
             .map(|metric| metric.group.clone())
             .collect::<Vec<_>>();
-        if *self.signature.borrow() != signature || *self.metric_groups.borrow() != groups {
+        let power_off_targets = metrics
+            .iter()
+            .map(|metric| metric.power_off.clone())
+            .collect::<Vec<_>>();
+        if *self.signature.borrow() != signature
+            || *self.metric_groups.borrow() != groups
+            || *self.power_off_targets.borrow() != power_off_targets
+        {
             self.minimum_width.set(0);
             clear_box(&self.rows);
             let mut views = self.metric_views.borrow_mut();
@@ -320,11 +332,15 @@ impl SectionView {
                 row.append(&accent);
                 row.append(&label);
                 row.append(&value);
+                if let Some(target) = &metric.power_off {
+                    row.append(&power_off_button(target.clone(), &metric.label));
+                }
                 self.rows.append(&row);
                 views.push(MetricView::Value(value));
             }
             self.signature.replace(signature);
             self.metric_groups.replace(groups);
+            self.power_off_targets.replace(power_off_targets);
         }
 
         for (view, metric) in self.metric_views.borrow().iter().zip(&metrics) {
@@ -380,6 +396,64 @@ impl SectionView {
             graph.queue_draw();
         }
     }
+}
+
+fn power_off_button(target: PowerOffTarget, name: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name("system-shutdown-symbolic");
+    button.add_css_class("system-monitor-device-power");
+    button.set_valign(gtk::Align::Center);
+    let tooltip = format!("Turn off {name}");
+    button.set_tooltip_text(Some(&tooltip));
+    button.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
+    button.connect_clicked(move |button| {
+        if !button.is_sensitive() {
+            return;
+        }
+        button.set_sensitive(false);
+        button.remove_css_class("error");
+        button.set_icon_name("content-loading-symbolic");
+        button.set_tooltip_text(Some("Sending power-off command…"));
+        let weak = button.downgrade();
+        let target = target.clone();
+        let tooltip = tooltip.clone();
+        run_background(
+            move || target.turn_off(),
+            move |result| {
+                let Some(button) = weak.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        button.set_icon_name("emblem-ok-symbolic");
+                        button.set_tooltip_text(Some("Power-off command sent"));
+                        // A successful USB transfer is not a wireless acknowledgement.
+                        // Let the next battery poll remove the row; allow retry if
+                        // it stays visible (or the controller is switched on again).
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_secs(15),
+                            move || {
+                                if let Some(button) = weak.upgrade() {
+                                    button.set_icon_name("system-shutdown-symbolic");
+                                    button.set_tooltip_text(Some(&tooltip));
+                                    button.set_sensitive(true);
+                                }
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "device power-off failed");
+                        button.set_icon_name("dialog-warning-symbolic");
+                        button.add_css_class("error");
+                        button.set_tooltip_text(Some(&format!(
+                            "Could not turn off device: {error}. Click to retry."
+                        )));
+                        button.set_sensitive(true);
+                    }
+                }
+            },
+        );
+    });
+    button
 }
 
 pub(super) struct MonitorLayout {
@@ -757,11 +831,10 @@ pub(super) fn display_metrics(
         }
         MonitorSection::Battery => {
             for battery in &snapshot.device_batteries {
-                metrics.push(DisplayMetric::new(
-                    &battery.id,
-                    &battery.name,
-                    battery.display_value(),
-                ));
+                let mut metric =
+                    DisplayMetric::new(&battery.id, &battery.name, battery.display_value());
+                metric.power_off.clone_from(&battery.power_off);
+                metrics.push(metric);
             }
             if let Some(battery) = snapshot.battery.as_ref() {
                 metrics.push(DisplayMetric::new(
