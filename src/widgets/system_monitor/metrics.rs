@@ -330,11 +330,16 @@ impl SectionView {
                 value.set_justify(gtk::Justification::Right);
 
                 row.append(&accent);
-                row.append(&label);
-                row.append(&value);
                 if let Some(target) = &metric.power_off {
-                    row.append(&power_off_button(target.clone(), &metric.label));
+                    row.append(&device_name_with_power(
+                        &label,
+                        target.clone(),
+                        &metric.label,
+                    ));
+                } else {
+                    row.append(&label);
                 }
+                row.append(&value);
                 self.rows.append(&row);
                 views.push(MetricView::Value(value));
             }
@@ -396,6 +401,42 @@ impl SectionView {
             graph.queue_draw();
         }
     }
+}
+
+fn device_name_with_power(label: &gtk::Label, target: PowerOffTarget, name: &str) -> gtk::Box {
+    let group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    group.add_css_class("system-monitor-device-name");
+    group.set_hexpand(true);
+    group.set_halign(gtk::Align::Start);
+    label.set_hexpand(false);
+    let button = power_off_button(target, name);
+    button.set_can_target(false);
+    group.append(label);
+    group.append(&button);
+
+    // Only entering the name reveals the action. Keep it available across the
+    // gap and the button itself, and reserve its space so readings never jump.
+    let motion = gtk::EventControllerMotion::new();
+    let weak_group = group.downgrade();
+    let weak_button = button.downgrade();
+    motion.connect_enter(move |_, _, _| {
+        if let (Some(group), Some(button)) = (weak_group.upgrade(), weak_button.upgrade()) {
+            group.add_css_class("power-visible");
+            button.set_can_target(true);
+        }
+    });
+    label.add_controller(motion);
+    let motion = gtk::EventControllerMotion::new();
+    let weak_group = group.downgrade();
+    let weak_button = button.downgrade();
+    motion.connect_leave(move |_| {
+        if let (Some(group), Some(button)) = (weak_group.upgrade(), weak_button.upgrade()) {
+            group.remove_css_class("power-visible");
+            button.set_can_target(false);
+        }
+    });
+    group.add_controller(motion);
+    group
 }
 
 fn power_off_button(target: PowerOffTarget, name: &str) -> gtk::Button {

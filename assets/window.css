@@ -162,18 +162,27 @@ button.system-monitor-device-power {
   min-width: 1.45em;
   min-height: 1.45em;
   padding: 0;
+  margin-left: 0.36em;
   border: none;
   border-radius: 0.36em;
   background: transparent;
   color: @fg;
   box-shadow: none;
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.power-visible button.system-monitor-device-power,
+button.system-monitor-device-power:focus-visible {
+  opacity: 1;
 }
 
 button.system-monitor-device-power:hover {
   background: alpha(@theme_fg_color,0.14);
 }
 
-button.system-monitor-device-power:disabled {
+.power-visible button.system-monitor-device-power:disabled,
+button.system-monitor-device-power:focus-visible:disabled {
   opacity: 0.5;
 }
 
@@ -318,10 +327,21 @@ button.system-monitor-settings-pin:checked:hover {
   background: alpha(@theme_fg_color,0.045);
 }
 
-.system-monitor-settings-adjustments > title {
+button.system-monitor-settings-adjustments-toggle {
   min-height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  color: @fg;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
   font-size: 1.09em;
   font-weight: 500;
+}
+
+button.system-monitor-settings-adjustments-toggle:hover {
+  background: @hover_bg;
 }
 
 .system-monitor-settings-slider-row .system-monitor-settings-section-title {

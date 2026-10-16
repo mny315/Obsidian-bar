@@ -250,8 +250,17 @@ impl MonitorSettingsPanel {
             .into_iter()
             .filter_map(settings_popover)
             .collect();
-        let adjustments = gtk::Expander::new(Some("Size and timing"));
+        let adjustments = gtk::Box::new(gtk::Orientation::Vertical, 0);
         adjustments.add_css_class("system-monitor-settings-adjustments");
+        let expand = gtk::ToggleButton::new();
+        expand.add_css_class("system-monitor-settings-adjustments-toggle");
+        expand.update_state(&[gtk::accessible::State::Expanded(Some(false))]);
+        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        let chevron = gtk::Label::new(Some(ICON_EXPAND));
+        chevron.add_css_class("system-monitor-settings-button-icon");
+        heading.append(&chevron);
+        heading.append(&gtk::Label::new(Some("Size and timing")));
+        expand.set_child(Some(&heading));
         let sliders = gtk::Box::new(gtk::Orientation::Vertical, 2);
         sliders.set_margin_top(6);
         for row in [
@@ -263,7 +272,22 @@ impl MonitorSettingsPanel {
         ] {
             sliders.append(row);
         }
-        adjustments.set_child(Some(&sliders));
+        let reveal = gtk::Revealer::new();
+        reveal.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+        reveal.set_transition_duration(180);
+        reveal.set_child(Some(&sliders));
+        let expansion = reveal.clone();
+        expand.connect_toggled(move |toggle| {
+            expansion.set_reveal_child(toggle.is_active());
+            toggle.update_state(&[gtk::accessible::State::Expanded(Some(toggle.is_active()))]);
+            chevron.set_label(if toggle.is_active() {
+                ICON_COLLAPSE
+            } else {
+                ICON_EXPAND
+            });
+        });
+        adjustments.append(&expand);
+        adjustments.append(&reveal);
         root.append(&adjustments);
         root.append(&settings_control_row("Display", &output));
         root.append(&settings_control_row("Network interface", &network));

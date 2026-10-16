@@ -105,41 +105,61 @@ fn peripheral_battery_labels_fit_narrow_panel() {
     let mut power_button = None;
     let mut child = section.rows.first_child();
     while let Some(row) = child {
-        let label = row
-            .first_child()
-            .unwrap()
-            .next_sibling()
-            .unwrap()
-            .downcast::<gtk::Label>()
-            .unwrap();
-        let value = label
-            .next_sibling()
-            .unwrap()
-            .downcast::<gtk::Label>()
-            .unwrap();
+        let name = row.first_child().unwrap().next_sibling().unwrap();
+        let label = name.clone().downcast::<gtk::Label>().unwrap_or_else(|_| {
+            name.first_child()
+                .unwrap()
+                .downcast::<gtk::Label>()
+                .unwrap()
+        });
+        let value = row.last_child().unwrap().downcast::<gtk::Label>().unwrap();
         assert!(!label.layout().is_ellipsized());
         let bounds = label.compute_bounds(&row).unwrap();
         let value_bounds = value.compute_bounds(&row).unwrap();
         assert!(bounds.x() + bounds.width() <= value_bounds.x());
         assert!(value_bounds.x() + value_bounds.width() <= row.width() as f32);
         if label.text() == "Steam Controller" {
-            let button = value
+            let button = label
                 .next_sibling()
                 .unwrap()
                 .downcast::<gtk::Button>()
                 .unwrap();
-            let bounds = button.compute_bounds(&row).unwrap();
-            assert!(value_bounds.x() + value_bounds.width() <= bounds.x());
+            let button_bounds = button.compute_bounds(&row).unwrap();
+            assert!(bounds.x() + bounds.width() <= button_bounds.x());
             assert!(
-                bounds.x() + bounds.width() <= row.width() as f32,
-                "button bounds {bounds:?}, row width {}, button width {}",
-                row.width(),
-                button.width()
+                button_bounds.x() + button_bounds.width() <= value_bounds.x(),
+                "button {button_bounds:?} overlaps battery value {value_bounds:?}"
             );
             assert_eq!(
                 button.tooltip_text().as_deref(),
                 Some("Turn off Steam Controller")
             );
+            assert!(!button.can_target());
+            let motions = label.observe_controllers();
+            for index in 0..motions.n_items() {
+                if let Ok(motion) = motions
+                    .item(index)
+                    .unwrap()
+                    .downcast::<gtk::EventControllerMotion>()
+                {
+                    motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+                }
+            }
+            super::super::test_support::pump(220);
+            assert!(button.can_target());
+            assert_eq!(value.compute_bounds(&row).unwrap(), value_bounds);
+            super::super::test_support::capture_if_requested(&window, "battery-name-hover");
+            let motions = name.observe_controllers();
+            for index in 0..motions.n_items() {
+                if let Ok(motion) = motions
+                    .item(index)
+                    .unwrap()
+                    .downcast::<gtk::EventControllerMotion>()
+                {
+                    motion.emit_by_name::<()>("leave", &[]);
+                }
+            }
+            assert!(!button.can_target());
             power_button = Some(button);
         } else {
             assert!(value.next_sibling().is_none());
@@ -179,12 +199,30 @@ fn peripheral_battery_labels_fit_narrow_panel() {
         id: "steam:test-missing-receiver:1".into(),
     });
     section.update(vec![metric.clone()], None, false);
-    let button = section.rows.first_child().unwrap().last_child().unwrap();
+    let button = section
+        .rows
+        .first_child()
+        .unwrap()
+        .first_child()
+        .unwrap()
+        .next_sibling()
+        .unwrap()
+        .last_child()
+        .unwrap();
     assert!(button.is::<gtk::Button>());
     metric.value = "60%".into();
     section.update(vec![metric], None, false);
     assert_eq!(
-        section.rows.first_child().unwrap().last_child().unwrap(),
+        section
+            .rows
+            .first_child()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap()
+            .last_child()
+            .unwrap(),
         button
     );
     window.close();
@@ -561,10 +599,34 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
         .unwrap()
         .next_sibling()
         .unwrap()
-        .downcast::<gtk::Expander>()
+        .first_child()
+        .unwrap()
+        .downcast::<gtk::ToggleButton>()
         .unwrap();
-    adjustments.set_expanded(true);
+    let reveal = adjustments
+        .next_sibling()
+        .unwrap()
+        .downcast::<gtk::Revealer>()
+        .unwrap();
+    runtime.window.settings().set_gtk_enable_animations(true);
+    adjustments.set_active(true);
+    pump(60);
+    let opening_height = reveal.height();
+    assert!(opening_height > 0);
     pump(200);
+    let expanded_height = reveal.height();
+    assert!(
+        opening_height < expanded_height,
+        "Size settings must grow over multiple frames"
+    );
+    assert!(reveal.is_child_revealed());
+    adjustments.set_active(false);
+    pump(60);
+    assert!(reveal.height() > 0 && reveal.height() < expanded_height);
+    // Reverse a running transition as users can click the heading again.
+    adjustments.set_active(true);
+    pump(200);
+    assert_eq!(reveal.height(), expanded_height);
     runtime
         .settings_panel
         .height
@@ -1355,10 +1417,12 @@ fn monitor_drawer_animation_keeps_width_and_survives_reversal() {
         );
         let adjustments = descendants(runtime.settings_panel.root.upcast_ref())
             .into_iter()
-            .find_map(|widget| widget.downcast::<gtk::Expander>().ok())
+            .find(|widget| widget.has_css_class("system-monitor-settings-adjustments-toggle"))
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
             .unwrap();
-        assert!(!adjustments.is_expanded());
-        adjustments.set_expanded(true);
+        assert!(!adjustments.is_active());
+        adjustments.set_active(true);
         pump(200);
         assert_eq!(runtime.window.surface().unwrap().height(), height);
         for hovered in [false, true] {

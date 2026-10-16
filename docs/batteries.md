@@ -21,10 +21,12 @@ percentage. Sleeping Logitech devices show “Asleep / unavailable”.
 
 ## Turning off a controller
 
-Steam Controllers connected through a Puck have a power button beside their
-battery reading. Clicking it sends the controller's power-off command to that
-specific receiver slot in a background worker. Pairing is preserved; press the
-controller's Steam button to switch it on again.
+Steam Controllers connected through a Puck have a power button immediately after
+their name. It fades in when hovering the name or focusing the button with the
+keyboard, and stays visible while moving the pointer onto it. Clicking it sends
+the controller's power-off command to that specific receiver slot in a background
+worker. Pairing is preserved; press the controller's Steam button to switch it on
+again.
 
 The button pauses while sending, then shows a check when the USB command has
 been sent. This is not a wireless acknowledgement: the row disappears after a
