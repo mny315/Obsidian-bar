@@ -1638,8 +1638,8 @@ button.wallpaper-card:checked {
 }
 
 button.wallpaper-delete-corner {
-  min-width: 26px;
-  min-height: 26px;
+  min-width: 20px;
+  min-height: 20px;
   padding: 0;
   margin: 0;
   border: none;
@@ -1647,13 +1647,13 @@ button.wallpaper-delete-corner {
   background: linear-gradient(45deg, #ed5267 50%, transparent 50%);
   box-shadow: none;
   outline: none;
-  opacity: 0.5;
+  opacity: 0.35;
   transition: opacity 160ms ease;
 }
 
 button.wallpaper-delete-corner:hover,
 button.wallpaper-delete-corner:focus-visible {
-  opacity: 0.75;
+  opacity: 0.65;
 }
 
 .wallpaper-delete-confirmation {

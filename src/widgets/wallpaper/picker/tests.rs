@@ -84,6 +84,45 @@ fn gallery_loads_thumbnails_after_scrolling_reuses_cards_and_releases_widgets() 
         .clone()
         .downcast::<gtk::ScrolledWindow>()
         .unwrap();
+    let wheel = scroller
+        .observe_controllers()
+        .iter::<glib::Object>()
+        .filter_map(Result::ok)
+        .filter_map(|controller| controller.downcast::<gtk::EventControllerScroll>().ok())
+        .find(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture)
+        .unwrap();
+    let adjustment = scroller.vadjustment();
+    assert!(wheel.emit_by_name::<bool>("scroll", &[&0.0_f64, &1.0_f64]));
+    pump(45);
+    assert!(
+        adjustment.value() > 0.0 && adjustment.value() < 96.0,
+        "a wheel step must animate through intermediate positions: {}",
+        adjustment.value()
+    );
+    pump(220);
+    assert!(
+        (adjustment.value() - 96.0).abs() < 1.0,
+        "list layout must not interrupt a wheel step: {}",
+        adjustment.value()
+    );
+    for _ in 0..12 {
+        wheel.emit_by_name::<bool>("scroll", &[&0.0_f64, &1.0_f64]);
+    }
+    pump(300);
+    assert!(
+        (adjustment.value() - 1248.0).abs() < 1.0,
+        "accumulated wheel steps must finish across recycled rows: {}",
+        adjustment.value()
+    );
+    wheel.emit_by_name::<bool>("scroll", &[&0.0_f64, &-1.0_f64]);
+    pump(220);
+    assert!(
+        (adjustment.value() - 1152.0).abs() < 1.0,
+        "reverse scrolling must finish its wheel step: {}",
+        adjustment.value()
+    );
+    adjustment.set_value(0.0);
+    pump(100);
     for _ in 0..3 {
         let adjustment = scroller.vadjustment();
         adjustment.set_value(adjustment.upper() - adjustment.page_size());

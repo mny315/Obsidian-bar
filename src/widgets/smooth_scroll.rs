@@ -28,6 +28,7 @@ impl SmoothScrollConfig {
 struct ScrollState {
     active: Cell<bool>,
     updating_value: Cell<bool>,
+    last_value: Cell<f64>,
     tick: super::FrameCallback,
     start: Cell<f64>,
     target: Cell<f64>,
@@ -43,6 +44,7 @@ impl ScrollState {
     }
 
     fn set_value(&self, adjustment: &gtk::Adjustment, value: f64) {
+        self.last_value.set(value);
         self.updating_value.set(true);
         adjustment.set_value(value);
         self.updating_value.set(false);
@@ -52,15 +54,20 @@ impl ScrollState {
 pub(super) fn install_smooth_scroll(scroller: &gtk::ScrolledWindow, config: SmoothScrollConfig) {
     let state = Rc::new(ScrollState::default());
     let weak_state = Rc::downgrade(&state);
-    scroller.vadjustment().connect_value_changed(move |_| {
-        if let Some(state) = weak_state.upgrade()
-            && !state.updating_value.get()
-        {
-            // A category reset, scrollbar drag or layout correction takes
-            // precedence over the old animation target.
-            state.cancel();
-        }
-    });
+    scroller
+        .vadjustment()
+        .connect_value_changed(move |adjustment| {
+            // Virtualized lists round their scroll anchor to whole pixels
+            // during allocation, after set_value() has already returned.
+            if let Some(state) = weak_state.upgrade()
+                && !state.updating_value.get()
+                && (adjustment.value() - state.last_value.get()).abs() >= 1.0
+            {
+                // A category reset, scrollbar drag or layout correction takes
+                // precedence over the old animation target.
+                state.cancel();
+            }
+        });
     let weak_state = Rc::downgrade(&state);
     scroller.connect_unmap(move |_| {
         if let Some(state) = weak_state.upgrade() {
