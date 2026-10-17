@@ -11,7 +11,6 @@ use niri_ipc::Workspace;
 use super::run_background;
 use crate::{niri::ipc, widgets::bar_features::BarFeatureController};
 
-const STATE_CLASSES: &[&str] = &["occupied", "active", "focused", "urgent"];
 const URGENT_BLINK_CLASS: &str = "urgent-blink-on";
 const URGENT_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 
@@ -28,7 +27,7 @@ pub struct WorkspaceIndicator {
 struct WorkspaceChip {
     button: gtk::Button,
     core: gtk::Box,
-    urgent_blink_source: RefCell<Option<glib::SourceId>>,
+    urgent_blink: Rc<UrgentBlink>,
     state: Cell<Option<WorkspaceView>>,
 }
 
@@ -113,22 +112,28 @@ impl WorkspaceIndicator {
         }
 
         if *self.order.borrow() != ids {
-            while let Some(child) = self.row.first_child() {
-                self.row.remove(&child);
-            }
-
-            let chips = self.chips.borrow();
+            let visible_ids = ids.iter().copied().collect::<HashSet<_>>();
+            let mut chips = self.chips.borrow_mut();
+            chips.retain(|id, chip| {
+                if visible_ids.contains(id) {
+                    true
+                } else {
+                    self.row.remove(&chip.button);
+                    false
+                }
+            });
+            let mut previous = None::<gtk::Widget>;
             for id in &ids {
                 if let Some(chip) = chips.get(id) {
-                    self.row.append(&chip.button);
+                    if chip.button.parent().is_none() {
+                        self.row.insert_child_after(&chip.button, previous.as_ref());
+                    } else if chip.button.prev_sibling().as_ref() != previous.as_ref() {
+                        self.row
+                            .reorder_child_after(&chip.button, previous.as_ref());
+                    }
+                    previous = Some(chip.button.clone().upcast());
                 }
             }
-            drop(chips);
-
-            let visible_ids = ids.iter().copied().collect::<HashSet<_>>();
-            self.chips
-                .borrow_mut()
-                .retain(|id, _| visible_ids.contains(id));
             self.order.replace(ids);
         }
 
@@ -161,70 +166,132 @@ impl WorkspaceChip {
             );
         });
 
+        let urgent_blink = UrgentBlink::new(&button, &core);
         Self {
             button,
             core,
-            urgent_blink_source: RefCell::new(None),
+            urgent_blink,
             state: Cell::new(None),
         }
     }
 
     fn set_state(&self, view: WorkspaceView) {
-        if self.state.replace(Some(view)) == Some(view) {
+        let previous = self.state.replace(Some(view));
+        if previous == Some(view) {
             return;
         }
         let urgent = should_blink_urgent(view);
 
-        clear_state_classes(&self.button);
-        clear_state_classes(&self.core);
-
-        set_state_class(&self.button, "occupied", view.occupied);
-        set_state_class(&self.button, "active", view.active);
-        set_state_class(&self.button, "focused", view.focused);
-        set_state_class(&self.button, "urgent", urgent);
-
-        set_state_class(&self.core, "occupied", view.occupied);
-        set_state_class(&self.core, "active", view.active);
-        set_state_class(&self.core, "focused", view.focused);
-        set_state_class(&self.core, "urgent", urgent);
-
-        self.set_urgent_blinking(urgent);
-    }
-
-    fn set_urgent_blinking(&self, enabled: bool) {
-        if !enabled {
-            if let Some(source) = self.urgent_blink_source.borrow_mut().take() {
-                source.remove();
+        for (class, enabled, before) in [
+            (
+                "occupied",
+                view.occupied,
+                previous.map(|view| view.occupied),
+            ),
+            ("active", view.active, previous.map(|view| view.active)),
+            ("focused", view.focused, previous.map(|view| view.focused)),
+            ("urgent", urgent, previous.map(should_blink_urgent)),
+        ] {
+            if before != Some(enabled) {
+                set_state_class(&self.button, class, enabled);
+                set_state_class(&self.core, class, enabled);
             }
-            set_urgent_blink_phase(&self.button, &self.core, false);
-            return;
         }
 
-        if self.urgent_blink_source.borrow().is_some() {
-            return;
-        }
-
-        set_urgent_blink_phase(&self.button, &self.core, true);
-
-        let weak_button = self.button.downgrade();
-        let weak_core = self.core.downgrade();
-        let mut lit = true;
-        let source = glib::timeout_add_local(URGENT_BLINK_INTERVAL, move || {
-            let (Some(button), Some(core)) = (weak_button.upgrade(), weak_core.upgrade()) else {
-                return glib::ControlFlow::Break;
-            };
-
-            lit = !lit;
-            set_urgent_blink_phase(&button, &core, lit);
-            glib::ControlFlow::Continue
-        });
-        self.urgent_blink_source.replace(Some(source));
+        self.urgent_blink.set_enabled(urgent);
     }
 }
 
-impl Drop for WorkspaceChip {
+struct UrgentBlink {
+    button: glib::WeakRef<gtk::Button>,
+    core: glib::WeakRef<gtk::Box>,
+    enabled: Cell<bool>,
+    lit: Cell<bool>,
+    source: RefCell<Option<glib::SourceId>>,
+}
+
+impl UrgentBlink {
+    fn new(button: &gtk::Button, core: &gtk::Box) -> Rc<Self> {
+        let blink = Rc::new(Self {
+            button: button.downgrade(),
+            core: core.downgrade(),
+            enabled: Cell::new(false),
+            lit: Cell::new(false),
+            source: RefCell::new(None),
+        });
+        let weak = Rc::downgrade(&blink);
+        button.connect_map(move |_| {
+            if let Some(blink) = weak.upgrade() {
+                blink.start();
+            }
+        });
+        let weak = Rc::downgrade(&blink);
+        button.connect_unmap(move |_| {
+            if let Some(blink) = weak.upgrade() {
+                blink.cancel();
+            }
+        });
+        blink
+    }
+
+    fn set_enabled(self: &Rc<Self>, enabled: bool) {
+        if self.enabled.replace(enabled) == enabled {
+            return;
+        }
+        self.set_phase(enabled);
+        if enabled {
+            self.start();
+        } else {
+            self.cancel();
+        }
+    }
+
+    fn start(self: &Rc<Self>) {
+        if !self.enabled.get() || self.source.borrow().is_some() || !self.is_mapped() {
+            return;
+        }
+        self.set_phase(true);
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local(URGENT_BLINK_INTERVAL, move || {
+            let Some(blink) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !blink.enabled.get() || !blink.is_mapped() {
+                blink.source.borrow_mut().take();
+                return glib::ControlFlow::Break;
+            }
+            blink.set_phase(!blink.lit.get());
+            glib::ControlFlow::Continue
+        });
+        self.source.replace(Some(source));
+    }
+
+    fn is_mapped(&self) -> bool {
+        self.button
+            .upgrade()
+            .is_some_and(|button| button.is_mapped())
+    }
+
+    fn set_phase(&self, lit: bool) {
+        if self.lit.replace(lit) == lit {
+            return;
+        }
+        if let (Some(button), Some(core)) = (self.button.upgrade(), self.core.upgrade()) {
+            set_urgent_blink_phase(&button, &core, lit);
+        }
+    }
+
+    fn cancel(&self) {
+        let source = self.source.borrow_mut().take();
+        if let Some(source) = source {
+            source.remove();
+        }
+    }
+}
+
+impl Drop for UrgentBlink {
     fn drop(&mut self) {
-        if let Some(source) = self.urgent_blink_source.get_mut().take() {
+        if let Some(source) = self.source.get_mut().take() {
             source.remove();
         }
     }
@@ -244,15 +311,11 @@ fn should_blink_urgent(view: WorkspaceView) -> bool {
     view.urgent && !view.active && !view.focused
 }
 
-fn clear_state_classes(widget: &impl IsA<gtk::Widget>) {
-    for class in STATE_CLASSES {
-        widget.remove_css_class(class);
-    }
-}
-
 fn set_state_class(widget: &impl IsA<gtk::Widget>, class: &str, enabled: bool) {
     if enabled {
         widget.add_css_class(class);
+    } else {
+        widget.remove_css_class(class);
     }
 }
 
@@ -298,6 +361,158 @@ fn visible_workspaces(workspaces: &[Workspace], output: Option<&str>) -> Vec<Wor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK Wayland; checks chip retention and hidden timer cancellation without moving the pointer"]
+    fn workspace_changes_keep_surviving_chips_parented_and_update_their_classes() {
+        gtk::init().unwrap();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        root.append(&row);
+        let indicator = WorkspaceIndicator {
+            root,
+            row,
+            output: Some("DP-1".into()),
+            chips: RefCell::new(HashMap::new()),
+            order: RefCell::new(Vec::new()),
+            enabled: Rc::new(Cell::new(true)),
+            has_content: Rc::new(Cell::new(false)),
+        };
+        indicator.set_workspaces(&[
+            workspace(1, 1, "DP-1", true, true, false, true),
+            workspace(2, 2, "DP-1", false, false, false, true),
+            workspace(3, 3, "DP-1", false, false, false, true),
+        ]);
+        let first = indicator.chips.borrow()[&1].button.clone();
+        let removed = indicator.chips.borrow()[&2].button.clone();
+        let third = indicator.chips.borrow()[&3].button.clone();
+        let reparents = Rc::new(Cell::new(0));
+        for button in [&first, &third] {
+            let changes = Rc::clone(&reparents);
+            button.connect_parent_notify(move |_| changes.set(changes.get() + 1));
+        }
+        indicator.set_workspaces(&[
+            workspace(3, 1, "DP-1", true, true, false, true),
+            workspace(1, 2, "DP-1", false, false, false, true),
+            workspace(4, 3, "DP-1", false, false, false, true),
+        ]);
+        assert_eq!(
+            reparents.get(),
+            0,
+            "changing the order must not unparent retained chips"
+        );
+        assert!(removed.parent().is_none());
+        assert_eq!(
+            indicator.row.first_child().as_ref(),
+            Some(third.upcast_ref())
+        );
+        assert_eq!(third.next_sibling().as_ref(), Some(first.upcast_ref()));
+        assert_eq!(indicator.chips.borrow()[&1].button, first);
+        assert!(!first.has_css_class("active"));
+        assert!(!first.has_css_class("focused"));
+        assert!(first.has_css_class("occupied"));
+        assert!(third.has_css_class("active"));
+        assert!(third.has_css_class("focused"));
+        assert!(indicator.root.get_visible());
+
+        indicator.set_workspaces(&[
+            workspace(3, 1, "DP-1", true, true, false, true),
+            workspace(1, 2, "DP-1", false, false, true, true),
+            workspace(4, 3, "DP-1", false, false, false, true),
+        ]);
+        assert!(first.has_css_class(URGENT_BLINK_CLASS));
+        assert!(
+            indicator.chips.borrow()[&1]
+                .urgent_blink
+                .source
+                .borrow()
+                .is_none()
+        );
+
+        use crate::widgets::test_support::pump;
+        use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+        use std::time::Instant;
+        let application = gtk::Application::builder()
+            .application_id("dev.obsidian.WorkspaceBlinkTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let css = gtk::CssProvider::new();
+        css.load_from_data(include_str!("../../assets/window.css"));
+        gtk::style_context_add_provider_for_display(
+            &gdk::Display::default().unwrap(),
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        indicator.root.add_css_class("widget-popup-frame");
+        let window = gtk::ApplicationWindow::builder()
+            .application(&application)
+            .child(&indicator.root)
+            .build();
+        window.add_css_class("widget-popup-window");
+        window.init_layer_shell();
+        window.set_namespace(Some("obsidian-bar-workspace-blink-test"));
+        window.set_layer(Layer::Overlay);
+        window.set_keyboard_mode(KeyboardMode::None);
+        window.set_anchor(Edge::Right, true);
+        window.set_anchor(Edge::Bottom, true);
+        window.set_margin(Edge::Bottom, 180);
+        window.present();
+        pump(100);
+        assert!(first.is_mapped());
+        assert!(
+            indicator.chips.borrow()[&1]
+                .urgent_blink
+                .source
+                .borrow()
+                .is_some()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while first.has_css_class(URGENT_BLINK_CLASS) {
+            assert!(Instant::now() < deadline, "visible chip must keep blinking");
+            pump(10);
+        }
+        window.set_visible(false);
+        assert!(
+            indicator.chips.borrow()[&1]
+                .urgent_blink
+                .source
+                .borrow()
+                .is_none()
+        );
+        let phase = indicator.chips.borrow()[&1].urgent_blink.lit.get();
+        pump(700);
+        assert_eq!(indicator.chips.borrow()[&1].urgent_blink.lit.get(), phase);
+        window.present();
+        pump(100);
+        assert!(first.has_css_class(URGENT_BLINK_CLASS));
+        assert!(
+            indicator.chips.borrow()[&1]
+                .urgent_blink
+                .source
+                .borrow()
+                .is_some()
+        );
+        indicator.set_workspaces(&[
+            workspace(3, 1, "DP-1", false, false, false, true),
+            workspace(1, 2, "DP-1", true, true, true, true),
+            workspace(4, 3, "DP-1", false, false, false, true),
+        ]);
+        assert!(!first.has_css_class("urgent"));
+        assert!(!first.has_css_class(URGENT_BLINK_CLASS));
+        assert!(
+            indicator.chips.borrow()[&1]
+                .urgent_blink
+                .source
+                .borrow()
+                .is_none()
+        );
+        let weak_blink = Rc::downgrade(&indicator.chips.borrow()[&1].urgent_blink);
+        window.set_child(None::<&gtk::Widget>);
+        drop(indicator);
+        assert!(weak_blink.upgrade().is_none());
+        crate::widgets::detach_application_window(&window);
+    }
 
     fn workspace(
         id: u64,

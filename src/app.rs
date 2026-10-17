@@ -4,14 +4,16 @@ use std::{
     time::Duration,
 };
 
+use crate::niri::ipc::WindowSnapshot;
 use gtk::{gdk, gio, glib, prelude::*};
-use niri_ipc::{Window, Workspace};
+use niri_ipc::Workspace;
 use tracing::{error, info, warn};
 
 use crate::{
     niri::ipc,
     ui::bar::{Bar, BarDependencies},
     widgets::{
+        Timer,
         audio_spectrum::{AudioSpectrumController, AudioSpectrumView},
         bar_features::BarFeatureController,
         bluetooth::BluetoothAgent,
@@ -28,10 +30,11 @@ use crate::{
 const APP_ID: &str = "dev.obsidian.Bar";
 const WINDOW_CSS: &str = include_str!("../assets/window.css");
 const FULLSCREEN_SYNC_DELAY: Duration = Duration::from_millis(75);
+const NIRI_UPDATE_BATCH_SIZE: usize = 8;
 
 fn monitor_desktop_is_empty(
     output: Option<&str>,
-    windows: &[Window],
+    windows: &[WindowSnapshot],
     workspaces: &[Workspace],
 ) -> bool {
     let Some(output) = output else {
@@ -61,11 +64,11 @@ pub struct App {
     shutting_down: Cell<bool>,
     niri_listener: RefCell<Option<ipc::EventListener>>,
     keyboard_layout: RefCell<String>,
-    windows: RefCell<Vec<Window>>,
+    windows: RefCell<Vec<WindowSnapshot>>,
     workspaces: RefCell<Vec<Workspace>>,
     niri_windows_ready: Cell<bool>,
     niri_workspaces_ready: Cell<bool>,
-    fullscreen_sync_generation: Cell<u64>,
+    fullscreen_sync_timer: Timer,
     bluetooth_agent: BluetoothAgent,
     bar_features: Rc<BarFeatureController>,
     audio_spectrum: Rc<AudioSpectrumController>,
@@ -99,7 +102,7 @@ impl App {
             workspaces: RefCell::new(Vec::new()),
             niri_windows_ready: Cell::new(false),
             niri_workspaces_ready: Cell::new(false),
-            fullscreen_sync_generation: Cell::new(0),
+            fullscreen_sync_timer: Timer::default(),
             bluetooth_agent: BluetoothAgent::default(),
             bar_features: BarFeatureController::new(),
             audio_spectrum: AudioSpectrumController::new(),
@@ -340,45 +343,65 @@ impl App {
             return;
         }
 
-        let (sender, receiver) = async_channel::bounded::<ipc::Update>(8);
+        let (sender, receiver) = async_channel::bounded::<ipc::Update>(NIRI_UPDATE_BATCH_SIZE);
         self.niri_listener
             .replace(Some(ipc::spawn_event_listener(sender)));
 
         let weak_self = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
+            let mut processed_without_yield = 0;
             while let Ok(update) = receiver.recv().await {
                 let Some(this) = weak_self.upgrade() else {
                     receiver.close();
                     break;
                 };
 
-                match update {
-                    ipc::Update::KeyboardLayout(layout) => {
-                        for bar in this.bars.borrow().iter() {
-                            bar.set_keyboard_layout(&layout);
-                        }
-                        this.keyboard_layout.replace(layout);
+                let mut batch = ipc::UpdateBatch::default();
+                batch.push(update);
+                // Bound the drain even if the listener continuously produces
+                // events, so input and frame callbacks keep getting their turn.
+                let mut drained = 0;
+                for _ in 1..NIRI_UPDATE_BATCH_SIZE {
+                    let Ok(update) = receiver.try_recv() else {
+                        break;
+                    };
+                    batch.push(update);
+                    drained += 1;
+                }
+                let desktop_changed =
+                    batch.windows_ready.is_some() || batch.workspaces_ready.is_some();
+                let fullscreen_changed = batch.windows.is_some() || batch.workspaces.is_some();
+                if let Some(layout) = batch.keyboard_layout {
+                    for bar in this.bars.borrow().iter() {
+                        bar.set_keyboard_layout(&layout);
                     }
-                    ipc::Update::Windows(windows) => {
-                        this.windows.replace(windows);
-                        this.niri_windows_ready.set(true);
-                        this.sync_monitor_desktop();
-                        this.schedule_bar_fullscreen_sync();
+                    this.keyboard_layout.replace(layout);
+                }
+                if let Some(windows) = batch.windows {
+                    this.windows.replace(windows);
+                }
+                if let Some(workspaces) = batch.workspaces {
+                    for bar in this.bars.borrow().iter() {
+                        bar.set_workspaces(&workspaces);
                     }
-                    ipc::Update::Workspaces(workspaces) => {
-                        for bar in this.bars.borrow().iter() {
-                            bar.set_workspaces(&workspaces);
-                        }
-                        this.workspaces.replace(workspaces);
-                        this.niri_workspaces_ready.set(true);
-                        this.sync_monitor_desktop();
-                        this.schedule_bar_fullscreen_sync();
-                    }
-                    ipc::Update::Disconnected => {
-                        this.niri_windows_ready.set(false);
-                        this.niri_workspaces_ready.set(false);
-                        this.sync_monitor_desktop();
-                    }
+                    this.workspaces.replace(workspaces);
+                }
+                if let Some(ready) = batch.windows_ready {
+                    this.niri_windows_ready.set(ready);
+                }
+                if let Some(ready) = batch.workspaces_ready {
+                    this.niri_workspaces_ready.set(ready);
+                }
+                if desktop_changed {
+                    this.sync_monitor_desktop();
+                }
+                if fullscreen_changed {
+                    this.schedule_bar_fullscreen_sync();
+                }
+                processed_without_yield += drained + 1;
+                if processed_without_yield >= NIRI_UPDATE_BATCH_SIZE {
+                    processed_without_yield = 0;
+                    glib::timeout_future(Duration::ZERO).await;
                 }
             }
         });
@@ -482,20 +505,18 @@ impl App {
     }
 
     fn schedule_bar_fullscreen_sync(self: &Rc<Self>) {
-        let generation = self.fullscreen_sync_generation.get().wrapping_add(1);
-        self.fullscreen_sync_generation.set(generation);
-
         let weak_self = Rc::downgrade(self);
-        glib::timeout_add_local_once(FULLSCREEN_SYNC_DELAY, move || {
-            let Some(this) = weak_self.upgrade() else {
-                return;
-            };
-            if this.shutting_down.get() || this.fullscreen_sync_generation.get() != generation {
-                return;
-            }
+        self.fullscreen_sync_timer
+            .schedule(FULLSCREEN_SYNC_DELAY, move || {
+                let Some(this) = weak_self.upgrade() else {
+                    return;
+                };
+                if this.shutting_down.get() {
+                    return;
+                }
 
-            this.sync_bar_fullscreen_state();
-        });
+                this.sync_bar_fullscreen_state();
+            });
     }
 
     fn show_launcher(&self) {
@@ -510,8 +531,7 @@ impl App {
         if self.shutting_down.replace(true) {
             return;
         }
-        self.fullscreen_sync_generation
-            .set(self.fullscreen_sync_generation.get().wrapping_add(1));
+        self.fullscreen_sync_timer.cancel();
         self.system_monitor_sync_pending.set(false);
 
         self.wallpaper.shutdown();
@@ -580,14 +600,12 @@ mod tests {
         }
     }
 
-    fn window(workspace_id: Option<u64>) -> Window {
-        serde_json::from_value(serde_json::json!({
-            "id": 1, "workspace_id": workspace_id,
-            "is_focused": false, "is_floating": false, "is_urgent": false,
-            "layout": { "tile_size": [800.0, 600.0], "window_size": [800, 600],
-                "window_offset_in_tile": [0.0, 0.0] }
-        }))
-        .unwrap()
+    fn window(workspace_id: Option<u64>) -> WindowSnapshot {
+        WindowSnapshot {
+            id: 1,
+            workspace_id,
+            tile_size: (800.0, 600.0),
+        }
     }
 
     #[test]
@@ -611,15 +629,11 @@ mod tests {
         assert!(!monitor_desktop_is_empty(None, &[], &workspaces));
         assert!(!monitor_desktop_is_empty(Some("missing"), &[], &workspaces));
         assert!(!monitor_desktop_is_empty(Some("DP-1"), &[], &[]));
-        for floating in [false, true] {
-            let mut occupant = window(Some(1));
-            occupant.is_floating = floating;
-            assert!(!monitor_desktop_is_empty(
-                Some("DP-1"),
-                &[occupant],
-                &workspaces
-            ));
-        }
+        assert!(!monitor_desktop_is_empty(
+            Some("DP-1"),
+            &[window(Some(1))],
+            &workspaces
+        ));
         assert!(!monitor_desktop_is_empty(
             Some("DP-1"),
             &[window(None)],

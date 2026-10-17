@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use super::tooltip::BarTooltipExt;
 use super::{
-    BAR_POPUP_WIDTH, CssTransition, Generation, PopupReveal, RefreshGate,
+    BAR_POPUP_WIDTH, CssTransition, Generation, PopupReveal, RefreshGate, Timer,
     attach_inline_revealer_behavior, attach_popup_escape_handler, attach_popup_lifecycle,
     attach_scale_value_changed, attach_vertical_step_scroll,
     audio_backend::{AudioBackend, SinkInfo, SinkKind, default_audio_backend},
@@ -71,7 +71,7 @@ impl AudioViewTransition {
 struct AudioState {
     volume: f64,
     muted: bool,
-    sinks: Vec<SinkInfo>,
+    sinks: Arc<[SinkInfo]>,
     show_hidden: bool,
 }
 
@@ -100,15 +100,14 @@ struct AudioController {
     sinks_read: RefreshGate,
     volume_revision: Generation,
     sinks_revision: Generation,
-    volume_write_serial: Generation,
-    volume_write_scheduled: Cell<bool>,
+    volume_write_timer: Timer,
     volume_write_busy: Cell<bool>,
     pending_volume_write: Cell<Option<f64>>,
     mute_write_busy: Cell<bool>,
     pending_mute_write: Cell<Option<bool>>,
     sink_switch_busy: Cell<bool>,
     pending_sink_switch: RefCell<Option<SinkInfo>>,
-    percent_flash_serial: Generation,
+    percent_flash_timer: Timer,
     popup_reveal: PopupReveal,
     view_transition: CssTransition,
     focus_armed: Rc<Cell<bool>>,
@@ -289,15 +288,14 @@ impl AudioIndicator {
             sinks_read: RefreshGate::default(),
             volume_revision: Generation::default(),
             sinks_revision: Generation::default(),
-            volume_write_serial: Generation::default(),
-            volume_write_scheduled: Cell::new(false),
+            volume_write_timer: Timer::default(),
             volume_write_busy: Cell::new(false),
             pending_volume_write: Cell::new(None),
             mute_write_busy: Cell::new(false),
             pending_mute_write: Cell::new(None),
             sink_switch_busy: Cell::new(false),
             pending_sink_switch: RefCell::new(None),
-            percent_flash_serial: Generation::default(),
+            percent_flash_timer: Timer::default(),
             popup_reveal,
             view_transition,
             focus_armed: Rc::new(Cell::new(false)),
@@ -455,7 +453,7 @@ impl AudioController {
                 let retry = this.volume_read.finish();
 
                 if !this.volume_revision.is_current(revision)
-                    || this.volume_write_scheduled.get()
+                    || this.volume_write_timer.is_pending()
                     || this.volume_write_busy.get()
                     || this.mute_write_busy.get()
                     || this.sink_switch_busy.get()
@@ -517,7 +515,9 @@ impl AudioController {
                         let sinks_changed = this.state.borrow().sinks != sinks;
                         if sinks_changed {
                             this.state.borrow_mut().sinks = sinks;
-                            this.rebuild_sink_list();
+                            if this.popup.is_visible() {
+                                this.rebuild_sink_list();
+                            }
                         }
                         this.update_volume_ui(true);
                     }
@@ -577,8 +577,6 @@ impl AudioController {
     }
 
     fn flash_percent(self: &Rc<Self>) {
-        let generation = self.percent_flash_serial.bump();
-
         let percentage = (self.state.borrow().volume * 100.0).round() as i32;
         self.trigger_label.remove_css_class("module-icon");
         self.trigger_label.add_css_class("module-percent");
@@ -586,15 +584,13 @@ impl AudioController {
         self.trigger_label.set_text(&format!("{percentage}%"));
 
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(PERCENT_FLASH_DELAY, move || {
-            let Some(this) = weak.upgrade() else {
-                return;
-            };
-            if !this.percent_flash_serial.is_current(generation) {
-                return;
-            }
-            this.show_trigger_icon();
-        });
+        self.percent_flash_timer
+            .schedule(PERCENT_FLASH_DELAY, move || {
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                this.show_trigger_icon();
+            });
     }
 
     fn set_volume(self: &Rc<Self>, value: f64) {
@@ -612,20 +608,15 @@ impl AudioController {
     }
 
     fn schedule_volume_write(self: &Rc<Self>, value: f64) {
-        self.volume_write_scheduled.set(true);
-        let generation = self.volume_write_serial.bump();
         let weak = Rc::downgrade(self);
 
-        glib::timeout_add_local_once(VOLUME_WRITE_DEBOUNCE, move || {
-            let Some(this) = weak.upgrade() else {
-                return;
-            };
-            if !this.volume_write_serial.is_current(generation) {
-                return;
-            }
-            this.volume_write_scheduled.set(false);
-            this.write_volume_now(value);
-        });
+        self.volume_write_timer
+            .schedule(VOLUME_WRITE_DEBOUNCE, move || {
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                this.write_volume_now(value);
+            });
     }
 
     fn write_volume_now(self: &Rc<Self>, value: f64) {

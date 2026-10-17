@@ -1,13 +1,14 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    io::{self, Read},
+    io,
     os::unix::process::CommandExt,
-    process::{Child, Command, ExitStatus, Output, Stdio},
-    sync::{OnceLock, mpsc},
-    thread,
+    process::{Command, Output, Stdio},
+    sync::OnceLock,
     time::Duration,
 };
+
+mod capture;
 
 const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const PIPE_FINISH_TIMEOUT: Duration = Duration::from_secs(1);
@@ -51,12 +52,6 @@ impl ExternalProgram {
     }
 }
 
-enum WaitOutcome {
-    Exited(ExitStatus),
-    TimedOut,
-    Failed(io::Error),
-}
-
 pub(super) enum StatusError {
     Io(io::Error),
     TimedOut,
@@ -92,11 +87,14 @@ where
     command.args(args).stdin(Stdio::null()).process_group(0);
     let child = command.spawn().map_err(StatusError::Io)?;
 
-    match wait_for_exit(child, timeout) {
-        WaitOutcome::Exited(status) if status.success() => Ok(()),
-        WaitOutcome::Exited(_) => Err(StatusError::Failed),
-        WaitOutcome::TimedOut => Err(StatusError::TimedOut),
-        WaitOutcome::Failed(error) => Err(StatusError::Io(error)),
+    match capture::wait(child, timeout) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) => Err(StatusError::Failed),
+        Err(capture::Error::TimedOut) => Err(StatusError::TimedOut),
+        Err(capture::Error::Io(error)) => Err(StatusError::Io(error)),
+        Err(capture::Error::PipeTimeout(stream)) => Err(StatusError::Io(io::Error::other(
+            format!("timed out while draining {stream}"),
+        ))),
     }
 }
 
@@ -119,50 +117,19 @@ fn run(
         })
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| format!("failed to start {display_name}: {error}"))?;
 
-    let process_group = child.id();
-    let stdout_reader = child.stdout.take().map(read_pipe);
-    let stderr_reader = child.stderr.take().map(read_pipe);
-    let outcome = wait_for_exit(child, timeout);
-
-    let (status, stdout, stderr) = match outcome {
-        WaitOutcome::Exited(status) => {
-            let stdout = finish_pipe(stdout_reader, display_name.as_ref(), "stdout");
-            let stderr = finish_pipe(stderr_reader, display_name.as_ref(), "stderr");
-            match (stdout, stderr) {
-                (Ok(stdout), Ok(stderr)) => (status, stdout, stderr),
-                (stdout, stderr) => {
-                    terminate_process_group(process_group, libc::SIGKILL);
-                    return Err(stdout
-                        .err()
-                        .or_else(|| stderr.err())
-                        .unwrap_or_else(|| format!("failed to drain {display_name} output")));
-                }
-            }
+    let output = capture::wait(child, timeout).map_err(|error| match error {
+        capture::Error::TimedOut => {
+            format!("{display_name} timed out after {} ms", timeout.as_millis())
         }
-        WaitOutcome::TimedOut => {
-            let _ = finish_pipe(stdout_reader, display_name.as_ref(), "stdout");
-            let _ = finish_pipe(stderr_reader, display_name.as_ref(), "stderr");
-            return Err(format!(
-                "{display_name} timed out after {} ms",
-                timeout.as_millis()
-            ));
-        }
-        WaitOutcome::Failed(error) => {
-            let _ = finish_pipe(stdout_reader, display_name.as_ref(), "stdout");
-            let _ = finish_pipe(stderr_reader, display_name.as_ref(), "stderr");
-            return Err(format!("failed to wait for {display_name}: {error}"));
-        }
-    };
-
-    let output = Output {
-        status,
-        stdout,
-        stderr,
-    };
+        capture::Error::Io(error) => format!("failed to wait for {display_name}: {error}"),
+        capture::Error::PipeTimeout(stream) => format!(
+            "timed out while draining {display_name} {stream}; a descendant may still hold the pipe"
+        ),
+    })?;
     if output.status.success() {
         return Ok(output);
     }
@@ -173,122 +140,6 @@ fn run(
     } else {
         format!("{display_name}: {stderr}")
     })
-}
-
-fn wait_for_exit(mut child: Child, timeout: Duration) -> WaitOutcome {
-    let process_group = child.id();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let waiter = thread::Builder::new()
-        .name(format!("process-wait-{process_group}"))
-        .spawn(move || {
-            let _ = sender.send(child.wait());
-        });
-
-    if let Err(error) = waiter {
-        terminate_process_group(process_group, libc::SIGKILL);
-        return WaitOutcome::Failed(error);
-    }
-
-    match receiver.recv_timeout(timeout) {
-        Ok(Ok(status)) => WaitOutcome::Exited(status),
-        Ok(Err(error)) => {
-            terminate_process_group(process_group, libc::SIGKILL);
-            WaitOutcome::Failed(error)
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            terminate_process_group(process_group, libc::SIGKILL);
-            WaitOutcome::Failed(io::Error::other(
-                "process waiter stopped before reporting an exit status",
-            ))
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            terminate_process_group(process_group, libc::SIGTERM);
-            match receiver.recv_timeout(PROCESS_TERMINATION_GRACE) {
-                Ok(_) => {
-                    // The leader exited after TERM; kill any descendants that kept
-                    // the process group alive and still report the original timeout.
-                    terminate_process_group(process_group, libc::SIGKILL);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    terminate_process_group(process_group, libc::SIGKILL);
-                    let _ = receiver.recv_timeout(PIPE_FINISH_TIMEOUT);
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {}
-            }
-            WaitOutcome::TimedOut
-        }
-    }
-}
-
-fn terminate_process_group(process_group_id: u32, signal: libc::c_int) {
-    if let Ok(pid) = libc::pid_t::try_from(process_group_id)
-        && pid > 0
-    {
-        // The child starts its own process group. Signal it directly so timeout
-        // handling cannot itself get stuck spawning or waiting for `kill`.
-        unsafe { libc::kill(-pid, signal) };
-    }
-}
-
-fn read_pipe<R>(mut pipe: R) -> mpsc::Receiver<io::Result<Vec<u8>>>
-where
-    R: Read + Send + 'static,
-{
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let worker_sender = sender.clone();
-    let spawn_result = thread::Builder::new()
-        .name("process-output-reader".to_owned())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let mut buffer = [0_u8; 8192];
-            let mut truncated = false;
-            let result = loop {
-                match pipe.read(&mut buffer) {
-                    Ok(0) => break Ok(()),
-                    Ok(read) => {
-                        let remaining = MAX_CAPTURE_BYTES.saturating_sub(bytes.len());
-                        let kept = read.min(remaining);
-                        bytes.extend_from_slice(&buffer[..kept]);
-                        truncated |= kept < read;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => break Err(error),
-                }
-            };
-
-            let result = result.map(|()| {
-                if truncated {
-                    bytes.extend_from_slice(OUTPUT_TRUNCATED_MARKER);
-                }
-                bytes
-            });
-            let _ = worker_sender.send(result);
-        });
-    if let Err(error) = spawn_result {
-        let _ = sender.send(Err(error));
-    }
-    receiver
-}
-
-fn finish_pipe(
-    reader: Option<mpsc::Receiver<io::Result<Vec<u8>>>>,
-    program: &str,
-    stream: &str,
-) -> Result<Vec<u8>, String> {
-    let Some(reader) = reader else {
-        return Ok(Vec::new());
-    };
-
-    match reader.recv_timeout(PIPE_FINISH_TIMEOUT) {
-        Ok(Ok(bytes)) => Ok(bytes),
-        Ok(Err(error)) => Err(format!("failed to read {program} {stream}: {error}")),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "timed out while draining {program} {stream}; a descendant may still hold the pipe"
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(format!("{program} {stream} reader stopped unexpectedly"))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -308,6 +159,36 @@ mod tests {
 
         assert!(output.contains("[output truncated]"));
         assert!(output.len() <= MAX_CAPTURE_BYTES + OUTPUT_TRUNCATED_MARKER.len());
+    }
+
+    #[test]
+    fn stdout_and_stderr_are_drained_together_without_exceeding_the_limits() {
+        let output = run(
+            "sh",
+            &[
+                "-c",
+                "head -c 1500000 /dev/zero & head -c 1500000 /dev/zero >&2; wait",
+            ],
+            Duration::from_secs(5),
+            true,
+        )
+        .expect("neither full pipe should block the child");
+        for bytes in [&output.stdout, &output.stderr] {
+            assert_eq!(
+                bytes.len(),
+                MAX_CAPTURE_BYTES + OUTPUT_TRUNCATED_MARKER.len()
+            );
+            assert!(bytes.ends_with(OUTPUT_TRUNCATED_MARKER));
+        }
+    }
+
+    #[test]
+    fn continuous_output_cannot_starve_the_timeout() {
+        let started = Instant::now();
+        let error = output("sh", &["-c", "exec yes x"], Duration::from_millis(100))
+            .expect_err("an endless writer must time out");
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
@@ -331,8 +212,8 @@ mod tests {
         let started = Instant::now();
 
         assert!(matches!(
-            wait_for_exit(child, Duration::from_millis(100)),
-            WaitOutcome::TimedOut
+            capture::wait(child, Duration::from_millis(100)),
+            Err(capture::Error::TimedOut)
         ));
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);

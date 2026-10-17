@@ -7,7 +7,7 @@ use std::{
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
-use super::{Generation, detach_application_window, make_window_click_through};
+use super::{Generation, Timer, detach_application_window, make_window_click_through};
 
 const TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(420);
 const TOOLTIP_GAP: i32 = 13;
@@ -66,7 +66,7 @@ struct TooltipState {
     label: gtk::Label,
     active_target: glib::WeakRef<gtk::Widget>,
     pending_target: glib::WeakRef<gtk::Widget>,
-    show_generation: Generation,
+    show_timer: Timer,
     hide_generation: Generation,
     placement_generation: Generation,
 }
@@ -134,7 +134,7 @@ impl BarTooltip {
             label,
             active_target: glib::WeakRef::new(),
             pending_target: glib::WeakRef::new(),
-            show_generation: Generation::default(),
+            show_timer: Timer::default(),
             hide_generation: Generation::default(),
             placement_generation: Generation::default(),
         });
@@ -285,7 +285,7 @@ fn tooltip_state_for(widget: &gtk::Widget) -> Option<Rc<TooltipState>> {
 
 impl TooltipState {
     fn invalidate_all(&self) {
-        self.show_generation.bump();
+        self.show_timer.cancel();
         self.hide_generation.bump();
         self.placement_generation.bump();
         self.active_target.set(None);
@@ -307,21 +307,19 @@ impl TooltipState {
         // of the previous tooltip yet: if the pointer leaves this target before
         // TOOLTIP_SHOW_DELAY expires, the old tooltip would otherwise remain
         // visible with no active target and could stick indefinitely.
-        let generation = self.show_generation.bump();
         self.pending_target.set(Some(target));
 
         let weak_state = Rc::downgrade(self);
         let weak_target = target.downgrade();
-        glib::timeout_add_local_once(TOOLTIP_SHOW_DELAY, move || {
+        self.show_timer.schedule(TOOLTIP_SHOW_DELAY, move || {
             let (Some(state), Some(target)) = (weak_state.upgrade(), weak_target.upgrade()) else {
                 return;
             };
-            if !state.show_generation.is_current(generation)
-                || !state
-                    .pending_target
-                    .upgrade()
-                    .as_ref()
-                    .is_some_and(|pending| pending == &target)
+            if !state
+                .pending_target
+                .upgrade()
+                .as_ref()
+                .is_some_and(|pending| pending == &target)
             {
                 return;
             }
@@ -382,7 +380,7 @@ impl TooltipState {
                 .as_ref()
                 .is_some_and(|pending| pending == target)
             {
-                self.show_generation.bump();
+                self.show_timer.cancel();
                 self.pending_target.set(None);
             }
 
@@ -395,7 +393,7 @@ impl TooltipState {
                 return;
             }
         } else {
-            self.show_generation.bump();
+            self.show_timer.cancel();
             self.pending_target.set(None);
         }
 

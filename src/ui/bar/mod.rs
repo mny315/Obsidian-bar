@@ -1,10 +1,12 @@
 use std::{cell::Cell, error::Error, fmt, rc::Rc, time::Duration};
 
+use crate::niri::ipc::WindowSnapshot;
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use niri_ipc::{Window, Workspace};
+use niri_ipc::Workspace;
 
 use crate::widgets::{
+    FrameCallback, Timer,
     audio::AudioIndicator,
     audio_spectrum::AudioSpectrumController,
     bar_features::BarFeatureController,
@@ -39,12 +41,27 @@ const BAR_MIN_ANIMATION_DURATION_MS: f64 = 70.0;
 const FULLSCREEN_SIZE_TOLERANCE: f64 = 1.5;
 
 struct BarSlideState {
-    generation: Cell<u64>,
+    frame: FrameCallback,
+    startup_timer: Timer,
     target_hidden: Cell<bool>,
     current_margin: Cell<f64>,
     applied_margin: Cell<i32>,
     started: Cell<bool>,
     startup_complete: Cell<bool>,
+}
+
+impl Default for BarSlideState {
+    fn default() -> Self {
+        Self {
+            frame: FrameCallback::default(),
+            startup_timer: Timer::default(),
+            target_hidden: Cell::new(false),
+            current_margin: Cell::new(BAR_HIDDEN_TOP_MARGIN as f64),
+            applied_margin: Cell::new(BAR_HIDDEN_TOP_MARGIN),
+            started: Cell::new(false),
+            startup_complete: Cell::new(false),
+        }
+    }
 }
 
 pub struct BarDependencies<'a> {
@@ -218,14 +235,7 @@ impl Bar {
             power,
             wallpaper,
             tooltip,
-            slide: Rc::new(BarSlideState {
-                generation: Cell::new(0),
-                target_hidden: Cell::new(false),
-                current_margin: Cell::new(BAR_HIDDEN_TOP_MARGIN as f64),
-                applied_margin: Cell::new(BAR_HIDDEN_TOP_MARGIN),
-                started: Cell::new(false),
-                startup_complete: Cell::new(false),
-            }),
+            slide: Rc::new(BarSlideState::default()),
         })
     }
 
@@ -239,26 +249,27 @@ impl Bar {
             let weak_window = self.window.downgrade();
             let weak_slide = Rc::downgrade(&self.slide);
             let tooltip = self.tooltip.clone();
-            glib::timeout_add_local_once(BAR_STARTUP_DELAY, move || {
-                let (Some(window), Some(slide)) = (weak_window.upgrade(), weak_slide.upgrade())
-                else {
-                    return;
-                };
-                if !slide.started.get() || slide.startup_complete.replace(true) {
-                    return;
-                }
+            self.slide
+                .startup_timer
+                .schedule(BAR_STARTUP_DELAY, move || {
+                    let (Some(window), Some(slide)) = (weak_window.upgrade(), weak_slide.upgrade())
+                    else {
+                        return;
+                    };
+                    if !slide.started.get() || slide.startup_complete.replace(true) {
+                        return;
+                    }
 
-                let hidden = slide.target_hidden.get();
-                animate_bar_slide(window, slide, tooltip, hidden);
-            });
+                    let hidden = slide.target_hidden.get();
+                    animate_bar_slide(window, slide, tooltip, hidden);
+                });
         }
     }
 
     pub fn close(&self) {
         self.slide.started.set(false);
-        self.slide
-            .generation
-            .set(self.slide.generation.get().wrapping_add(1));
+        self.slide.startup_timer.cancel();
+        self.slide.frame.cancel();
         self.dismiss_transient_ui();
         self.tooltip.close();
         self.window.close();
@@ -282,7 +293,7 @@ impl Bar {
         self.workspaces.set_workspaces(workspaces);
     }
 
-    pub fn set_fullscreen_state(&self, windows: &[Window], workspaces: &[Workspace]) {
+    pub fn set_fullscreen_state(&self, windows: &[WindowSnapshot], workspaces: &[Workspace]) {
         self.set_hidden(output_has_fullscreen_window(
             &self.monitor,
             windows,
@@ -334,8 +345,7 @@ fn animate_bar_slide(
     tooltip: BarTooltip,
     hidden: bool,
 ) {
-    let generation = slide.generation.get().wrapping_add(1);
-    slide.generation.set(generation);
+    slide.frame.cancel();
 
     let target_margin = if hidden {
         BAR_HIDDEN_TOP_MARGIN as f64
@@ -353,23 +363,21 @@ fn animate_bar_slide(
         window.set_can_target(true);
     }
 
-    if (start_margin - target_margin).abs() < f64::EPSILON {
+    if !window.settings().is_gtk_enable_animations()
+        || (start_margin - target_margin).abs() < f64::EPSILON
+    {
         finish_bar_slide(&window, &slide, target_margin);
         return;
     }
 
     let duration_ms = bar_slide_duration_ms(hidden, start_margin, target_margin);
-    let weak_window = window.downgrade();
     let weak_slide = Rc::downgrade(&slide);
     let start_time_us = Cell::new(None::<i64>);
 
-    window.add_tick_callback(move |_, frame_clock| {
-        let (Some(window), Some(slide)) = (weak_window.upgrade(), weak_slide.upgrade()) else {
+    slide.frame.start(&window, move |window, frame_clock| {
+        let Some(slide) = weak_slide.upgrade() else {
             return glib::ControlFlow::Break;
         };
-        if slide.generation.get() != generation {
-            return glib::ControlFlow::Break;
-        }
 
         let now_us = frame_clock.frame_time();
         let start_us = match start_time_us.get() {
@@ -388,12 +396,12 @@ fn animate_bar_slide(
         };
         let margin = start_margin + (target_margin - start_margin) * eased;
 
-        apply_bar_margin(&window, &slide, margin);
+        apply_bar_margin(window, &slide, margin);
 
         if progress < 1.0 {
             glib::ControlFlow::Continue
         } else {
-            finish_bar_slide(&window, &slide, target_margin);
+            finish_bar_slide(window, &slide, target_margin);
             glib::ControlFlow::Break
         }
     });
@@ -428,7 +436,7 @@ fn finish_bar_slide(window: &gtk::ApplicationWindow, slide: &BarSlideState, targ
 
 fn output_has_fullscreen_window(
     monitor: &gdk::Monitor,
-    windows: &[Window],
+    windows: &[WindowSnapshot],
     workspaces: &[Workspace],
 ) -> bool {
     let Some(output) = monitor.connector() else {
@@ -454,8 +462,8 @@ fn output_has_fullscreen_window(
         return false;
     };
 
-    size_matches_output(window.layout.tile_size.0, width)
-        && size_matches_output(window.layout.tile_size.1, height)
+    size_matches_output(window.tile_size.0, width)
+        && size_matches_output(window.tile_size.1, height)
 }
 
 fn size_matches_output(actual: f64, expected: f64) -> bool {
@@ -508,49 +516,4 @@ impl fmt::Display for BarError {
 impl Error for BarError {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn close(left: f64, right: f64) -> bool {
-        (left - right).abs() < 0.001
-    }
-
-    #[test]
-    fn full_slide_uses_configured_duration() {
-        assert!(close(
-            bar_slide_duration_ms(
-                true,
-                BAR_VISIBLE_TOP_MARGIN as f64,
-                BAR_HIDDEN_TOP_MARGIN as f64,
-            ),
-            BAR_HIDE_DURATION_MS,
-        ));
-        assert!(close(
-            bar_slide_duration_ms(
-                false,
-                BAR_HIDDEN_TOP_MARGIN as f64,
-                BAR_VISIBLE_TOP_MARGIN as f64,
-            ),
-            BAR_SHOW_DURATION_MS,
-        ));
-    }
-
-    #[test]
-    fn short_reverse_slide_does_not_take_the_full_duration() {
-        let duration = bar_slide_duration_ms(true, -40.0, BAR_HIDDEN_TOP_MARGIN as f64);
-        assert!(close(duration, BAR_MIN_ANIMATION_DURATION_MS));
-    }
-
-    #[test]
-    fn slide_endpoints_match_the_reserved_work_area() {
-        assert_eq!(BAR_HIDDEN_TOP_MARGIN + BAR_FALLBACK_HEIGHT, 0);
-        assert_eq!(BAR_VISIBLE_TOP_MARGIN + BAR_FALLBACK_HEIGHT, 46);
-    }
-
-    #[test]
-    fn fullscreen_size_match_has_a_small_absolute_tolerance() {
-        assert!(size_matches_output(1920.0, 1920.0));
-        assert!(size_matches_output(1919.0, 1920.0));
-        assert!(!size_matches_output(1918.0, 1920.0));
-    }
-}
+mod tests;

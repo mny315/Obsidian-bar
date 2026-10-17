@@ -7,6 +7,7 @@ use std::{
 use gtk::{gio, glib, prelude::*};
 use tracing::warn;
 
+use super::Timer;
 use super::tooltip::BarTooltipExt;
 
 const LOGIN_SERVICE: &str = "org.freedesktop.login1";
@@ -49,6 +50,22 @@ impl TimerTarget {
             Self::Off => 0,
             Self::At(deadline) => deadline.saturating_sub(now).div_ceil(MINUTE_US),
         }
+    }
+
+    fn next_display_change(self, now: u64) -> Option<Duration> {
+        let Self::At(deadline) = self else {
+            return None;
+        };
+        let remaining = deadline.saturating_sub(now);
+        if remaining == 0 {
+            return None;
+        }
+        let remainder = remaining % MINUTE_US;
+        Some(Duration::from_micros(if remainder == 0 {
+            MINUTE_US
+        } else {
+            remainder
+        }))
     }
 }
 
@@ -107,7 +124,8 @@ pub struct ShutdownTimer {
     revision: Cell<u64>,
     error: RefCell<Option<String>>,
     poll: RefCell<Option<glib::SourceId>>,
-    debounce: RefCell<Option<glib::SourceId>>,
+    debounce: Timer,
+    countdown: Timer,
 }
 
 impl ShutdownTimer {
@@ -120,7 +138,8 @@ impl ShutdownTimer {
             revision: Cell::new(0),
             error: RefCell::new(None),
             poll: RefCell::new(None),
-            debounce: RefCell::new(None),
+            debounce: Timer::default(),
+            countdown: Timer::default(),
         })
     }
 
@@ -130,16 +149,11 @@ impl ShutdownTimer {
         }
         self.refresh();
         let weak = Rc::downgrade(self);
-        let mut tick = 0;
-        let source = glib::timeout_add_local(Duration::from_secs(1), move || {
+        let source = glib::timeout_add_seconds_local(5, move || {
             let Some(timer) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            timer.update_views();
-            tick = (tick + 1) % 5;
-            if tick == 0 {
-                timer.refresh();
-            }
+            timer.refresh();
             glib::ControlFlow::Continue
         });
         self.poll.replace(Some(source));
@@ -188,17 +202,12 @@ impl ShutdownTimer {
         self.revision.set(self.revision.get().wrapping_add(1));
         self.error.replace(None);
         self.update_views();
-        if let Some(source) = self.debounce.borrow_mut().take() {
-            source.remove();
-        }
         let weak = Rc::downgrade(self);
-        let source = glib::timeout_add_local_once(WRITE_DELAY, move || {
+        self.debounce.schedule(WRITE_DELAY, move || {
             if let Some(timer) = weak.upgrade() {
-                timer.debounce.borrow_mut().take();
                 timer.flush();
             }
         });
-        self.debounce.replace(Some(source));
     }
 
     fn flush(self: &Rc<Self>) {
@@ -261,10 +270,24 @@ impl ShutdownTimer {
         });
     }
 
-    fn update_views(&self) {
+    fn update_views(self: &Rc<Self>) {
         let state = self.state.borrow();
         let target = state.displayed();
-        let minutes = target.minutes(now_usec());
+        let now = now_usec();
+        let minutes = target.minutes(now);
+        if let Some(delay) = target.next_display_change(now) {
+            let weak = Rc::downgrade(self);
+            // GLib uses milliseconds; round up so an early wake cannot spin
+            // at a minute boundary while the displayed value is still the same.
+            let delay = Duration::from_millis(delay.as_micros().div_ceil(1000) as u64);
+            self.countdown.schedule(delay, move || {
+                if let Some(timer) = weak.upgrade() {
+                    timer.update_views();
+                }
+            });
+        } else {
+            self.countdown.cancel();
+        }
         let pending = !state.idle();
         let error = self.error.borrow();
         let active = target != TimerTarget::Off;
@@ -325,10 +348,7 @@ impl ShutdownTimer {
 
 impl Drop for ShutdownTimer {
     fn drop(&mut self) {
-        for source in [self.poll.get_mut().take(), self.debounce.get_mut().take()]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(source) = self.poll.get_mut().take() {
             source.remove();
         }
     }
@@ -452,6 +472,19 @@ mod tests {
         assert_eq!(target.adjust(now + MINUTE_US, -1), TimerTarget::Off);
         assert_eq!(TimerTarget::Off.adjust(now, -1), TimerTarget::Off);
         assert_eq!(target.adjust(now, 500).minutes(now), 24 * 60);
+    }
+
+    #[test]
+    fn countdown_wakes_at_the_next_visible_minute_change() {
+        let target = TimerTarget::At(3 * MINUTE_US);
+        for now in [0, 1, MINUTE_US - 1, MINUTE_US, 3 * MINUTE_US - 1] {
+            let delay = target.next_display_change(now).unwrap().as_micros() as u64;
+            assert_eq!(target.minutes(now + delay - 1), target.minutes(now));
+            assert_eq!(target.minutes(now + delay), target.minutes(now) - 1);
+        }
+        assert_eq!(target.next_display_change(3 * MINUTE_US), None);
+        assert_eq!(target.next_display_change(4 * MINUTE_US), None);
+        assert_eq!(TimerTarget::Off.next_display_change(0), None);
     }
 
     #[test]

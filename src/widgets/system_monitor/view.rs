@@ -6,7 +6,7 @@ use super::{
     PANEL_EDGE_MARGIN, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, SETTINGS_PANEL_PADDING,
     SETTINGS_PANEL_WIDTH, SystemMonitorController,
 };
-use crate::widgets::{Generation, detach_application_window};
+use crate::widgets::{FrameCallback, Timer, detach_application_window};
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::LayerShell;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer};
@@ -14,7 +14,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-const CONTENT_NAMESPACE: &str = "obsidian-system-monitor";
+// Use the shared panel rule, which also configures native popup blur. The
+// older monitor-only rule covered the card but not its dropdown surfaces.
+pub(super) const CONTENT_NAMESPACE: &str = "obsidian-bar-system-monitor";
 const SETTINGS_HIDE_DELAY: Duration = Duration::from_secs(1);
 const SETTINGS_TRIGGER_SIZE: i32 = 36;
 const ICON_SETTINGS: &str = "\u{f0493}";
@@ -72,14 +74,15 @@ pub(super) struct MonitorRuntime {
     pub(super) pinned: Cell<bool>,
     pub(super) hide_delay: Cell<Duration>,
     pub(super) settings_hovered: Cell<bool>,
-    pub(super) settings_hide_generation: Generation,
+    pub(super) settings_hide_timer: Timer,
     pub(super) hovered: Cell<bool>,
     pub(super) hotspot_hovered: Cell<bool>,
     pub(super) dragging: Cell<bool>,
     pub(super) drag_start_y: Cell<i32>,
-    pub(super) hide_generation: Generation,
+    pub(super) hide_timer: Timer,
     pub(super) panel_width: Cell<i32>,
     pub(super) adjusting_scale: Cell<bool>,
+    font_measurement: FrameCallback,
 }
 
 impl MonitorRuntime {
@@ -88,7 +91,7 @@ impl MonitorRuntime {
             return;
         }
         self.tail.set_sensitive(available);
-        self.hide_generation.bump();
+        self.hide_timer.cancel();
         if available {
             self.hotspot_window.present();
             if self.restore_on_desktop.replace(false) && self.pinned.get() {
@@ -104,7 +107,7 @@ impl MonitorRuntime {
             self.settings_hovered.set(false);
             self.dragging.set(false);
             self.adjusting_scale.set(false);
-            self.settings_hide_generation.bump();
+            self.settings_hide_timer.cancel();
             for popover in &self.settings_panel.popovers {
                 popover.popdown();
             }
@@ -118,7 +121,7 @@ impl MonitorRuntime {
         if !self.desktop_available.get() {
             return;
         }
-        self.hide_generation.bump();
+        self.hide_timer.cancel();
         self.restore_on_desktop.set(false);
         let open = !self.drawer.is_revealed();
         if !open {
@@ -133,7 +136,7 @@ impl MonitorRuntime {
         // Inherited CSS fonts settle during layout. Measure after that frame,
         // including the first map with a font restored from saved settings.
         let weak = Rc::downgrade(self);
-        self.window.add_tick_callback(move |_, _| {
+        self.font_measurement.start(&self.window, move |_, _| {
             let weak = weak.clone();
             glib::idle_add_local_once(move || {
                 if let Some(runtime) = weak.upgrade() {
@@ -303,32 +306,31 @@ impl MonitorRuntime {
     }
 
     pub(super) fn sync_settings_timeout(self: &Rc<Self>) {
-        let generation = self.settings_hide_generation.bump();
+        self.settings_hide_timer.cancel();
         if !self.settings_reveal.reveals_child() || self.keep_settings_open() {
             return;
         }
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(SETTINGS_HIDE_DELAY, move || {
-            if let Some(runtime) = weak.upgrade()
-                && runtime.settings_hide_generation.is_current(generation)
-                && runtime.settings_reveal.reveals_child()
-                && !runtime.keep_settings_open()
-            {
-                runtime.set_settings_open(false);
-            }
-        });
+        self.settings_hide_timer
+            .schedule(SETTINGS_HIDE_DELAY, move || {
+                if let Some(runtime) = weak.upgrade()
+                    && runtime.settings_reveal.reveals_child()
+                    && !runtime.keep_settings_open()
+                {
+                    runtime.set_settings_open(false);
+                }
+            });
     }
 
     pub(super) fn sync_reveal(self: &Rc<Self>) {
         self.sync_settings_timeout();
-        let generation = self.hide_generation.bump();
+        self.hide_timer.cancel();
         if !self.desktop_available.get() || !self.drawer.is_revealed() || self.keep_open() {
             return;
         }
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(self.hide_delay.get(), move || {
+        self.hide_timer.schedule(self.hide_delay.get(), move || {
             if let Some(runtime) = weak.upgrade()
-                && runtime.hide_generation.is_current(generation)
                 && runtime.desktop_available.get()
                 && !runtime.keep_open()
             {
@@ -563,14 +565,15 @@ impl SystemMonitorView {
             pinned: Cell::new(settings.pinned),
             hide_delay: Cell::new(Duration::from_millis(settings.hide_delay_ms as u64)),
             settings_hovered: Cell::new(false),
-            settings_hide_generation: Generation::default(),
+            settings_hide_timer: Timer::default(),
             hovered: Cell::new(false),
             hotspot_hovered: Cell::new(false),
             dragging: Cell::new(false),
             drag_start_y: Cell::new(0),
-            hide_generation: Generation::default(),
+            hide_timer: Timer::default(),
             panel_width: Cell::new(geometry.panel_width),
             adjusting_scale: Cell::new(false),
+            font_measurement: FrameCallback::default(),
         });
         runtime.install_drag(&hotspot, controller);
         {
@@ -602,7 +605,7 @@ impl SystemMonitorView {
             settings_surface.connect_unmap(move |_| {
                 if let Some(runtime) = weak.upgrade() {
                     runtime.settings_hovered.set(false);
-                    runtime.settings_hide_generation.bump();
+                    runtime.settings_hide_timer.cancel();
                 }
             });
         }
@@ -682,7 +685,7 @@ impl SystemMonitorView {
             runtime.drawer.connect_settled(move || {
                 if let Some(runtime) = weak.upgrade() {
                     if !runtime.window.is_visible() {
-                        runtime.settings_hide_generation.bump();
+                        runtime.settings_hide_timer.cancel();
                         runtime.settings_reveal.set_transition_duration(0);
                         runtime.settings_reveal.set_reveal_child(false);
                         runtime.settings_reveal.set_transition_duration(220);
@@ -718,7 +721,16 @@ impl SystemMonitorView {
         }
         {
             let controller = Rc::downgrade(controller);
+            let weak = Rc::downgrade(&runtime);
             content_window.connect_visible_notify(move |window| {
+                if window.is_visible()
+                    && let Some(runtime) = weak.upgrade()
+                {
+                    runtime
+                        .layout
+                        .update_metrics(&runtime.layout.snapshot.borrow());
+                    runtime.apply_size();
+                }
                 if let Some(controller) = controller.upgrade() {
                     controller.set_view_visible(window.is_visible());
                 }
@@ -781,8 +793,14 @@ impl SystemMonitorView {
                 let Some(runtime) = weak.upgrade() else {
                     return false;
                 };
-                runtime.layout.update_snapshot(snapshot);
-                runtime.apply_size();
+                if runtime.window.is_visible() {
+                    runtime.layout.update_snapshot(snapshot);
+                    runtime.apply_size();
+                } else {
+                    // Keep traffic history and the latest data while the panel
+                    // is hidden. Labels and measurements catch up before reveal.
+                    runtime.layout.cache_snapshot(snapshot);
+                }
                 true
             });
         }

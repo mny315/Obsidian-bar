@@ -1,108 +1,25 @@
 use super::batteries::PowerOffTarget;
-use super::gpu;
 use super::{
-    ICON_MONITOR, METRIC_METER, MonitorSection, MonitorSettings, SCALE_MILLI_DEFAULT,
-    SystemSnapshot, scaled_pixels,
+    ICON_MONITOR, MonitorSection, MonitorSettings, SCALE_MILLI_DEFAULT, SystemSnapshot,
+    scaled_pixels,
 };
 use crate::widgets::{clear_box, run_background};
 use gtk::{gdk, glib, prelude::*};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
+
+mod data;
+#[cfg(test)]
+pub(super) use data::display_metrics;
+pub(super) use data::{
+    DisplayMetric, MetricGroup, MetricOption, format_bytes, format_percent, metric_options,
+    selected_metrics,
+};
 
 const NETWORK_HISTORY_LENGTH: usize = 64;
 pub(super) const METRIC_GRAPH: &str = "traffic-graph";
-
-#[derive(Clone)]
-pub(super) struct DisplayMetric {
-    pub(super) id: String,
-    pub(super) label: String,
-    pub(super) value: String,
-    pub(super) group: Option<MetricGroup>,
-    pub(super) fraction: Option<f64>,
-    pub(super) power_off: Option<PowerOffTarget>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct MetricGroup {
-    pub(super) id: String,
-    pub(super) label: String,
-}
-
-impl DisplayMetric {
-    pub(super) fn new(
-        id: impl Into<String>,
-        label: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            label: label.into(),
-            value: value.into(),
-            group: None,
-            fraction: None,
-            power_off: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct MetricOption {
-    pub(super) id: String,
-    pub(super) label: String,
-    pub(super) group: Option<MetricGroup>,
-}
-
-pub(super) fn metric_options(
-    section: MonitorSection,
-    snapshot: &SystemSnapshot,
-) -> Vec<MetricOption> {
-    let (metrics, fraction) = display_metrics(section, snapshot);
-    let mut options = metrics
-        .into_iter()
-        .filter(|metric| metric.id != "loading")
-        .map(|metric| MetricOption {
-            id: metric.id,
-            label: metric.label,
-            group: metric.group,
-        })
-        .collect::<Vec<_>>();
-    if section == MonitorSection::Network && snapshot.network_available {
-        options.insert(
-            0,
-            MetricOption {
-                id: METRIC_GRAPH.into(),
-                label: "Traffic graph".into(),
-                group: None,
-            },
-        );
-    }
-    if fraction.is_some() {
-        options.push(MetricOption {
-            id: METRIC_METER.into(),
-            label: "Usage bar".into(),
-            group: None,
-        });
-    }
-    options
-}
-
-pub(super) fn selected_metrics(
-    section: MonitorSection,
-    snapshot: &SystemSnapshot,
-    settings: &MonitorSettings,
-) -> (Vec<DisplayMetric>, Option<f64>, bool) {
-    let (mut metrics, fraction) = display_metrics(section, snapshot);
-    metrics.retain(|metric| settings.metric_visible(section, &metric.id));
-    for metric in &mut metrics {
-        metric.label = settings.metric_name(section, &metric.id, &metric.label);
-    }
-    let fraction = fraction.filter(|_| settings.metric_visible(section, METRIC_METER));
-    let graph = section == MonitorSection::Network
-        && snapshot.network_available
-        && settings.metric_visible(section, METRIC_GRAPH);
-    (metrics, fraction, graph)
-}
 
 #[derive(Default)]
 pub(super) struct NetworkGraphState {
@@ -174,9 +91,10 @@ impl MeterView {
 
     pub(super) fn set_fraction(&self, fraction: Option<f64>) {
         self.area.set_visible(fraction.is_some());
-        self.fraction
-            .set(fraction.unwrap_or_default().clamp(0.0, 1.0));
-        self.area.queue_draw();
+        let fraction = fraction.unwrap_or_default().clamp(0.0, 1.0);
+        if self.fraction.replace(fraction) != fraction {
+            self.area.queue_draw();
+        }
     }
 }
 
@@ -261,22 +179,25 @@ impl SectionView {
         fraction: Option<f64>,
         graph_visible: bool,
     ) {
-        let signature = metrics
+        let same_signature = self
+            .signature
+            .borrow()
             .iter()
-            .map(|metric| (metric.id.clone(), metric.label.clone()))
-            .collect::<Vec<_>>();
-        let groups = metrics
+            .map(|(id, label)| (id.as_str(), label.as_str()))
+            .eq(metrics
+                .iter()
+                .map(|metric| (metric.id.as_str(), metric.label.as_str())));
+        let same_groups = self
+            .metric_groups
+            .borrow()
             .iter()
-            .map(|metric| metric.group.clone())
-            .collect::<Vec<_>>();
-        let power_off_targets = metrics
+            .eq(metrics.iter().map(|metric| &metric.group));
+        let same_targets = self
+            .power_off_targets
+            .borrow()
             .iter()
-            .map(|metric| metric.power_off.clone())
-            .collect::<Vec<_>>();
-        if *self.signature.borrow() != signature
-            || *self.metric_groups.borrow() != groups
-            || *self.power_off_targets.borrow() != power_off_targets
-        {
+            .eq(metrics.iter().map(|metric| &metric.power_off));
+        if !same_signature || !same_groups || !same_targets {
             self.minimum_width.set(0);
             clear_box(&self.rows);
             let mut views = self.metric_views.borrow_mut();
@@ -343,9 +264,20 @@ impl SectionView {
                 self.rows.append(&row);
                 views.push(MetricView::Value(value));
             }
-            self.signature.replace(signature);
-            self.metric_groups.replace(groups);
-            self.power_off_targets.replace(power_off_targets);
+            self.signature.replace(
+                metrics
+                    .iter()
+                    .map(|metric| (metric.id.clone(), metric.label.clone()))
+                    .collect(),
+            );
+            self.metric_groups
+                .replace(metrics.iter().map(|metric| metric.group.clone()).collect());
+            self.power_off_targets.replace(
+                metrics
+                    .iter()
+                    .map(|metric| metric.power_off.clone())
+                    .collect(),
+            );
         }
 
         for (view, metric) in self.metric_views.borrow().iter().zip(&metrics) {
@@ -507,14 +439,14 @@ pub(super) struct MonitorLayout {
     pub(super) scale_provider: gtk::CssProvider,
     pub(super) display: gdk::Display,
     pub(super) settings: RefCell<MonitorSettings>,
-    pub(super) snapshot: RefCell<SystemSnapshot>,
+    pub(super) snapshot: RefCell<Arc<SystemSnapshot>>,
 }
 
 impl MonitorLayout {
     pub(super) fn new(
         display: &gdk::Display,
         settings: MonitorSettings,
-        snapshot: SystemSnapshot,
+        snapshot: Arc<SystemSnapshot>,
     ) -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 7);
         root.add_css_class("system-monitor-surface");
@@ -557,7 +489,7 @@ impl MonitorLayout {
             scale_provider,
             display: display.clone(),
             settings: RefCell::new(settings.clone()),
-            snapshot: RefCell::new(snapshot.clone()),
+            snapshot: RefCell::new(Arc::clone(&snapshot)),
         });
         layout.apply_settings(&settings);
         layout.update_snapshot(&snapshot);
@@ -565,6 +497,17 @@ impl MonitorLayout {
     }
 
     pub(super) fn apply_settings(&self, settings: &MonitorSettings) {
+        let order_changed = self.root.first_child().is_none()
+            || self
+                .settings
+                .borrow()
+                .sections
+                .iter()
+                .map(|preference| preference.section)
+                .ne(settings
+                    .sections
+                    .iter()
+                    .map(|preference| preference.section));
         self.settings.replace(settings.clone());
         if self.applied_scale.replace(settings.scale_milli) != settings.scale_milli {
             self.scale_provider.load_from_data(&format!(
@@ -579,13 +522,15 @@ impl MonitorLayout {
                 section.apply_scale(settings.scale_milli);
             }
         }
-        clear_box(&self.root);
-        for preference in &settings.sections {
-            if let Some(section) = self.sections.get(&preference.section) {
-                self.root.append(&section.root);
+        if order_changed {
+            clear_box(&self.root);
+            for preference in &settings.sections {
+                if let Some(section) = self.sections.get(&preference.section) {
+                    self.root.append(&section.root);
+                }
             }
+            self.root.append(&self.empty_state);
         }
-        self.root.append(&self.empty_state);
         self.update_metrics(&self.snapshot.borrow());
     }
 
@@ -615,20 +560,29 @@ impl MonitorLayout {
         natural.max(1)
     }
 
-    pub(super) fn update_snapshot(&self, snapshot: &SystemSnapshot) {
-        self.snapshot.replace(snapshot.clone());
+    pub(super) fn update_snapshot(&self, snapshot: &Arc<SystemSnapshot>) {
+        self.cache_snapshot(snapshot);
+        self.update_metrics(snapshot);
+    }
+
+    pub(super) fn cache_snapshot(&self, snapshot: &Arc<SystemSnapshot>) {
+        self.snapshot.replace(Arc::clone(snapshot));
         if let Some(view) = self.sections.get(&MonitorSection::Network) {
             view.push_network_sample(
                 snapshot.download_bytes_per_second,
                 snapshot.upload_bytes_per_second,
             );
         }
-        self.update_metrics(snapshot);
     }
 
     pub(super) fn update_metrics(&self, snapshot: &SystemSnapshot) {
         let settings = self.settings.borrow();
-        for section in MonitorSection::ALL {
+        for preference in settings
+            .sections
+            .iter()
+            .filter(|preference| preference.visible)
+        {
+            let section = preference.section;
             let Some(view) = self.sections.get(&section) else {
                 continue;
             };
@@ -650,24 +604,35 @@ impl MonitorLayout {
             }
         }
 
-        let selected_options = settings
+        if !settings.enabled || has_visible_metrics {
+            self.empty_state.set_visible(false);
+            return;
+        }
+        // Only an empty view needs to distinguish hidden metrics from missing
+        // hardware. Ordinary samples already have visible rows above.
+        let snapshot = self.snapshot.borrow();
+        let mut has_options = false;
+        let mut has_selected_metric = false;
+        for preference in settings
             .sections
             .iter()
             .filter(|preference| preference.visible)
-            .flat_map(|preference| {
-                metric_options(preference.section, &self.snapshot.borrow())
-                    .into_iter()
-                    .map(move |metric| (preference.section, metric.id))
-            })
-            .collect::<Vec<_>>();
+        {
+            let options = metric_options(preference.section, &snapshot);
+            has_options |= !options.is_empty();
+            if options
+                .iter()
+                .any(|metric| settings.metric_visible(preference.section, &metric.id))
+            {
+                has_selected_metric = true;
+                break;
+            }
+        }
         let has_selected_sections = settings
             .sections
             .iter()
             .any(|preference| preference.visible);
-        let all_items_hidden = !selected_options.is_empty()
-            && selected_options
-                .iter()
-                .all(|(section, id)| !settings.metric_visible(*section, id));
+        let all_items_hidden = has_options && !has_selected_metric;
         if has_selected_sections && !all_items_hidden {
             self.empty_title.set_label("No compatible metrics");
             self.empty_hint
@@ -685,278 +650,6 @@ impl MonitorLayout {
 impl Drop for MonitorLayout {
     fn drop(&mut self) {
         gtk::style_context_remove_provider_for_display(&self.display, &self.scale_provider);
-    }
-}
-
-pub(super) fn display_metrics(
-    section: MonitorSection,
-    snapshot: &SystemSnapshot,
-) -> (Vec<DisplayMetric>, Option<f64>) {
-    let mut metrics = Vec::new();
-    let fraction = match section {
-        MonitorSection::Cpu => {
-            if !snapshot.ready {
-                metrics.push(DisplayMetric::new("loading", "System Monitor", "Loading…"));
-                return (metrics, None);
-            }
-            if let Some(cpu) = snapshot.cpu_percent {
-                metrics.push(DisplayMetric::new("cpu", "CPU", format_percent(cpu)));
-            }
-            if let Some(frequency) = snapshot.cpu_frequency_mhz {
-                metrics.push(DisplayMetric::new(
-                    "cpu-frequency",
-                    "CPU Frequency",
-                    if frequency >= 1000.0 {
-                        format!("{:.2} GHz", frequency / 1000.0)
-                    } else {
-                        format!("{frequency:.0} MHz")
-                    },
-                ));
-            }
-            if let Some(load) = snapshot.load_average {
-                metrics.push(DisplayMetric::new(
-                    "load-average",
-                    "Load (1 min)",
-                    format!("{load:.2}"),
-                ));
-            }
-            if let (Some(running), Some(total)) =
-                (snapshot.running_processes, snapshot.total_processes)
-            {
-                metrics.push(DisplayMetric::new(
-                    "processes",
-                    "Processes",
-                    format!("{running} / {total}"),
-                ));
-            }
-            if let Some(seconds) = snapshot.uptime_seconds {
-                metrics.push(DisplayMetric::new(
-                    "uptime",
-                    "Uptime",
-                    format_duration(seconds),
-                ));
-            }
-            None
-        }
-        MonitorSection::Gpu => {
-            metrics.extend(gpu::display(section, &snapshot.gpus));
-            None
-        }
-        MonitorSection::Memory => {
-            if let Some(used) = snapshot.memory_used {
-                metrics.push(DisplayMetric::new(
-                    "memory-used",
-                    "Memory Used",
-                    format_bytes(used),
-                ));
-            }
-            if let Some(total) = snapshot.memory_total {
-                metrics.push(DisplayMetric::new(
-                    "memory-total",
-                    "Memory Total",
-                    format_bytes(total),
-                ));
-            }
-            if let (Some(used), Some(total)) = (snapshot.memory_used, snapshot.memory_total) {
-                metrics.push(DisplayMetric::new(
-                    "memory-available",
-                    "Available",
-                    format_bytes(total.saturating_sub(used)),
-                ));
-            }
-            if let Some(used) = snapshot.swap_used {
-                metrics.push(DisplayMetric::new(
-                    "swap-used",
-                    "Swap Used",
-                    format_bytes(used),
-                ));
-            }
-            if let Some(total) = snapshot.swap_total {
-                metrics.push(DisplayMetric::new(
-                    "swap-total",
-                    "Swap Total",
-                    format_bytes(total),
-                ));
-            }
-            ratio(snapshot.memory_used, snapshot.memory_total)
-        }
-        MonitorSection::Network => {
-            if snapshot.network_available {
-                if !snapshot.network_interfaces.is_empty() {
-                    metrics.push(DisplayMetric::new(
-                        "network-interfaces",
-                        "Interfaces",
-                        snapshot.network_interfaces.join(", "),
-                    ));
-                }
-                metrics.push(DisplayMetric::new(
-                    "download",
-                    "Download Rate",
-                    format_rate(snapshot.download_bytes_per_second),
-                ));
-                metrics.push(DisplayMetric::new(
-                    "upload",
-                    "Upload Rate",
-                    format_rate(snapshot.upload_bytes_per_second),
-                ));
-                metrics.push(DisplayMetric::new(
-                    "network-received",
-                    "Received",
-                    format_bytes(snapshot.network_received_bytes),
-                ));
-                metrics.push(DisplayMetric::new(
-                    "network-sent",
-                    "Sent",
-                    format_bytes(snapshot.network_transmitted_bytes),
-                ));
-            }
-            None
-        }
-        MonitorSection::Storage => {
-            for disk in &snapshot.disks {
-                let group = MetricGroup {
-                    id: disk.id.clone(),
-                    label: disk.name.clone(),
-                };
-                for (id, label, bytes) in [
-                    ("used", "Used", disk.used),
-                    ("total", "Total", disk.total),
-                    ("available", "Available", disk.available),
-                ] {
-                    let mut metric =
-                        DisplayMetric::new(format!("{}:{id}", disk.id), label, format_bytes(bytes));
-                    metric.group = Some(group.clone());
-                    metrics.push(metric);
-                }
-                if let Some(fraction) = ratio(Some(disk.used), Some(disk.total)) {
-                    let mut metric =
-                        DisplayMetric::new(format!("{}:{METRIC_METER}", disk.id), "Usage bar", "");
-                    metric.group = Some(group);
-                    metric.fraction = Some(fraction);
-                    metrics.push(metric);
-                }
-            }
-            None
-        }
-        MonitorSection::Temperatures => {
-            for sensor in &snapshot.temperatures {
-                metrics.push(DisplayMetric::new(
-                    &sensor.id,
-                    &sensor.label,
-                    sensor.formatted("°C", 1),
-                ));
-            }
-            metrics.extend(gpu::display(section, &snapshot.gpus));
-            None
-        }
-        MonitorSection::Power => {
-            for sensor in &snapshot.power {
-                metrics.push(DisplayMetric::new(
-                    &sensor.id,
-                    &sensor.label,
-                    sensor.formatted("W", 1),
-                ));
-            }
-            metrics.extend(gpu::display(section, &snapshot.gpus));
-            None
-        }
-        MonitorSection::Cooling => {
-            for sensor in &snapshot.fans {
-                metrics.push(DisplayMetric::new(
-                    &sensor.id,
-                    &sensor.label,
-                    sensor.formatted("RPM", 0),
-                ));
-            }
-            None
-        }
-        MonitorSection::Battery => {
-            for battery in &snapshot.device_batteries {
-                let mut metric =
-                    DisplayMetric::new(&battery.id, &battery.name, battery.display_value());
-                metric.power_off.clone_from(&battery.power_off);
-                metrics.push(metric);
-            }
-            if let Some(battery) = snapshot.battery.as_ref() {
-                metrics.push(DisplayMetric::new(
-                    "battery",
-                    "Battery",
-                    format!("{:.0}%", battery.percent),
-                ));
-                metrics.push(DisplayMetric::new(
-                    "battery-status",
-                    "Status",
-                    &battery.status,
-                ));
-                if let Some(power) = battery.power_watts {
-                    let label = if battery.status.eq_ignore_ascii_case("charging") {
-                        "Charging Rate"
-                    } else {
-                        "Power Draw"
-                    };
-                    metrics.push(DisplayMetric::new(
-                        "battery-power",
-                        label,
-                        format!("{power:.1} W"),
-                    ));
-                }
-                Some(battery.percent / 100.0)
-            } else {
-                None
-            }
-        }
-    };
-    (metrics, fraction)
-}
-
-fn ratio(value: Option<u64>, total: Option<u64>) -> Option<f64> {
-    value
-        .zip(total)
-        .filter(|(_, total)| *total > 0)
-        .map(|(value, total)| value as f64 / total as f64)
-}
-
-pub(super) fn format_percent(value: f64) -> String {
-    if value >= 10.0 {
-        format!("{value:.0}%")
-    } else {
-        format!("{value:.1}%")
-    }
-}
-
-pub(super) fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    const TIB: f64 = GIB * 1024.0;
-    let bytes = bytes as f64;
-    if bytes >= TIB {
-        format!("{:.1} TiB", bytes / TIB)
-    } else if bytes >= GIB {
-        format!("{:.1} GiB", bytes / GIB)
-    } else if bytes >= MIB {
-        format!("{:.0} MiB", bytes / MIB)
-    } else if bytes >= KIB {
-        format!("{:.0} KiB", bytes / KIB)
-    } else {
-        format!("{bytes:.0} B")
-    }
-}
-
-fn format_rate(bytes_per_second: f64) -> String {
-    format!("{}/s", format_bytes(bytes_per_second.max(0.0) as u64))
-}
-
-fn format_duration(seconds: u64) -> String {
-    let days = seconds / 86_400;
-    let hours = seconds % 86_400 / 3_600;
-    let minutes = seconds % 3_600 / 60;
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else {
-        format!("{minutes}m")
     }
 }
 

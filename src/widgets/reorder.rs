@@ -2,7 +2,7 @@
 use gtk::{gdk, glib, prelude::*};
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -34,6 +34,9 @@ fn moved_index(index: usize, from: usize, to: usize) -> usize {
 }
 
 pub(super) fn sort_by_order<T>(items: &mut [T], order: &[String], key: impl Fn(&T) -> String) {
+    if order.is_empty() || items.len() < 2 {
+        return;
+    }
     let ranks = order
         .iter()
         .enumerate()
@@ -44,10 +47,11 @@ pub(super) fn sort_by_order<T>(items: &mut [T], order: &[String], key: impl Fn(&
 }
 
 pub(super) fn merge_visible_order(full: &[String], visible: &[String]) -> Vec<String> {
+    let visible_keys = visible.iter().collect::<HashSet<_>>();
     let mut replacement = visible.iter();
     full.iter()
         .map(|key| {
-            if visible.contains(key) {
+            if visible_keys.contains(key) {
                 replacement.next().unwrap().clone()
             } else {
                 key.clone()

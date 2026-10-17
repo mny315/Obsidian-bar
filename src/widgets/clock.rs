@@ -8,7 +8,7 @@ use gtk::{gdk, glib, prelude::*};
 
 use super::tooltip::BarTooltipExt;
 use super::{
-    PopupReveal, attach_popup_escape_handler, attach_popup_lifecycle, build_bar_popup_left,
+    PopupReveal, Timer, attach_popup_escape_handler, attach_popup_lifecycle, build_bar_popup_left,
     detach_application_window, reset_hidden_popup_state, run_when_popup_visible,
 };
 
@@ -20,6 +20,7 @@ struct ClockController {
     popup_root: gtk::Box,
     popup_reveal: PopupReveal,
     focus_armed: Rc<Cell<bool>>,
+    minute_timer: Timer,
 }
 
 pub struct ClockIndicator {
@@ -91,10 +92,11 @@ impl ClockIndicator {
             popup_root,
             popup_reveal,
             focus_armed: Rc::new(Cell::new(false)),
+            minute_timer: Timer::default(),
         });
 
         ClockController::connect(&controller, bar_window);
-        schedule_update(&label);
+        controller.schedule_update(&label);
 
         Self {
             trigger,
@@ -179,18 +181,18 @@ impl ClockController {
         self.trigger.remove_css_class("calendar-popup-open");
         self.popup_reveal.hide(&self.popup);
     }
-}
-
-fn schedule_update(label: &gtk::Label) {
-    let weak_label = label.downgrade();
-    glib::timeout_add_local_once(duration_until_next_minute(), move || {
-        let Some(label) = weak_label.upgrade() else {
-            return;
-        };
-
-        label.set_label(&local_clock_text());
-        schedule_update(&label);
-    });
+    fn schedule_update(self: &Rc<Self>, label: &gtk::Label) {
+        let weak = Rc::downgrade(self);
+        let weak_label = label.downgrade();
+        self.minute_timer
+            .schedule(duration_until_next_minute(), move || {
+                let (Some(controller), Some(label)) = (weak.upgrade(), weak_label.upgrade()) else {
+                    return;
+                };
+                label.set_label(&local_clock_text());
+                controller.schedule_update(&label);
+            });
+    }
 }
 
 fn duration_until_next_minute() -> Duration {
@@ -282,7 +284,15 @@ mod tests {
         pump(150);
         clock.widget().emit_clicked();
         pump(350);
-        assert!(controller.popup_reveal.0.child.opacity() > 0.99);
+        assert!(
+            controller
+                .popup_reveal
+                .widget()
+                .first_child()
+                .unwrap()
+                .opacity()
+                > 0.99
+        );
 
         fn check_labels(widget: &gtk::Widget) -> usize {
             let mut count = 0;
@@ -301,7 +311,7 @@ mod tests {
             }
             count
         }
-        assert!(check_labels(&controller.popup_reveal.0.child) >= 42);
+        assert!(check_labels(&controller.popup_reveal.widget().first_child().unwrap()) >= 42);
         capture_if_requested(&controller.popup, "calendar");
         clock.dismiss();
         assert!(
@@ -310,6 +320,29 @@ mod tests {
         );
         pump(250);
         assert!(!controller.popup.is_visible());
+        controller.popup.settings().set_gtk_enable_animations(false);
+        controller.open_popup();
+        assert_eq!(
+            controller
+                .popup_reveal
+                .widget()
+                .first_child()
+                .unwrap()
+                .opacity(),
+            1.0
+        );
+        clock.dismiss();
+        assert!(
+            !controller.popup.is_visible(),
+            "disabled effects must close immediately"
+        );
+        let weak_controller = Rc::downgrade(controller);
+        let weak_popup = controller.popup.downgrade();
+        assert!(controller.minute_timer.is_pending());
+        drop(clock);
+        pump(20);
+        assert!(weak_controller.upgrade().is_none());
+        assert!(weak_popup.upgrade().is_none());
         bar.destroy();
     }
 }

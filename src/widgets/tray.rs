@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -10,7 +10,9 @@ use std::{
 
 use super::{
     RefreshGate,
-    dbus::{unbox_variant, variant_value},
+    change_signal::{ChangeSignal, ChangeTicket},
+    css_transition::attach_popover_reveal,
+    dbus::{properties_changed, unbox_variant, variant_value},
     tooltip::{BarTooltipExt, BarTooltipSuppression, hide_all_tooltips_immediately},
 };
 use gtk::{gdk, gio, glib, prelude::*};
@@ -121,8 +123,14 @@ enum TrayEvent {
         owner: String,
         item: String,
     },
-    ItemChanged(String),
-    RefreshRequested(String),
+    ItemChanged {
+        item_id: String,
+        ticket: ChangeTicket,
+    },
+    RefreshRequested {
+        item_id: String,
+        ticket: ChangeTicket,
+    },
     NameOwnerChanged {
         name: String,
         new_owner: String,
@@ -162,11 +170,17 @@ impl TrayController {
 
         let weak_state = Rc::downgrade(&state);
         glib::MainContext::default().spawn_local(async move {
+            let mut processed = 0;
             while let Ok(event) = events_rx.recv().await {
                 let Some(state) = weak_state.upgrade() else {
                     break;
                 };
                 state.borrow_mut().handle_event(event);
+                processed += 1;
+                if processed >= 32 {
+                    glib::timeout_future(Duration::ZERO).await;
+                    processed = 0;
+                }
             }
         });
 
@@ -552,12 +566,14 @@ impl TrayState {
                     self.unregister_item(&item);
                 }
             }
-            TrayEvent::ItemChanged(item_id) => {
+            TrayEvent::ItemChanged { item_id, ticket } => {
+                drop(ticket);
                 if let Some(item) = self.items.iter().find(|item| item.id == item_id).cloned() {
                     self.update_views(&item);
                 }
             }
-            TrayEvent::RefreshRequested(item_id) => {
+            TrayEvent::RefreshRequested { item_id, ticket } => {
+                drop(ticket);
                 if let Some(item) = self.items.iter().find(|item| item.id == item_id).cloned() {
                     item.schedule_refresh();
                 }
@@ -809,6 +825,7 @@ impl TrayState {
     }
 
     fn update_views(&mut self, item: &Rc<TrayItem>) {
+        item.refresh_snapshot();
         self.views.retain(|view| {
             if let Some(view) = view.upgrade() {
                 view.update_item(item);
@@ -920,8 +937,7 @@ impl TrayView {
 struct TrayButton {
     root: gtk::MenuButton,
     image: gtk::Image,
-    tooltip: RefCell<String>,
-    icon_signature: RefCell<TrayIconSignature>,
+    snapshot: RefCell<Rc<TraySnapshot>>,
     menu_request: Rc<RefCell<Option<gio::Cancellable>>>,
 }
 
@@ -955,16 +971,16 @@ impl TrayButton {
         &self.root
     }
 
-    fn update(&self, snapshot: TraySnapshot) {
-        let icon_signature = snapshot.icon_signature();
-        if *self.tooltip.borrow() != snapshot.tooltip {
+    fn update(&self, snapshot: Rc<TraySnapshot>) {
+        let current = self.snapshot.borrow();
+        if current.tooltip != snapshot.tooltip {
             self.root.set_bar_tooltip_text(Some(&snapshot.tooltip));
         }
-        if *self.icon_signature.borrow() != icon_signature {
+        if current.icon != snapshot.icon {
             apply_icon(&self.image, &snapshot);
         }
-        *self.tooltip.borrow_mut() = snapshot.tooltip;
-        *self.icon_signature.borrow_mut() = icon_signature;
+        drop(current);
+        self.snapshot.replace(snapshot);
     }
 }
 
@@ -973,8 +989,10 @@ struct TrayItem {
     service: String,
     proxy: gio::DBusProxy,
     menu_proxy: RefCell<Option<(String, gio::DBusProxy)>>,
+    snapshot: RefCell<Option<Rc<TraySnapshot>>>,
     events: async_channel::Sender<TrayEvent>,
     refresh: RefreshGate,
+    changed: ChangeSignal,
 }
 
 impl TrayItem {
@@ -989,9 +1007,12 @@ impl TrayItem {
             service,
             proxy,
             menu_proxy: RefCell::new(None),
+            snapshot: RefCell::new(None),
             events: events.clone(),
             refresh: RefreshGate::default(),
+            changed: ChangeSignal::default(),
         });
+        item.refresh_snapshot();
         item.connect_signals();
         item
     }
@@ -999,12 +1020,38 @@ impl TrayItem {
     fn connect_signals(self: &Rc<Self>) {
         let changed_id = self.id.clone();
         let changed_events = self.events.clone();
-        self.proxy.connect_g_properties_changed(move |_, _, _| {
-            enqueue_tray_event(&changed_events, TrayEvent::ItemChanged(changed_id.clone()));
-        });
+        let pending = self.changed.clone();
+        self.proxy
+            .connect_g_properties_changed(move |_, changed, invalidated| {
+                if properties_changed(
+                    changed,
+                    invalidated.iter().map(|name| name.as_str()),
+                    &[
+                        "Status",
+                        "Title",
+                        "Id",
+                        "ToolTip",
+                        "IconName",
+                        "IconPixmap",
+                        "AttentionIconName",
+                        "AttentionIconPixmap",
+                        "IconThemePath",
+                    ],
+                ) && let Some(ticket) = pending.claim()
+                {
+                    enqueue_tray_event(
+                        &changed_events,
+                        TrayEvent::ItemChanged {
+                            item_id: changed_id.clone(),
+                            ticket,
+                        },
+                    );
+                }
+            });
 
         let refresh_id = self.id.clone();
         let refresh_events = self.events.clone();
+        let pending = ChangeSignal::default();
         self.proxy
             .connect_g_signal(None::<&str>, move |_, _, signal_name, _| {
                 if matches!(
@@ -1015,10 +1062,14 @@ impl TrayItem {
                         | "NewOverlayIcon"
                         | "NewToolTip"
                         | "NewStatus"
-                ) {
+                ) && let Some(ticket) = pending.claim()
+                {
                     enqueue_tray_event(
                         &refresh_events,
-                        TrayEvent::RefreshRequested(refresh_id.clone()),
+                        TrayEvent::RefreshRequested {
+                            item_id: refresh_id.clone(),
+                            ticket,
+                        },
                     );
                 }
             });
@@ -1038,7 +1089,15 @@ impl TrayItem {
         });
     }
 
-    fn snapshot(&self) -> Option<TraySnapshot> {
+    fn snapshot(&self) -> Option<Rc<TraySnapshot>> {
+        self.snapshot.borrow().as_ref().map(Rc::clone)
+    }
+
+    fn refresh_snapshot(&self) {
+        self.snapshot.replace(self.read_snapshot().map(Rc::new));
+    }
+
+    fn read_snapshot(&self) -> Option<TraySnapshot> {
         let status = cached_property::<String>(&self.proxy, "Status").unwrap_or_default();
         let title = cached_property::<String>(&self.proxy, "Title")
             .filter(|title| !title.is_empty())
@@ -1054,15 +1113,23 @@ impl TrayItem {
             return None;
         }
 
+        let pixmap_hash = icon_pixmaps.as_ref().map(|pixmaps| {
+            let mut hasher = DefaultHasher::new();
+            pixmaps.hash(&mut hasher);
+            hasher.finish()
+        });
         Some(TraySnapshot {
             tooltip,
-            icon_name,
+            icon: TrayIconSignature {
+                icon_name,
+                icon_theme_path,
+                pixmap_hash,
+            },
             icon_pixmaps,
-            icon_theme_path,
         })
     }
 
-    fn build_button(self: &Rc<Self>, snapshot: TraySnapshot) -> TrayButton {
+    fn build_button(self: &Rc<Self>, snapshot: Rc<TraySnapshot>) -> TrayButton {
         let button = gtk::MenuButton::new();
         button.add_css_class("tray-item");
         button.set_has_frame(false);
@@ -1128,12 +1195,10 @@ impl TrayItem {
             }
         });
         button.add_controller(secondary);
-        let icon_signature = snapshot.icon_signature();
         TrayButton {
             root: button,
             image,
-            tooltip: RefCell::new(snapshot.tooltip),
-            icon_signature: RefCell::new(icon_signature),
+            snapshot: RefCell::new(snapshot),
             menu_request,
         }
     }
@@ -1279,24 +1344,8 @@ fn tray_icon_properties(
 
 struct TraySnapshot {
     tooltip: String,
-    icon_name: Option<String>,
+    icon: TrayIconSignature,
     icon_pixmaps: Option<IconPixmaps>,
-    icon_theme_path: Option<String>,
-}
-
-impl TraySnapshot {
-    fn icon_signature(&self) -> TrayIconSignature {
-        let pixmap_hash = self.icon_pixmaps.as_ref().map(|pixmaps| {
-            let mut hasher = DefaultHasher::new();
-            pixmaps.hash(&mut hasher);
-            hasher.finish()
-        });
-        TrayIconSignature {
-            icon_name: self.icon_name.clone(),
-            icon_theme_path: self.icon_theme_path.clone(),
-            pixmap_hash,
-        }
-    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -1431,43 +1480,11 @@ fn build_menu_box(
 }
 
 fn install_menu_reveal(popover: &gtk::Popover) {
-    popover.set_opacity(0.0);
-    let reveal_generation = Rc::new(Cell::new(0_u64));
-    let reveal_generation_for_notify = Rc::clone(&reveal_generation);
-    popover.connect_visible_notify(move |popover| {
-        let generation = reveal_generation_for_notify.get().wrapping_add(1);
-        reveal_generation_for_notify.set(generation);
-        popover.remove_css_class(CONTEXT_MENU_REVEAL_CLASS);
-
-        if !popover.is_visible() {
-            popover.set_opacity(0.0);
-            return;
-        }
-
-        popover.set_opacity(0.0);
-        let weak_popover = popover.downgrade();
-        let reveal_generation = Rc::clone(&reveal_generation_for_notify);
-        glib::idle_add_local_once(move || {
-            let Some(popover) = weak_popover.upgrade() else {
-                return;
-            };
-            if reveal_generation.get() != generation || !popover.is_visible() {
-                return;
-            }
-
-            popover.add_css_class(CONTEXT_MENU_REVEAL_CLASS);
-            popover.set_opacity(1.0);
-            let weak_popover = popover.downgrade();
-            let reveal_generation = Rc::clone(&reveal_generation);
-            glib::timeout_add_local_once(CONTEXT_MENU_REVEAL_DURATION, move || {
-                if reveal_generation.get() == generation
-                    && let Some(popover) = weak_popover.upgrade()
-                {
-                    popover.remove_css_class(CONTEXT_MENU_REVEAL_CLASS);
-                }
-            });
-        });
-    });
+    attach_popover_reveal(
+        popover,
+        CONTEXT_MENU_REVEAL_CLASS,
+        CONTEXT_MENU_REVEAL_DURATION,
+    );
 }
 
 fn menu_row_content(
@@ -1595,8 +1612,8 @@ fn send_menu_event(proxy: &gio::DBusProxy, id: i32) {
 fn apply_icon(image: &gtk::Image, snapshot: &TraySnapshot) {
     image.clear();
 
-    if let Some(icon_name) = snapshot.icon_name.as_deref()
-        && apply_icon_name(image, icon_name, snapshot.icon_theme_path.as_deref())
+    if let Some(icon_name) = snapshot.icon.icon_name.as_deref()
+        && apply_icon_name(image, icon_name, snapshot.icon.icon_theme_path.as_deref())
     {
         return;
     }
@@ -1786,7 +1803,15 @@ fn refresh_item_properties(item: &Rc<TrayItem>) {
                     item.proxy.set_cached_property(&name, Some(&value));
                 }
             }
-            enqueue_tray_event(&item.events, TrayEvent::ItemChanged(item.id.clone()));
+            if let Some(ticket) = item.changed.claim() {
+                enqueue_tray_event(
+                    &item.events,
+                    TrayEvent::ItemChanged {
+                        item_id: item.id.clone(),
+                        ticket,
+                    },
+                );
+            }
             if item.refresh.finish() {
                 item.schedule_refresh();
             }

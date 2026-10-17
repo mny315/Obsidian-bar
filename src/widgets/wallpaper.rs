@@ -11,6 +11,7 @@ use std::{
 };
 use tracing::{info, warn};
 
+mod files;
 mod picker;
 mod thumbnails;
 use thumbnails::*;
@@ -1022,24 +1023,7 @@ fn choose_random_wallpaper(
 }
 
 fn list_wallpapers(directory: &Path) -> Result<Vec<PathBuf>, WallpaperError> {
-    let entries = fs::read_dir(directory).map_err(WallpaperError::Io)?;
-    let mut paths = Vec::new();
-
-    for entry in entries {
-        let entry = entry.map_err(WallpaperError::Io)?;
-        let path = entry.path();
-        if is_supported_wallpaper(&path) && path.is_file() {
-            paths.push(path);
-        }
-    }
-
-    paths.sort_by_cached_key(|path| {
-        path.file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-    });
-    Ok(paths)
+    files::list_entries(directory, files::EntryKind::Wallpaper, None)
 }
 
 fn wallpaper_key(path: &Path) -> String {

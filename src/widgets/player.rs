@@ -5,7 +5,8 @@ use std::{
     time::Duration,
 };
 
-use super::dbus::variant_value;
+use super::change_signal::{ChangeSignal, ChangeTicket};
+use super::dbus::{properties_changed, unbox_variant, variant_value};
 use gio::prelude::*;
 use gtk::glib;
 use tracing::{debug, warn};
@@ -52,20 +53,50 @@ impl PlayerHandle {
 
         let events_tx = events.clone();
         let changed_bus = bus_name.clone();
-        player.connect_g_properties_changed(move |_, _, _| {
-            enqueue_player_event(
-                &events_tx,
-                PlayerEvent::PlayerPropertiesChanged(changed_bus.clone()),
-            );
+        let pending = ChangeSignal::default();
+        player.connect_g_properties_changed(move |_, changed, invalidated| {
+            if properties_changed(
+                changed,
+                invalidated.iter().map(|name| name.as_str()),
+                &[
+                    "PlaybackStatus",
+                    "Metadata",
+                    "CanControl",
+                    "CanPlay",
+                    "CanPause",
+                    "CanGoPrevious",
+                    "CanGoNext",
+                ],
+            ) && let Some(ticket) = pending.claim()
+            {
+                enqueue_player_event(
+                    &events_tx,
+                    PlayerEvent::PlayerPropertiesChanged {
+                        bus_name: changed_bus.clone(),
+                        ticket,
+                    },
+                );
+            }
         });
 
         let events_tx = events.clone();
         let changed_bus = bus_name.clone();
-        root.connect_g_properties_changed(move |_, _, _| {
-            enqueue_player_event(
-                &events_tx,
-                PlayerEvent::RootPropertiesChanged(changed_bus.clone()),
-            );
+        let pending = ChangeSignal::default();
+        root.connect_g_properties_changed(move |_, changed, invalidated| {
+            if properties_changed(
+                changed,
+                invalidated.iter().map(|name| name.as_str()),
+                &["Identity", "CanRaise"],
+            ) && let Some(ticket) = pending.claim()
+            {
+                enqueue_player_event(
+                    &events_tx,
+                    PlayerEvent::RootPropertiesChanged {
+                        bus_name: changed_bus.clone(),
+                        ticket,
+                    },
+                );
+            }
         });
 
         Some(Self {
@@ -227,8 +258,14 @@ enum PlayerEvent {
         root: Option<gio::DBusProxy>,
         error: Option<String>,
     },
-    PlayerPropertiesChanged(String),
-    RootPropertiesChanged(String),
+    PlayerPropertiesChanged {
+        bus_name: String,
+        ticket: ChangeTicket,
+    },
+    RootPropertiesChanged {
+        bus_name: String,
+        ticket: ChangeTicket,
+    },
 }
 
 fn enqueue_player_event(sender: &async_channel::Sender<PlayerEvent>, event: PlayerEvent) {
@@ -304,10 +341,14 @@ impl PlayerState {
                 root,
                 error,
             } => self.finish_player_connection(bus_name, request_id, player, root, error),
-            PlayerEvent::PlayerPropertiesChanged(bus_name) => {
+            PlayerEvent::PlayerPropertiesChanged { bus_name, ticket } => {
+                drop(ticket);
                 self.player_properties_changed(&bus_name)
             }
-            PlayerEvent::RootPropertiesChanged(bus_name) => self.root_properties_changed(&bus_name),
+            PlayerEvent::RootPropertiesChanged { bus_name, ticket } => {
+                drop(ticket);
+                self.root_properties_changed(&bus_name)
+            }
         }
     }
 
@@ -496,7 +537,12 @@ impl PlayerState {
         self.prune_ownerless_players();
         self.ensure_active_bus();
         let view = self.current_view();
-        let sources = self.source_views();
+        let sources = self
+            .views
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|ui| ui.wants_source_views())
+            .then(|| self.source_views());
 
         self.views.retain(|weak_ui| {
             let Some(ui) = weak_ui.upgrade() else {
@@ -504,7 +550,7 @@ impl PlayerState {
             };
 
             match view.as_ref() {
-                Some(view) => ui.render(view, &sources),
+                Some(view) => ui.render(view, sources.as_deref()),
                 None => ui.clear(),
             }
             true
@@ -519,7 +565,7 @@ impl PlayerState {
         let view = self.current_view();
 
         match view.as_ref() {
-            Some(view) => ui.render(view, &self.source_views()),
+            Some(view) => ui.render(view, None),
             None => ui.clear(),
         }
     }
@@ -677,11 +723,17 @@ impl PlayerController {
 
         let weak_state = Rc::downgrade(&state);
         glib::MainContext::default().spawn_local(async move {
+            let mut processed = 0;
             while let Ok(event) = events_rx.recv().await {
                 let Some(state) = weak_state.upgrade() else {
                     break;
                 };
                 state.borrow_mut().handle_event(event);
+                processed += 1;
+                if processed >= 32 {
+                    glib::timeout_future(Duration::ZERO).await;
+                    processed = 0;
+                }
             }
         });
 
@@ -842,39 +894,55 @@ fn playback_status(proxy: &gio::DBusProxy) -> PlaybackStatus {
 }
 
 fn metadata_text(player: &gio::DBusProxy, root: &gio::DBusProxy) -> String {
-    let metadata = player
+    player
         .cached_property("Metadata")
-        .and_then(|variant| variant.get::<HashMap<String, glib::Variant>>());
-
-    let title = metadata
         .as_ref()
-        .and_then(|map| map.get("xesam:title"))
-        .and_then(variant_value::<String>)
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-
-    let artist = metadata
-        .as_ref()
-        .and_then(|map| map.get("xesam:artist"))
-        .and_then(variant_value::<Vec<String>>)
-        .map(|artists| {
-            artists
-                .into_iter()
-                .map(|artist| artist.trim().to_owned())
-                .filter(|artist| !artist.is_empty())
-                .collect::<Vec<_>>()
-                .join(", ")
+        .and_then(track_metadata_text)
+        .or_else(|| {
+            property_string(root, "Identity")
+                .map(|identity| identity.trim().to_owned())
+                .filter(|identity| !identity.is_empty())
         })
-        .filter(|value| !value.is_empty());
+        .unwrap_or_else(|| "Now playing".to_owned())
+}
+
+fn track_metadata_text(metadata: &glib::Variant) -> Option<String> {
+    if metadata.type_() != glib::VariantTy::VARDICT {
+        return None;
+    }
+    let mut title = None;
+    let mut artist = None;
+    // Art URLs, album data and other metadata do not need owned Rust map keys
+    // or values when the bar displays only the artist and track title.
+    for entry in metadata.iter() {
+        let name = entry.child_value(0);
+        match name.str() {
+            Some("xesam:title") => {
+                title = variant_value::<String>(&unbox_variant(&entry.child_value(1)))
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty());
+            }
+            Some("xesam:artist") => {
+                artist = variant_value::<Vec<String>>(&unbox_variant(&entry.child_value(1)))
+                    .map(|artists| {
+                        artists
+                            .iter()
+                            .map(|artist| artist.trim())
+                            .filter(|artist| !artist.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|value| !value.is_empty());
+            }
+            _ => {}
+        }
+    }
 
     match (artist, title) {
-        (Some(artist), Some(title)) => format!("{artist} — {title}"),
-        (_, Some(title)) => title,
-        (Some(artist), None) => artist,
-        (None, None) => property_string(root, "Identity")
-            .map(|identity| identity.trim().to_owned())
-            .filter(|identity| !identity.is_empty())
-            .unwrap_or_else(|| "Now playing".to_owned()),
+        (Some(artist), Some(title)) => Some(format!("{artist} — {title}")),
+        (_, Some(title)) => Some(title),
+        (Some(artist), None) => Some(artist),
+        (None, None) => None,
     }
 }
 
@@ -884,18 +952,14 @@ fn truncate_text(value: &str, limit: usize) -> String {
     }
 
     let mut chars = value.chars();
-    let prefix = chars.by_ref().take(limit).collect::<String>();
+    let mut prefix = chars.by_ref().take(limit).collect::<String>();
     if chars.next().is_none() {
         return prefix;
     }
 
-    if limit == 1 {
-        return "…".to_owned();
-    }
-
-    let mut shortened = prefix.chars().take(limit - 1).collect::<String>();
-    shortened.push('…');
-    shortened
+    prefix.pop();
+    prefix.push('…');
+    prefix
 }
 
 fn property_string(proxy: &gio::DBusProxy, name: &str) -> Option<String> {

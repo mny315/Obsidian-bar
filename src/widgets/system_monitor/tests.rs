@@ -4,6 +4,8 @@ use super::*;
 use gtk::{gdk, prelude::*};
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
+mod source_menus;
+
 #[test]
 fn peripheral_battery_names_and_selection_stay_independent() {
     let mut snapshot = SystemSnapshot::default();
@@ -296,6 +298,7 @@ fn battery_total_uses_capacities_and_excludes_peripherals_and_absent_packs() {
 fn metric_selection_snapshot() -> SystemSnapshot {
     SystemSnapshot {
         ready: true,
+        cpu_name: Some(Arc::from("AMD Ryzen 9 9950X")),
         cpu_percent: Some(25.0),
         cpu_frequency_mhz: Some(3500.0),
         uptime_seconds: Some(7200),
@@ -335,6 +338,31 @@ fn metric_selection_snapshot() -> SystemSnapshot {
         }],
         ..SystemSnapshot::default()
     }
+}
+
+#[test]
+fn cpu_name_heads_the_selected_metrics_without_changing_their_ids() {
+    let mut snapshot = metric_selection_snapshot();
+    let mut settings = MonitorSettings::default();
+    settings.set_metric_visible(MonitorSection::Cpu, "cpu", false);
+    let (metrics, _, _) = selected_metrics(MonitorSection::Cpu, &snapshot, &settings);
+    assert_eq!(metrics[0].id, "cpu-frequency");
+    assert_eq!(metrics[0].value, "3.50 GHz");
+    for metric in &metrics {
+        let group = metric.group.as_ref().unwrap();
+        assert_eq!(group.id, "cpu");
+        assert_eq!(group.label, "AMD Ryzen 9 9950X");
+    }
+    let options = metric_options(MonitorSection::Cpu, &snapshot);
+    assert_eq!(options[0].id, "cpu");
+    assert_eq!(options[0].group, metrics[0].group);
+    snapshot.cpu_name = None;
+    assert!(
+        display_metrics(MonitorSection::Cpu, &snapshot)
+            .0
+            .iter()
+            .all(|metric| metric.group.is_none())
+    );
 }
 
 #[test]
@@ -411,6 +439,75 @@ fn sensor_preferences_do_not_depend_on_hwmon_enumeration() {
         hwmon_device_key(first, "nct6775"),
         hwmon_device_key(other, "nct6775")
     );
+}
+
+#[test]
+#[ignore = "reads local hwmon and thermal-zone files for a sampling benchmark"]
+fn profile_hwmon_sampling() {
+    let settings = MonitorSettings::default();
+    let mut sampler = sensors::HwmonSampler::default();
+    let started = Instant::now();
+    let mut counts = (0, 0, 0);
+    for index in 0..100 {
+        let snapshot = sampler.sample(&settings, index == 0);
+        counts = (
+            snapshot.temperatures.len(),
+            snapshot.power.len(),
+            snapshot.fans.len(),
+        );
+        std::hint::black_box(snapshot);
+    }
+    eprintln!(
+        "hwmon: 100 samples in {:?}, readings={counts:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn new_samples_keep_paused_readings_without_copying_replaced_collections() {
+    let mut previous = metric_selection_snapshot();
+    previous
+        .section_states
+        .insert(MonitorSection::Cpu, gpu::DataState::Paused);
+    previous.battery = Some(BatterySnapshot {
+        percent: 42.0,
+        status: "Charging".into(),
+        power_watts: Some(10.0),
+    });
+    previous.device_batteries.push(batteries::DeviceBattery {
+        id: "mouse".into(),
+        name: "Mouse".into(),
+        percent: Some(70.0),
+        detail: "Discharging".into(),
+        power_off: None,
+    });
+    previous.download_bytes_per_second = 123.0;
+    previous.network_received_bytes = 456;
+    let previous = Arc::new(previous);
+    let mut paused = previous.for_sample(false, false);
+    assert!(paused.ready);
+    assert!(Arc::ptr_eq(
+        previous.cpu_name.as_ref().unwrap(),
+        paused.cpu_name.as_ref().unwrap(),
+    ));
+    assert_eq!(paused.cpu_percent, Some(25.0));
+    assert_eq!(paused.memory_used, previous.memory_used);
+    assert_eq!(paused.network_received_bytes, 456);
+    assert_eq!(paused.download_bytes_per_second, 123.0);
+    assert_eq!(paused.disks.len(), 2);
+    assert_eq!(paused.battery.as_ref().unwrap().percent, 42.0);
+    assert_eq!(paused.device_batteries[0].percent, Some(70.0));
+    assert!(paused.section_states.is_empty());
+    assert!(paused.temperatures.is_empty());
+    assert!(paused.fans.is_empty());
+    paused.disks[0].name = "new label".into();
+    paused.device_batteries[0].percent = Some(20.0);
+    assert_ne!(previous.disks[0].name, "new label");
+    assert_eq!(previous.device_batteries[0].percent, Some(70.0));
+    let active = previous.for_sample(true, true);
+    assert!(active.disks.is_empty());
+    assert!(active.battery.is_none());
+    assert!(active.device_batteries.is_empty());
 }
 
 #[test]
@@ -561,10 +658,43 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
             ..MonitorSettings::default()
         })
     );
-    controller.latest.replace(metric_selection_snapshot());
+    controller
+        .latest
+        .replace(Arc::new(metric_selection_snapshot()));
     let view = SystemMonitorView::new(&application, &monitor, &controller);
     let runtime = &view.runtime;
     runtime.window.set_layer(Layer::Overlay);
+    assert!(!runtime.window.is_visible());
+    let cpu_title = runtime.layout.sections[&MonitorSection::Cpu]
+        .rows
+        .first_child()
+        .unwrap()
+        .downcast::<gtk::Label>()
+        .unwrap();
+    assert_eq!(cpu_title.text(), "AMD Ryzen 9 9950X");
+    assert!(cpu_title.has_css_class("system-monitor-storage-title"));
+    let cpu_row = runtime.layout.sections[&MonitorSection::Cpu]
+        .metric_views
+        .borrow();
+    let MetricView::Value(cpu_label) = &cpu_row[0] else {
+        panic!("CPU value row expected")
+    };
+    let cpu_label = cpu_label.clone();
+    drop(cpu_row);
+    let old_cpu_text = cpu_label.text();
+    let mut hidden_sample = metric_selection_snapshot();
+    hidden_sample.cpu_percent = Some(17.0);
+    let hidden_sample = Arc::new(hidden_sample);
+    controller
+        .snapshot_subscribers
+        .borrow_mut()
+        .retain(|subscriber| subscriber(&hidden_sample));
+    assert_eq!(
+        cpu_label.text(),
+        old_cpu_text,
+        "hidden telemetry must not rebuild labels"
+    );
+    assert_eq!(runtime.layout.snapshot.borrow().cpu_percent, Some(17.0));
     // This test drives settings hover explicitly. Native enter events after a
     // popover closes must not depend on the user's current pointer position.
     let settings_surface = runtime.settings_reveal.child().unwrap();
@@ -581,6 +711,11 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
         settings_surface.remove_controller(&motion);
     }
     view.set_desktop_available(true);
+    assert_eq!(
+        cpu_label.text(),
+        "17%",
+        "reveal must render the latest cached telemetry immediately"
+    );
     let pump = |ms: u64| {
         let until = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < until {
@@ -589,6 +724,20 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
         }
     };
     pump(350);
+    super::super::test_support::capture_if_requested(&runtime.window, "cpu-model");
+    let unmapped = Rc::new(Cell::new(0));
+    let unmapped_count = Rc::clone(&unmapped);
+    let cpu_section = &runtime.layout.sections[&MonitorSection::Cpu].root;
+    let unmap_handler =
+        cpu_section.connect_unmap(move |_| unmapped_count.set(unmapped_count.get() + 1));
+    assert!(controller.set_dimensions(365, 650, SCALE_MILLI_DEFAULT));
+    assert!(controller.set_dimensions(364, 650, SCALE_MILLI_DEFAULT));
+    assert_eq!(
+        unmapped.get(),
+        0,
+        "dimension changes must preserve mapped metric sections"
+    );
+    cpu_section.disconnect(unmap_handler);
     runtime.set_settings_open(true);
     runtime.settings_hovered.set(true);
     pump(300);
@@ -775,7 +924,10 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
     assert_eq!(panel.width.value(), minimum);
     assert_eq!(runtime.card.width(), minimum as i32);
     controller.set_dimensions(364, 650, SCALE_MILLI_MAX);
-    pump(100);
+    let layout_deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.card.width() != PANEL_MAX_WIDTH && Instant::now() < layout_deadline {
+        pump(5);
+    }
     assert_eq!(runtime.card.width(), PANEL_MAX_WIDTH);
     assert!(
         runtime.window.height() > height,
@@ -795,12 +947,12 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
     pump(100);
     let mut snapshot = metric_selection_snapshot();
     snapshot.cpu_percent = Some(100.0);
-    runtime.layout.update_snapshot(&snapshot);
+    runtime.layout.update_snapshot(&Arc::new(snapshot.clone()));
     runtime.apply_size();
     pump(30);
     let reserved_width = runtime.card.width();
     snapshot.cpu_percent = Some(0.0);
-    runtime.layout.update_snapshot(&snapshot);
+    runtime.layout.update_snapshot(&Arc::new(snapshot.clone()));
     runtime.apply_size();
     pump(30);
     assert_eq!(
@@ -893,11 +1045,12 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
     let mut snapshot = metric_selection_snapshot();
     snapshot.temperatures.remove(0);
     let publish = |snapshot: &SystemSnapshot| {
-        controller.latest.replace(snapshot.clone());
+        let snapshot = Arc::new(snapshot.clone());
+        controller.latest.replace(Arc::clone(&snapshot));
         controller
             .snapshot_subscribers
             .borrow_mut()
-            .retain(|subscriber| subscriber(snapshot));
+            .retain(|subscriber| subscriber(&snapshot));
         pump(60);
     };
     publish(&snapshot);
@@ -1024,8 +1177,8 @@ fn monitor_metric_groups_keep_selection_and_scroll_position() {
 fn network_selection_does_not_fall_back_when_selected_device_disappears() {
     let content = "header\nheader\n eth0: 100 0 0 0 0 0 0 0 200 0 0 0 0 0 0 0\n wlan0: 300 0 0 0 0 0 0 0 400 0 0 0 0 0 0 0\n";
     let defaults = HashSet::from(["eth0".to_owned()]);
-    let (automatic, _) = parse_network_counters(content, None, &defaults, |_| true).unwrap();
-    let (manual, _) = parse_network_counters(content, Some("wlan0"), &defaults, |_| true).unwrap();
+    let automatic = parse_network_counters(content, None, &defaults, |_| true).unwrap();
+    let manual = parse_network_counters(content, Some("wlan0"), &defaults, |_| true).unwrap();
     assert_eq!(automatic.received, 100);
     assert_eq!(manual.received, 300);
     assert_eq!(manual.transmitted, 400);
@@ -1192,6 +1345,28 @@ fn disk_mounts_include_second_ssd_without_counting_bind_mounts_twice() {
 }
 
 #[test]
+fn mount_paths_decode_once_and_keep_unicode_and_unknown_escapes() {
+    let mounts = disk_mounts(concat!(
+        "1 0 0:21 /@ /mnt/Игры\\040и\\040музыка rw - btrfs /dev/disk/by-label/Game\\040Disk rw\n",
+        "2 0 0:22 /@home /mnt/longer/path rw - btrfs /dev/disk/by-label/Game\\040Disk rw\n",
+        "3 0 8:1 / /mnt/line\\012tab\\011slash\\134040 rw - ext4 /dev/sda1 rw\n",
+        "4 0 8:2 / /mnt/raw\\999\\é\\ rw - ext4 /dev/sdb1 rw\n",
+        "5 0 0:7 / /run/ignored\\040mount rw - tmpfs tmpfs rw\n",
+    ));
+    assert_eq!(
+        mounts,
+        [
+            ("8:1".into(), PathBuf::from("/mnt/line\ntab\tslash\\040")),
+            ("8:2".into(), PathBuf::from("/mnt/raw\\999\\é\\")),
+            (
+                "/dev/disk/by-label/Game Disk".into(),
+                PathBuf::from("/mnt/Игры и музыка")
+            ),
+        ]
+    );
+}
+
+#[test]
 fn hidden_monitor_only_captures_the_visible_tab() {
     for width in [159, 285, 565] {
         let region = monitor_input_region(width, 600, false, width - 48, 40);
@@ -1284,7 +1459,7 @@ fn monitor_drawer_animation_keeps_width_and_survives_reversal() {
     runtime.window.set_layer(Layer::Overlay);
     runtime.window.settings().set_gtk_enable_animations(true);
     runtime.pinned.set(true);
-    runtime.hide_generation.bump();
+    runtime.hide_timer.cancel();
     let pump = |ms: u64| {
         let until = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < until {
@@ -1560,6 +1735,17 @@ fn monitor_drawer_animation_keeps_width_and_survives_reversal() {
             .borrow_mut()
             .retain(|subscriber| subscriber(&settings));
         pump(100);
+        // A font change needs CSS layout, a size request and a Wayland
+        // configure round trip. Wait for that allocation under load instead
+        // of inspecting the previous height after a fixed 100 ms.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.scroller.vadjustment().upper()
+            > runtime.scroller.vadjustment().page_size() + 1.0
+            && runtime.card.height() != runtime.geometry().height_limits().1
+            && Instant::now() < deadline
+        {
+            pump(10);
+        }
         assert!(runtime.card.width() >= width);
         assert!(runtime.card.width() <= PANEL_MAX_WIDTH);
         assert_monitor_text_fits(runtime.card.upcast_ref());

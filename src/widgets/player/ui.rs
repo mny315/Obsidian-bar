@@ -3,7 +3,7 @@ use super::{
     PlayerView,
 };
 use crate::widgets::{
-    Generation, PopupReveal, attach_popup_escape_handler, attach_popup_lifecycle,
+    FrameCallback, PopupReveal, attach_popup_escape_handler, attach_popup_lifecycle,
     bar_features::BarFeatureController, build_bar_popup_left, detach_application_window,
     reset_hidden_popup_state, run_when_popup_visible, tooltip::BarTooltipSuppression,
 };
@@ -23,7 +23,7 @@ const ICON_SWITCH_SOURCE: &str = "\u{f04e1}";
 struct TrackLabel {
     label: gtk::Label,
     desired: Rc<RefCell<String>>,
-    generation: Rc<Generation>,
+    animation: FrameCallback,
 }
 
 impl TrackLabel {
@@ -35,20 +35,20 @@ impl TrackLabel {
         label.set_max_width_chars(max_chars);
         label.set_hexpand(true);
         let desired = Rc::new(RefCell::new(String::new()));
-        let generation = Rc::new(Generation::default());
+        let animation = FrameCallback::default();
         let hidden_text = desired.clone();
-        let hidden_generation = generation.clone();
+        let hidden_animation = animation.clone();
         label.connect_unmap(move |label| {
             // Frame callbacks stop while hidden. Never reopen a list with the
             // outgoing title from an animation interrupted by closing it.
-            hidden_generation.bump();
+            hidden_animation.cancel();
             label.set_label(&hidden_text.borrow());
             label.set_opacity(1.0);
         });
         Self {
             label,
             desired,
-            generation,
+            animation,
         }
     }
 
@@ -61,7 +61,7 @@ impl TrackLabel {
             return;
         }
         self.desired.replace(text.to_owned());
-        let generation = self.generation.bump();
+        self.animation.cancel();
         if !self.label.is_mapped()
             || self.label.label().is_empty()
             || !self.label.settings().is_gtk_enable_animations()
@@ -74,16 +74,12 @@ impl TrackLabel {
         // Use one label, replacing its text only while transparent. Two
         // reusable Stack pages can still contain a much older title when
         // several metadata updates arrive during the same crossfade.
-        let revision = self.generation.clone();
         let text = text.to_owned();
         let start_opacity = self.label.opacity();
         let fade_out_ms = 90.0 * start_opacity;
         let start = Cell::new(None::<i64>);
         let replaced = Cell::new(false);
-        self.label.add_tick_callback(move |label, clock| {
-            if !revision.is_current(generation) {
-                return glib::ControlFlow::Break;
-            }
+        self.animation.start(&self.label, move |label, clock| {
             let now = clock.frame_time();
             let started = start.get().unwrap_or_else(|| {
                 start.set(Some(now));
@@ -264,8 +260,16 @@ impl PlayerUi {
         self.revealer.set_reveal_child(false);
     }
 
-    pub(super) fn render(&self, view: &PlayerView, sources: &[PlayerSourceView]) {
-        self.source_menu.render(view, sources);
+    pub(super) fn wants_source_views(&self) -> bool {
+        self.source_menu.popup.is_visible()
+    }
+
+    pub(super) fn render(&self, view: &PlayerView, sources: Option<&[PlayerSourceView]>) {
+        if self.wants_source_views()
+            && let Some(sources) = sources
+        {
+            self.source_menu.render(view, sources);
+        }
         if self.rendered.borrow().as_ref() == Some(view) {
             return;
         }
@@ -420,6 +424,19 @@ impl PlayerSourceMenu {
     }
 
     fn open(self: &Rc<Self>) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let (view, sources) = {
+            let state = state.borrow();
+            let Some(view) = state.current_view() else {
+                return;
+            };
+            (view, state.source_views())
+        };
+        // Hidden source lists do no metadata formatting or widget updates.
+        // Refresh before measuring so opening always uses the current data.
+        self.render(&view, &sources);
         if let Some(bar) = self.bar_window.upgrade()
             && let Some(bounds) = self.trigger.compute_bounds(&bar)
         {
@@ -851,15 +868,33 @@ mod tests {
         ui.source_menu
             .popup
             .set_layer(gtk4_layer_shell::Layer::Overlay);
+        // These checks synthesize button actions, not compositor focus changes.
+        // Keep activity in other desktop windows from dismissing the fixture.
+        window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+        ui.source_menu
+            .popup
+            .set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
         connect_actions(&controller.state, &ui);
         controller.state.borrow_mut().attach_view(&ui);
+        assert!(
+            ui.source_menu.rows.borrow().is_empty(),
+            "hidden source menus must be built lazily"
+        );
         window.set_child(Some(&ui.root));
         window.present();
         pump(300);
         ui.source.emit_clicked();
         pump(350);
         assert!(ui.source_menu.popup.is_visible());
-        assert!(ui.source_menu.reveal.0.child.opacity() > 0.99);
+        assert!(
+            ui.source_menu
+                .reveal
+                .widget()
+                .first_child()
+                .unwrap()
+                .opacity()
+                > 0.99
+        );
         assert!(ui.source_menu.popup.height() < 500);
         capture_if_requested(&ui.source_menu.popup, "player-sources");
         let update_title = |index: usize, title: &str| {
@@ -991,6 +1026,19 @@ mod tests {
         pump(300);
         assert!(!controller.state.borrow().pinned);
         assert_eq!(ui.play_pause_icon.label(), ICON_PAUSE);
+        update_title(2, "Source updated while menu is hidden");
+        assert_ne!(
+            ui.source_menu.rows.borrow()[2].metadata.widget().label(),
+            "Source updated while menu is hidden"
+        );
+        ui.source.emit_clicked();
+        pump(300);
+        assert_eq!(
+            ui.source_menu.rows.borrow()[2].metadata.widget().label(),
+            "Source updated while menu is hidden"
+        );
+        ui.source_menu.close();
+        pump(300);
         controller
             .state
             .borrow_mut()
@@ -1000,7 +1048,12 @@ mod tests {
             .borrow_mut()
             .owner_changed("source-7", false);
         assert!(!controller.state.borrow().pinned);
+        assert_eq!(ui.source_menu.rows.borrow().len(), 8);
+        ui.source.emit_clicked();
+        pump(100);
         assert_eq!(ui.source_menu.rows.borrow().len(), 7);
+        ui.source_menu.close();
+        pump(300);
         assert_eq!(ui.play_pause_icon.label(), ICON_PAUSE);
         let controllers = ui.source.observe_controllers();
         let secondary = (0..controllers.n_items())

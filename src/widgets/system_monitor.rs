@@ -17,10 +17,17 @@ use tracing::{info, warn};
 use super::run_background;
 
 mod batteries;
+#[cfg(test)]
+use batteries::{battery_capacity, read_battery_snapshot_at};
+mod cpu;
+mod files;
+#[cfg(test)]
+use cpu::{cpu_usage, parse_cpu_times};
 mod drawer;
 mod gpu;
 mod nvidia;
 
+mod memory;
 mod metrics;
 use metrics::*;
 mod settings_ui;
@@ -28,6 +35,14 @@ pub(crate) use drawer::monitor_output_id;
 mod view;
 #[cfg(test)]
 use view::{MonitorRuntime, monitor_input_region};
+mod network;
+#[cfg(test)]
+use network::{NetworkCounters, network_rates, parse_default_interfaces, parse_network_counters};
+mod sensors;
+use sensors::*;
+mod storage;
+#[cfg(test)]
+use storage::{compact_storage_model, disk_mounts, storage_display_name};
 mod sampler;
 use sampler::*;
 pub use view::SystemMonitorView;
@@ -344,6 +359,9 @@ impl MonitorSettings {
     }
 
     fn metric_visible(&self, section: MonitorSection, id: &str) -> bool {
+        if self.hidden_metrics.is_empty() {
+            return true;
+        }
         let legacy_storage_bar_hidden = section == MonitorSection::Storage
             && id.ends_with(":usage-meter")
             && self.hidden_metrics.contains("storage:usage-meter");
@@ -357,11 +375,14 @@ impl MonitorSettings {
                 .contains(&format!("{}:{id}", section.id()))
     }
 
-    fn metric_name(&self, section: MonitorSection, id: &str, default: &str) -> String {
+    fn metric_name<'a>(&'a self, section: MonitorSection, id: &str, default: &'a str) -> &'a str {
+        if self.metric_names.is_empty() {
+            return default;
+        }
         self.metric_names
             .get(&format!("{}:{id}", section.id()))
-            .cloned()
-            .unwrap_or_else(|| default.to_owned())
+            .map(String::as_str)
+            .unwrap_or(default)
     }
 
     fn wants(&self, section: MonitorSection, id: &str) -> bool {
@@ -472,6 +493,7 @@ struct DiskSnapshot {
 #[derive(Clone, Debug, Default)]
 struct SystemSnapshot {
     ready: bool,
+    cpu_name: Option<Arc<str>>,
     cpu_percent: Option<f64>,
     cpu_frequency_mhz: Option<f64>,
     load_average: Option<f64>,
@@ -499,13 +521,13 @@ struct SystemSnapshot {
     device_batteries: Vec<batteries::DeviceBattery>,
 }
 
-type SnapshotSubscriber = Box<dyn Fn(&SystemSnapshot) -> bool>;
+type SnapshotSubscriber = Box<dyn Fn(&Arc<SystemSnapshot>) -> bool>;
 type SettingsSubscriber = Box<dyn Fn(&MonitorSettings) -> bool>;
 type StateSubscriber = Box<dyn Fn(bool) -> bool>;
 
 pub struct SystemMonitorController {
     settings: RefCell<MonitorSettings>,
-    latest: RefCell<SystemSnapshot>,
+    latest: RefCell<Arc<SystemSnapshot>>,
     sampler: Arc<Mutex<SystemSampler>>,
     gpu_sampling_enabled: Arc<AtomicBool>,
     snapshot_subscribers: RefCell<Vec<SnapshotSubscriber>>,
@@ -526,7 +548,7 @@ impl SystemMonitorController {
         let gpu_sampling_enabled = Arc::new(AtomicBool::new(settings.enabled));
         Rc::new(Self {
             settings: RefCell::new(settings),
-            latest: RefCell::new(SystemSnapshot::default()),
+            latest: RefCell::new(Arc::default()),
             sampler: Arc::new(Mutex::new(SystemSampler {
                 gpu_sampling_enabled: Arc::clone(&gpu_sampling_enabled),
                 ..SystemSampler::default()
@@ -673,7 +695,7 @@ impl SystemMonitorController {
                         "system monitor received its first hardware snapshot"
                     );
                 }
-                controller.latest.replace(snapshot.clone());
+                controller.latest.replace(Arc::clone(&snapshot));
                 controller
                     .snapshot_subscribers
                     .borrow_mut()
@@ -685,7 +707,7 @@ impl SystemMonitorController {
         );
     }
 
-    fn subscribe_snapshot(&self, subscriber: impl Fn(&SystemSnapshot) -> bool + 'static) {
+    fn subscribe_snapshot(&self, subscriber: impl Fn(&Arc<SystemSnapshot>) -> bool + 'static) {
         if subscriber(&self.latest.borrow()) {
             self.snapshot_subscribers
                 .borrow_mut()
@@ -717,8 +739,8 @@ impl SystemMonitorController {
         self.settings.borrow().clone()
     }
 
-    fn latest(&self) -> SystemSnapshot {
-        self.latest.borrow().clone()
+    fn latest(&self) -> Arc<SystemSnapshot> {
+        Arc::clone(&self.latest.borrow())
     }
 
     fn update_settings(self: &Rc<Self>, update: impl FnOnce(&mut MonitorSettings)) -> bool {

@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 pub(crate) use super::bluetooth_backend::BluetoothAgent;
 use super::tooltip::BarTooltipExt;
 use super::{
-    BAR_POPUP_WIDTH, Generation, PopupReveal, RefreshGate, attach_popup_escape_handler,
+    BAR_POPUP_WIDTH, Generation, PopupReveal, RefreshGate, Timer, attach_popup_escape_handler,
     attach_popup_lifecycle,
     bluetooth_backend::{
         AgentEvent, AgentPromptKind, BluetoothBackend, BluetoothDevice, BluetoothSnapshot,
@@ -20,6 +20,9 @@ use super::{
     detach_application_window, empty_state_label, reset_hidden_popup_state, run_background,
     run_when_popup_visible, set_optional_label, set_spinner_active,
 };
+
+mod device_row;
+use device_row::DeviceRows;
 
 const DEVICE_LIST_MIN_HEIGHT: i32 = 120;
 const DEVICE_LIST_MAX_HEIGHT: i32 = 220;
@@ -100,6 +103,7 @@ struct BluetoothController {
     pairing_cancel_button: gtk::Button,
     pairing_confirm_button: gtk::Button,
     list: gtk::Box,
+    device_rows: DeviceRows,
     notice: gtk::Label,
 
     backend: BluetoothBackend,
@@ -126,7 +130,8 @@ struct BluetoothController {
     signal_subscription_retry_attempt: Cell<u32>,
     signal_subscriptions: RefCell<Vec<gio::SignalSubscription>>,
     discovery_timeout_generation: Generation,
-    notice_generation: Generation,
+    discovery_timer: Timer,
+    notice_timer: Timer,
 }
 
 pub struct BluetoothIndicator {
@@ -330,6 +335,7 @@ impl BluetoothIndicator {
             pairing_cancel_button,
             pairing_confirm_button,
             list,
+            device_rows: DeviceRows::default(),
             notice,
             backend: BluetoothBackend,
             agent: agent.clone(),
@@ -354,7 +360,8 @@ impl BluetoothIndicator {
             signal_subscription_retry_attempt: Cell::new(0),
             signal_subscriptions: RefCell::new(Vec::new()),
             discovery_timeout_generation: Generation::default(),
-            notice_generation: Generation::default(),
+            discovery_timer: Timer::default(),
+            notice_timer: Timer::default(),
         });
 
         BluetoothController::connect(&controller, bar_window);
@@ -709,21 +716,23 @@ impl BluetoothController {
     fn sync_device_list(self: &Rc<Self>) {
         self.list_initialized.set(true);
         self.list_dirty.set(false);
-        self.clear_device_list();
 
         let snapshot = self.snapshot.borrow();
         let Some(adapter) = snapshot.adapter.as_ref() else {
+            self.clear_device_list();
             self.show_empty("Bluetooth unavailable");
             return;
         };
 
         let display_powered = self.pending_power.get().unwrap_or(adapter.powered);
         if !display_powered {
+            self.clear_device_list();
             self.build_off_state();
             return;
         }
 
         if snapshot.devices.is_empty() {
+            self.clear_device_list();
             let display_scanning = self.pending_scan.get().unwrap_or(adapter.discovering);
             let text = if display_scanning {
                 "Scanning devices…"
@@ -734,12 +743,17 @@ impl BluetoothController {
             return;
         }
 
-        for device in &snapshot.devices {
-            self.list.append(&self.build_device_row(device));
-        }
+        self.device_rows.sync(
+            &self.list,
+            &snapshot.devices,
+            self.pending_device.borrow().as_ref(),
+            self.action_busy.get(),
+            Rc::downgrade(self),
+        );
     }
 
     fn clear_device_list(&self) {
+        self.device_rows.clear();
         clear_box(&self.list);
     }
 
@@ -776,115 +790,6 @@ impl BluetoothController {
         row.append(&icon);
         row.append(&text);
         self.list.append(&row);
-    }
-
-    fn build_device_row(self: &Rc<Self>, device: &BluetoothDevice) -> gtk::Box {
-        let pending_state = self.pending_device.borrow();
-        let pending = pending_state
-            .as_ref()
-            .filter(|pending| pending.path == device.path);
-        let busy = self.action_busy.get();
-
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        row.add_css_class("network-row-container");
-        row.set_valign(gtk::Align::Center);
-
-        let icon = gtk::Label::new(Some(device_glyph(&device.icon, &device.name)));
-        icon.add_css_class("network-row-icon");
-        icon.set_valign(gtk::Align::Center);
-        row.append(&icon);
-
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        content.set_hexpand(true);
-        content.set_valign(gtk::Align::Center);
-
-        let title = gtk::Label::new(Some(&device.name));
-        title.add_css_class("network-row-title");
-        title.set_xalign(0.0);
-        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        title.set_max_width_chars(26);
-
-        let meta = gtk::Label::new(Some(&device_meta(device, pending)));
-        meta.add_css_class("network-row-meta");
-        meta.set_xalign(0.0);
-
-        content.append(&title);
-        content.append(&meta);
-        row.append(&content);
-
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        actions.set_valign(gtk::Align::Center);
-
-        let show_pair_button = !device.connected && !device.paired;
-        if show_pair_button {
-            let pair_label = gtk::Label::new(Some(
-                if pending.is_some_and(|pending| pending.action == PendingDeviceAction::Pairing) {
-                    "Pairing…"
-                } else {
-                    "Pair"
-                },
-            ));
-            pair_label.add_css_class("bluetooth-pair-button-label");
-
-            let pair_button = gtk::Button::new();
-            pair_button.add_css_class("network-row-button");
-            pair_button.add_css_class("bluetooth-pair-button");
-            pair_button.set_focusable(false);
-            pair_button.set_sensitive(!busy);
-            pair_button.set_child(Some(&pair_label));
-
-            let weak = Rc::downgrade(self);
-            let device_path = device.path.clone();
-            pair_button.connect_clicked(move |_| {
-                if let Some(this) = weak.upgrade() {
-                    this.set_device_connected(&device_path, true);
-                }
-            });
-            actions.append(&pair_button);
-        } else {
-            let device_switch = gtk::Switch::new();
-            device_switch.add_css_class("network-wifi-switch");
-            device_switch.set_valign(gtk::Align::Center);
-            device_switch.set_halign(gtk::Align::End);
-            device_switch.set_sensitive(!busy);
-            device_switch.set_active(pending.map_or(device.connected, |pending| {
-                pending.action.target_connected(device.connected)
-            }));
-
-            let weak = Rc::downgrade(self);
-            let device_path = device.path.clone();
-            device_switch.connect_active_notify(move |switch| {
-                let Some(this) = weak.upgrade() else {
-                    return;
-                };
-                if this.action_busy.get() {
-                    return;
-                }
-                let target = switch.is_active();
-                this.set_device_connected(&device_path, target);
-            });
-            actions.append(&device_switch);
-        }
-
-        let remove_icon = gtk::Label::new(Some(ICON_REMOVE));
-        remove_icon.add_css_class("network-action-icon");
-        let remove_button = gtk::Button::new();
-        remove_button.add_css_class("network-icon-button");
-        remove_button.set_valign(gtk::Align::Center);
-        remove_button.set_sensitive(!busy);
-        remove_button.set_child(Some(&remove_icon));
-
-        let weak = Rc::downgrade(self);
-        let device_path = device.path.clone();
-        remove_button.connect_clicked(move |_| {
-            if let Some(this) = weak.upgrade() {
-                this.remove_device(&device_path);
-            }
-        });
-        actions.append(&remove_button);
-
-        row.append(&actions);
-        row
     }
 
     fn handle_agent_event(self: &Rc<Self>, event: AgentEvent) {
@@ -1145,7 +1050,7 @@ impl BluetoothController {
         self.snapshot_generation.bump();
         self.pending_power.set(Some(powered));
         if !powered {
-            self.discovery_timeout_generation.bump();
+            self.cancel_discovery_timeout();
             self.pending_scan.set(Some(false));
         }
         self.update_header();
@@ -1200,7 +1105,7 @@ impl BluetoothController {
         self.snapshot_generation.bump();
         self.pending_scan.set(Some(scanning));
         if !scanning {
-            self.discovery_timeout_generation.bump();
+            self.cancel_discovery_timeout();
         }
         self.update_header();
         self.refresh_device_list();
@@ -1295,7 +1200,7 @@ impl BluetoothController {
         self.action_busy.set(true);
         self.snapshot_generation.bump();
         if connected {
-            self.discovery_timeout_generation.bump();
+            self.cancel_discovery_timeout();
             self.pending_scan.set(Some(false));
         }
         self.pending_device.replace(Some(PendingDevice {
@@ -1409,11 +1314,16 @@ impl BluetoothController {
     fn schedule_discovery_timeout(self: &Rc<Self>) {
         let token = self.discovery_timeout_generation.bump();
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(DISCOVERY_TIMEOUT, move || {
+        self.discovery_timer.schedule(DISCOVERY_TIMEOUT, move || {
             if let Some(this) = weak.upgrade() {
                 this.stop_discovery_when_idle(token);
             }
         });
+    }
+
+    fn cancel_discovery_timeout(&self) {
+        self.discovery_timeout_generation.bump();
+        self.discovery_timer.cancel();
     }
 
     fn stop_discovery_when_idle(self: &Rc<Self>, token: u64) {
@@ -1424,11 +1334,12 @@ impl BluetoothController {
             // set_scanning rejects concurrent actions. Keep the timeout alive
             // while a device operation finishes, instead of losing the stop.
             let weak = Rc::downgrade(self);
-            glib::timeout_add_local_once(DISCOVERY_STOP_RETRY_DELAY, move || {
-                if let Some(this) = weak.upgrade() {
-                    this.stop_discovery_when_idle(token);
-                }
-            });
+            self.discovery_timer
+                .schedule(DISCOVERY_STOP_RETRY_DELAY, move || {
+                    if let Some(this) = weak.upgrade() {
+                        this.stop_discovery_when_idle(token);
+                    }
+                });
         } else {
             self.set_scanning(false);
         }
@@ -1439,19 +1350,17 @@ impl BluetoothController {
     }
 
     fn set_notice(self: &Rc<Self>, text: Option<&str>) {
-        let generation = self.notice_generation.bump();
+        self.notice_timer.cancel();
         match text {
             Some(text) if !text.trim().is_empty() => {
                 set_optional_label(&self.notice, Some(text));
 
                 let weak = Rc::downgrade(self);
-                glib::timeout_add_local_once(NOTICE_TIMEOUT, move || {
+                self.notice_timer.schedule(NOTICE_TIMEOUT, move || {
                     let Some(this) = weak.upgrade() else {
                         return;
                     };
-                    if this.notice_generation.is_current(generation) {
-                        set_optional_label(&this.notice, None);
-                    }
+                    set_optional_label(&this.notice, None);
                 });
             }
             _ => {

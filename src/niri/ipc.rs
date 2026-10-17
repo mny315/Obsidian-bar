@@ -14,9 +14,10 @@ use std::{
 
 use crate::unix_socket::connect as connect_socket;
 
+use super::updates::changed_windows;
+pub use super::updates::{Update, UpdateBatch, WindowSnapshot};
 use niri_ipc::{
-    Action, Event, LayoutSwitchTarget, Reply, Request, Response, Window, Workspace,
-    WorkspaceReferenceArg,
+    Action, Event, LayoutSwitchTarget, Reply, Request, Response, Workspace, WorkspaceReferenceArg,
     socket::SOCKET_PATH_ENV,
     state::{EventStreamStatePart, KeyboardLayoutsState, WindowsState, WorkspacesState},
 };
@@ -47,14 +48,6 @@ const KNOWN_LAYOUTS: &[(&[&str], &str)] = &[
     (&["turkish", "tr"], "TR"),
     (&["dutch", "nederlands", "nl"], "NL"),
 ];
-
-#[derive(Debug, Clone)]
-pub enum Update {
-    Disconnected,
-    KeyboardLayout(String),
-    Windows(Vec<Window>),
-    Workspaces(Vec<Workspace>),
-}
 
 pub struct EventListener {
     stop: Arc<AtomicBool>,
@@ -194,6 +187,7 @@ fn read_event_stream(
 
     let mut keyboard_state = KeyboardLayoutsState::default();
     let mut windows_state = WindowsState::default();
+    let mut previous_windows = None;
     let mut workspaces_state = WorkspacesState::default();
 
     loop {
@@ -212,6 +206,7 @@ fn read_event_stream(
             tracing::warn!("niri switched layout before sending keyboard layout state");
             continue;
         }
+        validate_event(&event, &windows_state, &workspaces_state)?;
 
         let (workspaces_changed, event) = match workspaces_state.apply(event) {
             Some(event) => (false, Some(event)),
@@ -245,12 +240,45 @@ fn read_event_stream(
             }
         }
 
-        if windows_changed {
-            let windows = sorted_windows(&windows_state);
-            if sender.send_blocking(Update::Windows(windows)).is_err() {
-                return Ok(());
-            }
+        if windows_changed
+            && let Some(windows) = changed_windows(&windows_state, &mut previous_windows)
+            && sender.send_blocking(Update::Windows(windows)).is_err()
+        {
+            return Ok(());
         }
+    }
+}
+
+fn validate_event(
+    event: &Event,
+    windows: &WindowsState,
+    workspaces: &WorkspacesState,
+) -> io::Result<()> {
+    // The upstream state helpers panic for a missing object. An inconsistent
+    // stream should enter the reconnect path, not permanently kill the listener.
+    let missing = match event {
+        Event::WorkspaceActivated { id, .. } => {
+            (!workspaces.workspaces.contains_key(id)).then_some(("workspace", *id))
+        }
+        Event::WorkspaceActiveWindowChanged { workspace_id, .. } => {
+            (!workspaces.workspaces.contains_key(workspace_id))
+                .then_some(("workspace", *workspace_id))
+        }
+        Event::WindowClosed { id } => {
+            (!windows.windows.contains_key(id)).then_some(("window", *id))
+        }
+        Event::WindowLayoutsChanged { changes } => changes
+            .iter()
+            .find(|(id, _)| !windows.windows.contains_key(id))
+            .map(|(id, _)| ("window", *id)),
+        _ => None,
+    };
+    match missing {
+        Some((kind, id)) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("niri event referenced missing {kind} {id}"),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -303,12 +331,6 @@ fn read_line(stream: &mut BufReader<UnixStream>, line: &mut String) -> io::Resul
         Ok(_) => Ok(true),
         Err(error) => Err(error),
     }
-}
-
-fn sorted_windows(state: &WindowsState) -> Vec<Window> {
-    let mut windows = state.windows.values().cloned().collect::<Vec<_>>();
-    windows.sort_by_key(|window| window.id);
-    windows
 }
 
 fn sorted_workspaces(state: &WorkspacesState) -> Vec<Workspace> {
@@ -372,6 +394,61 @@ fn compact_layout_name(name: &str) -> String {
 mod tests {
     use super::*;
     use niri_ipc::KeyboardLayouts;
+
+    #[test]
+    fn inconsistent_events_reconnect_but_cross_snapshot_window_references_are_allowed() {
+        let windows = WindowsState::default();
+        let mut workspaces = WorkspacesState::default();
+        for event in [
+            Event::WindowClosed { id: 9 },
+            Event::WorkspaceActivated {
+                id: 2,
+                focused: true,
+            },
+            Event::WorkspaceActiveWindowChanged {
+                workspace_id: 2,
+                active_window_id: Some(9),
+            },
+        ] {
+            assert_eq!(
+                validate_event(&event, &windows, &workspaces)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        workspaces.workspaces.insert(
+            2,
+            Workspace {
+                id: 2,
+                idx: 1,
+                name: None,
+                output: Some("DP-1".into()),
+                is_urgent: false,
+                is_active: true,
+                is_focused: true,
+                active_window_id: None,
+            },
+        );
+        // Niri legitimately reports a workspace's active window before the
+        // corresponding WindowOpenedOrChanged event arrives.
+        let event = Event::WorkspaceActiveWindowChanged {
+            workspace_id: 2,
+            active_window_id: Some(9),
+        };
+        validate_event(&event, &windows, &workspaces).unwrap();
+        assert!(workspaces.apply(event).is_none());
+        assert_eq!(workspaces.workspaces[&2].active_window_id, Some(9));
+        validate_event(
+            &Event::WorkspaceActivated {
+                id: 2,
+                focused: true,
+            },
+            &windows,
+            &workspaces,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn an_unresponsive_compositor_does_not_hold_a_worker_forever() {

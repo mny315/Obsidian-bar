@@ -1,6 +1,9 @@
+use super::files::{read_trimmed, sorted_directory_paths};
 use super::*;
 
+mod discovery;
 mod intel;
+use discovery::{DeviceIdentity, PciGpuDiscovery, device_identity};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum DataState {
@@ -86,8 +89,9 @@ pub(super) fn legacy_metric_id(section: MonitorSection, id: &str) -> Option<&'st
 
 #[derive(Default)]
 pub(super) struct GpuSampler {
-    previous: HashMap<String, GpuDevice>,
+    names: HashMap<String, (Option<DeviceIdentity>, String)>,
     intel: intel::IntelSampler,
+    pci: PciGpuDiscovery,
 }
 
 impl GpuSampler {
@@ -97,7 +101,9 @@ impl GpuSampler {
         visible: bool,
         enabled: &AtomicBool,
     ) -> Vec<GpuDevice> {
+        self.intel.begin_sample();
         let mut devices = Vec::new();
+        let mut names = HashMap::new();
         let mut seen = HashSet::new();
         let mut paths = sorted_directory_paths(Path::new("/sys/class/drm"))
             .into_iter()
@@ -118,9 +124,9 @@ impl GpuSampler {
         // Unbound devices have no DRM card. Enumerating PCI metadata lets us
         // explain a missing driver without opening or waking the GPU.
         paths.extend(
-            sorted_directory_paths(Path::new("/sys/bus/pci/devices"))
+            self.pci
+                .paths(Path::new("/sys/bus/pci/devices"))
                 .into_iter()
-                .filter(|device| is_gpu_device(device))
                 .map(|device| (device.clone(), device)),
         );
         for (card, device) in paths {
@@ -137,10 +143,12 @@ impl GpuSampler {
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
             });
+            let identity = device_identity(&device);
             let name = self
-                .previous
+                .names
                 .get(&id)
-                .map(|gpu| gpu.name.clone())
+                .filter(|(cached_identity, _)| identity.is_some() && *cached_identity == identity)
+                .map(|(_, name)| name.clone())
                 .unwrap_or_else(|| device_name(&device, &id, &vendor));
             let request = GpuRequest::new(settings, &id);
             let state = if driver.is_none() {
@@ -171,6 +179,7 @@ impl GpuSampler {
             };
             data.client_memory = matches!(driver.as_deref(), Some("i915" | "xe"));
             let name = data.name.clone().unwrap_or(name);
+            names.insert(id.clone(), (identity, name.clone()));
             devices.push(GpuDevice {
                 id,
                 name,
@@ -178,11 +187,7 @@ impl GpuSampler {
                 data,
             });
         }
-        self.previous = devices
-            .iter()
-            .cloned()
-            .map(|device| (device.id.clone(), device))
-            .collect();
+        self.names = names;
         devices
     }
 }
@@ -345,7 +350,11 @@ fn read_hwmon(device: &Path, request: GpuRequest, data: &mut GpuSnapshot) {
     }
 }
 
-pub(super) fn display(section: MonitorSection, devices: &[GpuDevice]) -> Vec<DisplayMetric> {
+pub(super) fn display(
+    section: MonitorSection,
+    devices: &[GpuDevice],
+    values: bool,
+) -> Vec<DisplayMetric> {
     let mut rows = Vec::new();
     for device in devices {
         let data = &device.data;
@@ -358,7 +367,9 @@ pub(super) fn display(section: MonitorSection, devices: &[GpuDevice]) -> Vec<Dis
                     } else {
                         "GPU Load"
                     },
-                    data.utilization_percent.map(format_percent),
+                    data.utilization_percent
+                        .filter(|_| values)
+                        .map(format_percent),
                 ),
                 (
                     "memory-used",
@@ -367,29 +378,34 @@ pub(super) fn display(section: MonitorSection, devices: &[GpuDevice]) -> Vec<Dis
                     } else {
                         "GPU Memory Used"
                     },
-                    data.memory_used.map(format_bytes),
+                    data.memory_used.filter(|_| values).map(format_bytes),
                 ),
                 (
                     "memory-total",
                     "GPU Memory Total",
-                    data.memory_total.map(format_bytes),
+                    data.memory_total.filter(|_| values).map(format_bytes),
                 ),
                 (
                     "frequency",
                     "GPU Frequency",
-                    data.frequency_mhz.map(|value| format!("{value:.0} MHz")),
+                    data.frequency_mhz
+                        .filter(|_| values)
+                        .map(|value| format!("{value:.0} MHz")),
                 ),
             ],
             MonitorSection::Temperatures => vec![(
                 "temperature",
                 "GPU Temperature",
                 data.temperature_celsius
+                    .filter(|_| values)
                     .map(|value| format!("{value:.1} °C")),
             )],
             MonitorSection::Power => vec![(
                 "power",
                 "GPU Power",
-                data.power_watts.map(|value| format!("{value:.1} W")),
+                data.power_watts
+                    .filter(|_| values)
+                    .map(|value| format!("{value:.1} W")),
             )],
             _ => Vec::new(),
         };
@@ -405,21 +421,27 @@ pub(super) fn display(section: MonitorSection, devices: &[GpuDevice]) -> Vec<Dis
             let mut metric = DisplayMetric::new(
                 metric_id(&device.id, key),
                 label,
-                value.unwrap_or_else(|| state.label().to_owned()),
-            );
-            metric.group = Some(MetricGroup {
-                id: device.id.clone(),
-                label: if devices
-                    .iter()
-                    .filter(|other| other.name == device.name)
-                    .count()
-                    > 1
-                {
-                    format!("{} · {}", device.name, device.id)
+                if values {
+                    value.unwrap_or_else(|| state.label().to_owned())
                 } else {
-                    device.name.clone()
+                    String::new()
                 },
-            });
+            );
+            if section != MonitorSection::Temperatures {
+                metric.group = Some(MetricGroup {
+                    id: device.id.clone(),
+                    label: if devices
+                        .iter()
+                        .filter(|other| other.name == device.name)
+                        .count()
+                        > 1
+                    {
+                        format!("{} · {}", device.name, device.id)
+                    } else {
+                        device.name.clone()
+                    },
+                });
+            }
             rows.push(metric);
         }
     }
@@ -449,7 +471,7 @@ mod tests {
                 data: GpuSnapshot::default(),
             },
         ];
-        let rows = display(MonitorSection::Gpu, &devices);
+        let rows = display(MonitorSection::Gpu, &devices, true);
         assert_eq!(rows.len(), 8);
         assert_eq!(rows[0].value, format_percent(25.0));
         assert_eq!(rows[4].value, "Sleeping");

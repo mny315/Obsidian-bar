@@ -20,7 +20,7 @@ use pw::{
 use tracing::{debug, warn};
 
 use super::{
-    Generation, PopupReveal, RefreshGate,
+    FrameCallback, PopupReveal, RefreshGate, Timer,
     audio_backend::{AudioBackend, VolumeState, default_audio_backend, invalidate_audio_caches},
     audio_visual::{ICON_HIGH, volume_icon},
     detach_application_window, make_window_click_through, run_background,
@@ -60,8 +60,8 @@ struct OsdState {
     refresh: RefreshGate,
     last_volume: Cell<Option<VolumeKey>>,
     suppress_until: Cell<Option<Instant>>,
-    hide_generation: Generation,
-    value_generation: Generation,
+    hide_timer: Timer,
+    value_animation: FrameCallback,
     event_refresh_pending: Cell<bool>,
     event_monitor: RefCell<Option<AudioEventMonitor>>,
     event_monitor_retry_pending: Cell<bool>,
@@ -75,6 +75,13 @@ pub struct OsdController(Rc<OsdState>);
 
 impl OsdController {
     pub fn new(application: &gtk::Application, monitor: &gdk::Monitor) -> Self {
+        let controller = Self::build(application, monitor);
+        controller.start_event_monitor();
+        controller.refresh_volume(false);
+        controller
+    }
+
+    fn build(application: &gtk::Application, monitor: &gdk::Monitor) -> Self {
         let window = gtk::ApplicationWindow::builder()
             .application(application)
             .decorated(false)
@@ -157,8 +164,8 @@ impl OsdController {
             refresh: RefreshGate::default(),
             last_volume: Cell::new(None),
             suppress_until: Cell::new(None),
-            hide_generation: Generation::default(),
-            value_generation: Generation::default(),
+            hide_timer: Timer::default(),
+            value_animation: FrameCallback::default(),
             event_refresh_pending: Cell::new(false),
             event_monitor: RefCell::new(None),
             event_monitor_retry_pending: Cell::new(false),
@@ -166,10 +173,7 @@ impl OsdController {
             audio_change_subscribers: RefCell::new(Vec::new()),
             running: Cell::new(true),
         });
-        let controller = Self(state);
-        controller.start_event_monitor();
-        controller.refresh_volume(false);
-        controller
+        Self(state)
     }
 
     pub fn set_monitor(&self, monitor: &gdk::Monitor) {
@@ -194,8 +198,8 @@ impl OsdController {
             return;
         }
 
-        self.0.hide_generation.bump();
-        self.0.value_generation.bump();
+        self.0.hide_timer.cancel();
+        self.0.value_animation.cancel();
         self.0.event_refresh_pending.set(false);
         drop(self.0.event_monitor.borrow_mut().take());
         self.0.reveal.reset_hidden();
@@ -369,20 +373,19 @@ impl OsdController {
         self.animate_value(volume.volume);
 
         self.0.reveal.show(&self.0.window);
-        let generation = self.0.hide_generation.bump();
         let weak = Rc::downgrade(&self.0);
-        glib::timeout_add_local_once(AUTO_HIDE_DELAY, move || {
+        self.0.hide_timer.schedule(AUTO_HIDE_DELAY, move || {
             let Some(state) = weak.upgrade() else {
                 return;
             };
-            if state.running.get() && state.hide_generation.is_current(generation) {
+            if state.running.get() {
                 state.reveal.hide(&state.window);
             }
         });
     }
 
     fn set_static_value(&self, volume: VolumeState) {
-        self.0.value_generation.bump();
+        self.0.value_animation.cancel();
         self.0.slider.set_value(volume.volume);
         self.update_content(volume);
     }
@@ -404,49 +407,38 @@ impl OsdController {
     fn animate_value(&self, target: f64) {
         let target = target.clamp(0.0, 1.0);
         let start = self.0.slider.value();
-        if (start - target).abs() < 0.001 {
-            self.0.value_generation.bump();
+        if (start - target).abs() < 0.001 || !self.0.slider.settings().is_gtk_enable_animations() {
+            self.0.value_animation.cancel();
             self.0.slider.set_value(target);
             return;
         }
 
-        let generation = self.0.value_generation.bump();
-        let weak_state = Rc::downgrade(&self.0);
-        let weak_slider = self.0.slider.downgrade();
         let start_time_us = Cell::new(None::<i64>);
 
-        self.0.slider.add_tick_callback(move |_, frame_clock| {
-            let Some(state) = weak_state.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            if !state.running.get() || !state.value_generation.is_current(generation) {
-                return glib::ControlFlow::Break;
-            }
+        self.0
+            .value_animation
+            .start(&self.0.slider, move |slider, frame_clock| {
+                let now_us = frame_clock.frame_time();
+                let started_us = match start_time_us.get() {
+                    Some(value) => value,
+                    None => {
+                        start_time_us.set(Some(now_us));
+                        now_us
+                    }
+                };
+                let elapsed_ms = (now_us - started_us).max(0) as f64 / 1_000.0;
+                let progress = (elapsed_ms / VALUE_ANIMATION_MS).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - progress).powi(3);
 
-            let now_us = frame_clock.frame_time();
-            let started_us = match start_time_us.get() {
-                Some(value) => value,
-                None => {
-                    start_time_us.set(Some(now_us));
-                    now_us
+                slider.set_value(start + (target - start) * eased);
+
+                if progress < 1.0 {
+                    glib::ControlFlow::Continue
+                } else {
+                    slider.set_value(target);
+                    glib::ControlFlow::Break
                 }
-            };
-            let elapsed_ms = (now_us - started_us).max(0) as f64 / 1_000.0;
-            let progress = (elapsed_ms / VALUE_ANIMATION_MS).clamp(0.0, 1.0);
-            let eased = 1.0 - (1.0 - progress).powi(3);
-
-            let Some(slider) = weak_slider.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            slider.set_value(start + (target - start) * eased);
-
-            if progress < 1.0 {
-                glib::ControlFlow::Continue
-            } else {
-                slider.set_value(target);
-                glib::ControlFlow::Break
-            }
-        });
+            });
     }
 }
 
@@ -654,6 +646,91 @@ fn is_default_sink_key(key: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires GTK Wayland; uses synthetic volume values and never starts audio monitoring"]
+    fn osd_rapid_updates_static_values_and_shutdown_cancel_obsolete_animation() {
+        use crate::widgets::test_support::pump;
+        gtk::init().unwrap();
+        let application = gtk::Application::builder()
+            .application_id("dev.obsidian.OsdAnimationTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(None::<&gio::Cancellable>).unwrap();
+        let display = gdk::Display::default().unwrap();
+        let css = gtk::CssProvider::new();
+        css.load_from_data(include_str!("../../assets/window.css"));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        let monitor = display
+            .monitors()
+            .item(0)
+            .unwrap()
+            .downcast::<gdk::Monitor>()
+            .unwrap();
+        let controller = OsdController::build(&application, &monitor);
+        let settings = controller.0.window.settings();
+        settings.set_gtk_enable_animations(true);
+        for index in 0..200 {
+            controller.present(VolumeState {
+                volume: f64::from(index % 100) / 100.0,
+                muted: false,
+            });
+        }
+        controller.present(VolumeState {
+            volume: 0.73,
+            muted: false,
+        });
+        pump(450);
+        assert!((controller.0.slider.value() - 0.73).abs() < 0.001);
+        assert_eq!(controller.0.percent.label(), "73%");
+        assert_eq!(
+            controller
+                .0
+                .reveal
+                .widget()
+                .first_child()
+                .unwrap()
+                .opacity(),
+            1.0
+        );
+
+        controller.animate_value(0.9);
+        pump(20);
+        controller.set_static_value(VolumeState {
+            volume: 0.2,
+            muted: true,
+        });
+        pump(250);
+        assert!((controller.0.slider.value() - 0.2).abs() < 0.001);
+        assert_eq!(controller.0.title.label(), "Sound muted");
+
+        settings.set_gtk_enable_animations(false);
+        controller.present(VolumeState {
+            volume: 0.81,
+            muted: false,
+        });
+        assert!((controller.0.slider.value() - 0.81).abs() < 0.001);
+        controller.0.reveal.hide(&controller.0.window);
+        assert!(!controller.0.window.is_visible());
+        settings.set_gtk_enable_animations(true);
+        controller.present(VolumeState {
+            volume: 0.5,
+            muted: false,
+        });
+        let weak_state = Rc::downgrade(&controller.0);
+        let weak_window = controller.0.window.downgrade();
+        let weak_slider = controller.0.slider.downgrade();
+        controller.shutdown();
+        drop(controller);
+        pump(150);
+        assert!(weak_state.upgrade().is_none());
+        assert!(weak_window.upgrade().is_none());
+        assert!(weak_slider.upgrade().is_none());
+    }
 
     #[test]
     fn filters_audio_sink_media_classes() {

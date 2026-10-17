@@ -7,10 +7,12 @@ use super::{
     SystemMonitorController, SystemSnapshot,
 };
 use crate::widgets::clear_box;
+use crate::widgets::css_transition::attach_popover_reveal;
 use gtk::{gdk, glib, prelude::*};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 const ICON_UP: &str = "\u{f005d}";
 const ICON_DOWN: &str = "\u{f0045}";
@@ -18,6 +20,7 @@ const ICON_VISIBLE: &str = "\u{f0208}";
 const ICON_HIDDEN: &str = "\u{f0209}";
 const ICON_EXPAND: &str = "\u{f0142}";
 const ICON_COLLAPSE: &str = "\u{f0140}";
+const SOURCE_MENU_OPEN_CLASS: &str = "system-monitor-source-menu-opening";
 
 fn monitor_dimension_slider(
     title: &str,
@@ -94,7 +97,18 @@ fn settings_dropdown() -> gtk::DropDown {
     });
     dropdown.set_factory(Some(&factory));
     dropdown.add_css_class("system-monitor-settings-dropdown");
+    if let Some(popover) = settings_popover(&dropdown) {
+        style_source_menu(&popover);
+    }
     dropdown
+}
+
+fn style_source_menu(popover: &gtk::Popover) {
+    // Apply the shared glass surface to the native popover, including when
+    // the desktop theme would otherwise paint an opaque menu underneath it.
+    popover.add_css_class("system-monitor-source-menu");
+    popover.set_has_arrow(false);
+    attach_popover_reveal(popover, SOURCE_MENU_OPEN_CLASS, Duration::from_millis(250));
 }
 
 fn constrain_metric_name(widget: &impl IsA<gtk::Widget>) {
@@ -664,7 +678,7 @@ impl MonitorSettingsPanel {
                     );
                     let row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
                     row.add_css_class("system-monitor-settings-metric-row");
-                    let name = gtk::EditableLabel::new(&settings.metric_name(
+                    let name = gtk::EditableLabel::new(settings.metric_name(
                         section,
                         &option.id,
                         &option.label,
@@ -750,7 +764,7 @@ impl MonitorSettingsPanel {
             {
                 toggle.set_active(settings.metric_visible(section, &option.id));
                 if !name.is_editing() {
-                    name.set_text(&settings.metric_name(section, &option.id, &option.label));
+                    name.set_text(settings.metric_name(section, &option.id, &option.label));
                 }
             }
         }

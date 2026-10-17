@@ -1,17 +1,18 @@
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 use gio::{glib, prelude::*};
 use glib::variant::{ObjectPath, ToVariant};
 
 use super::dbus::{object_path, variant_value};
+use super::snapshot_cache::SnapshotCache;
+
+mod reader;
+use reader::NetworkReader;
 
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
@@ -42,10 +43,9 @@ const NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192: u32 = 0x0000_2000;
 const ROOT_OBJECT_PATH: &str = "/";
 const DBUS_TIMEOUT_MS: i32 = 5_000;
 const NETWORK_CACHE_TTL: Duration = Duration::from_millis(500);
-static NETWORK_SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 static NETWORK_WRITE_LOCK: Mutex<()> = Mutex::new(());
-static NETWORK_SNAPSHOT_CACHE: OnceLock<Mutex<Option<(Instant, WifiSnapshot)>>> = OnceLock::new();
-static NETWORK_SNAPSHOT_REVISION: AtomicU64 = AtomicU64::new(0);
+static NETWORK_SNAPSHOT_CACHE: SnapshotCache<Arc<WifiSnapshot>> =
+    SnapshotCache::new(NETWORK_CACHE_TTL);
 static SAVED_WIFI_CACHE: OnceLock<Arc<Mutex<SavedWifiCache>>> = OnceLock::new();
 const WRITE_CALL_FLAGS: gio::DBusCallFlags = gio::DBusCallFlags::ALLOW_INTERACTIVE_AUTHORIZATION;
 
@@ -148,26 +148,8 @@ impl Default for NetworkBackend {
 }
 
 impl NetworkBackend {
-    pub fn snapshot(&self) -> Result<WifiSnapshot, String> {
-        if let Some(snapshot) = cached_network_snapshot() {
-            return Ok(snapshot);
-        }
-        let _snapshot_guard = NETWORK_SNAPSHOT_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(snapshot) = cached_network_snapshot() {
-            return Ok(snapshot);
-        }
-
-        let revision = NETWORK_SNAPSHOT_REVISION.load(Ordering::Acquire);
-        let snapshot = self.read_snapshot()?;
-        let mut cache = network_snapshot_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if NETWORK_SNAPSHOT_REVISION.load(Ordering::Acquire) == revision {
-            *cache = Some((Instant::now(), snapshot.clone()));
-        }
-        Ok(snapshot)
+    pub fn snapshot(&self) -> Result<Arc<WifiSnapshot>, String> {
+        NETWORK_SNAPSHOT_CACHE.get_or_try_update(|| self.read_snapshot().map(Arc::new))
     }
 
     pub fn invalidate_snapshot_cache(&self) {
@@ -176,6 +158,7 @@ impl NetworkBackend {
 
     fn read_snapshot(&self) -> Result<WifiSnapshot, String> {
         let manager = manager_proxy()?;
+        let reader = NetworkReader::from_proxy(&manager)?;
         let enabled = property::<bool>(&manager, "WirelessEnabled").unwrap_or(false);
 
         let Some(device_path) = find_wifi_device(&manager)? else {
@@ -208,22 +191,34 @@ impl NetworkBackend {
 
         for path in paths {
             let ap_path = path.as_str().to_owned();
-            let access_point = match proxy(&ap_path, NM_ACCESS_POINT_INTERFACE) {
-                Ok(proxy) => proxy,
+            let properties = match reader.properties(&ap_path, NM_ACCESS_POINT_INTERFACE) {
+                Ok(properties) => properties,
                 Err(_) => continue,
             };
 
-            let Some(ssid_bytes) = property::<Vec<u8>>(&access_point, "Ssid") else {
+            let Some(ssid_bytes) = properties.get("Ssid").and_then(variant_value::<Vec<u8>>) else {
                 continue;
             };
             if ssid_bytes.is_empty() {
                 continue;
             }
 
-            let signal = property::<u8>(&access_point, "Strength").unwrap_or(0);
-            let flags = property::<u32>(&access_point, "Flags").unwrap_or(0);
-            let wpa_flags = property::<u32>(&access_point, "WpaFlags").unwrap_or(0);
-            let rsn_flags = property::<u32>(&access_point, "RsnFlags").unwrap_or(0);
+            let signal = properties
+                .get("Strength")
+                .and_then(variant_value::<u8>)
+                .unwrap_or(0);
+            let flags = properties
+                .get("Flags")
+                .and_then(variant_value::<u32>)
+                .unwrap_or(0);
+            let wpa_flags = properties
+                .get("WpaFlags")
+                .and_then(variant_value::<u32>)
+                .unwrap_or(0);
+            let rsn_flags = properties
+                .get("RsnFlags")
+                .and_then(variant_value::<u32>)
+                .unwrap_or(0);
             let security = wifi_security(flags, wpa_flags, rsn_flags);
             let candidate = AccessPointCandidate {
                 signal,
@@ -574,24 +569,8 @@ fn network_write_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
     }
 }
 
-fn network_snapshot_cache() -> &'static Mutex<Option<(Instant, WifiSnapshot)>> {
-    NETWORK_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(None))
-}
-
-fn cached_network_snapshot() -> Option<WifiSnapshot> {
-    network_snapshot_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .filter(|(loaded_at, _)| loaded_at.elapsed() < NETWORK_CACHE_TTL)
-        .map(|(_, snapshot)| snapshot.clone())
-}
-
 fn invalidate_network_snapshot_cache() {
-    NETWORK_SNAPSHOT_REVISION.fetch_add(1, Ordering::AcqRel);
-    *network_snapshot_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    NETWORK_SNAPSHOT_CACHE.invalidate();
 }
 
 fn manager_proxy() -> Result<gio::DBusProxy, String> {
@@ -752,20 +731,16 @@ impl NetworkBackend {
         }
 
         let paths = saved_connection_paths(&settings)?;
+        let reader = NetworkReader::from_proxy(&settings)?;
         let mut saved = HashMap::<Vec<u8>, Vec<String>>::with_capacity(paths.len());
 
         for path in paths {
             let path_string = path.as_str().to_owned();
-            let connection = match proxy(&path_string, NM_SETTINGS_CONNECTION_INTERFACE) {
-                Ok(proxy) => proxy,
-                Err(_) => continue,
-            };
-            let reply = match connection.call_sync(
+            let reply = match reader.call(
+                &path_string,
+                NM_SETTINGS_CONNECTION_INTERFACE,
                 "GetSettings",
                 None,
-                gio::DBusCallFlags::NONE,
-                DBUS_TIMEOUT_MS,
-                None::<&gio::Cancellable>,
             ) {
                 Ok(reply) => reply,
                 Err(_) => continue,

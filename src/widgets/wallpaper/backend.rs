@@ -94,15 +94,20 @@ impl ManagedSubprocess {
 
     pub(super) async fn stop(&self) {
         self.request_stop();
-        let started_at = Instant::now();
-        while self.running.get() && started_at.elapsed() < MANAGED_SUBPROCESS_STOP_TIMEOUT {
-            wait_local(Duration::from_millis(10)).await;
+        if !self.running.get() {
+            return;
         }
-        if self.running.get() {
-            warn!(
+        match glib::future_with_timeout(MANAGED_SUBPROCESS_STOP_TIMEOUT, self.process.wait_future())
+            .await
+        {
+            Ok(Ok(())) => self.running.set(false),
+            Ok(Err(error)) => {
+                warn!(process = self.name, %error, "failed to wait for wallpaper subprocess exit")
+            }
+            Err(_) => warn!(
                 process = self.name,
                 "wallpaper subprocess did not exit before the stop timeout"
-            );
+            ),
         }
     }
 }
@@ -561,11 +566,7 @@ pub(super) async fn wait_awww_transition() {
 }
 
 pub(super) async fn wait_local(duration: Duration) {
-    let (sender, receiver) = async_channel::bounded(1);
-    glib::timeout_add_local_once(duration, move || {
-        let _ = sender.try_send(());
-    });
-    let _ = receiver.recv().await;
+    glib::timeout_future(duration).await;
 }
 
 fn mpvpaper_ipc_socket_path() -> PathBuf {

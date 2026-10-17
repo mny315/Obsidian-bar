@@ -461,45 +461,72 @@ button.system-monitor-settings-expand:focus-visible {
   box-shadow: none;
 }
 
-.system-monitor-settings-dropdown popover,
-.system-monitor-settings-dropdown popover.background,
-.system-monitor-settings-dropdown popover > arrow {
+popover.system-monitor-source-menu,
+popover.system-monitor-source-menu.background {
   color: @fg;
   background: transparent;
+  background-color: transparent;
   background-image: none;
+  border: none;
   box-shadow: none;
 }
 
-.system-monitor-settings-dropdown popover > contents {
+popover.system-monitor-source-menu > contents {
   padding: 5px;
   color: @fg;
   background: @popup_surface_bg;
+  background-color: @popup_surface_bg;
   background-image: none;
   border: 1px solid @popup_surface_border;
   border-radius: 18px;
+  background-clip: padding-box;
   box-shadow: none;
+  transform-origin: 50% 0;
 }
 
-.system-monitor-settings-dropdown popover listview {
+popover.system-monitor-source-menu listview,
+popover.system-monitor-source-menu scrolledwindow,
+popover.system-monitor-source-menu viewport,
+popover.system-monitor-source-menu label,
+popover.system-monitor-source-menu image {
   color: @fg;
   background: transparent;
+  background-image: none;
 }
 
-.system-monitor-settings-dropdown popover listview > row {
+popover.system-monitor-source-menu listview > row {
   min-height: 28px;
-  padding: 3px 8px;
-  border-radius: 6px;
+  padding: 4px 9px;
+  border-radius: 8px;
   color: @fg;
   background: transparent;
+  background-image: none;
+  transition: background-color 120ms ease;
 }
 
-.system-monitor-settings-dropdown popover listview > row:selected {
-  color: @fg;
+popover.system-monitor-source-menu listview > row:selected {
+  background: @accent_overlay_18;
+}
+
+popover.system-monitor-source-menu listview > row:hover,
+popover.system-monitor-source-menu listview > row:selected:hover {
   background: @soft_overlay_16;
 }
 
-.system-monitor-settings-dropdown popover listview > row:hover {
-  background: @hover_bg;
+@keyframes system-monitor-source-menu-open {
+  from {
+    opacity: 0;
+    transform: translate(0, -6px) scale(0.975);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+}
+
+popover.system-monitor-source-menu.system-monitor-source-menu-opening > contents {
+  animation: system-monitor-source-menu-open 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 button.system-monitor-settings-move,
@@ -1742,6 +1769,22 @@ button.wallpaper-card:hover .wallpaper-thumb {
 .wallpaper-directory-list-wrap,
 .wallpaper-directory-list {
   min-width: 436px;
+}
+
+listview.wallpaper-directory-list,
+listview.wallpaper-directory-list > row {
+  color: inherit;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+  border: none;
+}
+
+listview.wallpaper-directory-list > row {
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  outline: none;
 }
 
 .wallpaper-directory-list-wrap scrollbar,

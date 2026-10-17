@@ -8,7 +8,7 @@ use std::{
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::{Edge, LayerShell};
 
-use super::super::{Generation, popup_animation_progress};
+use super::super::{Generation, Timer, popup_animation_progress};
 
 pub(super) const EDGE_TRIGGER_WIDTH: i32 = 10;
 pub(super) const TAIL_WIDTH: i32 = EDGE_TRIGGER_WIDTH;
@@ -136,6 +136,8 @@ pub(super) struct MonitorDrawer {
     revealed: Cell<bool>,
     progress: Cell<f64>,
     generation: Generation,
+    settle_timer: Timer,
+    animation: crate::widgets::FrameCallback,
     settled: RefCell<Option<Box<dyn Fn()>>>,
 }
 
@@ -158,6 +160,8 @@ impl MonitorDrawer {
             revealed: Cell::new(false),
             progress: Cell::new(0.0),
             generation: Generation::default(),
+            settle_timer: Timer::default(),
+            animation: crate::widgets::FrameCallback::default(),
             settled: RefCell::new(None),
         })
     }
@@ -197,6 +201,7 @@ impl MonitorDrawer {
             return;
         }
         let generation = self.generation.bump();
+        self.settle_timer.cancel();
         let start = self.progress.get();
         let target = if revealed { 1.0 } else { 0.0 };
         let animate = self.window.settings().is_gtk_enable_animations();
@@ -221,7 +226,7 @@ impl MonitorDrawer {
             // callbacks. Still unmap after the slide, so a later reveal starts
             // from the hidden endpoint instead of a stalled closing frame.
             let weak = Rc::downgrade(self);
-            glib::timeout_add_local_once(
+            self.settle_timer.schedule(
                 Duration::from_millis(duration_ms.ceil() as u64 + 100),
                 move || {
                     if let Some(drawer) = weak.upgrade()
@@ -235,7 +240,7 @@ impl MonitorDrawer {
         }
         let weak = Rc::downgrade(self);
         let start_time = Cell::new(None::<i64>);
-        self.window.add_tick_callback(move |_, clock| {
+        self.animation.start(&self.window, move |_, clock| {
             let Some(drawer) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
@@ -268,6 +273,8 @@ impl MonitorDrawer {
     }
 
     fn finish(&self, revealed: bool) {
+        self.animation.cancel();
+        self.settle_timer.cancel();
         self.progress.set(if revealed { 1.0 } else { 0.0 });
         self.slide.set_animating(false);
         self.sync_position();

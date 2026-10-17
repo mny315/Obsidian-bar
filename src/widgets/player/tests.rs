@@ -95,11 +95,112 @@ fn newly_discovered_playing_source_is_an_activation_candidate() {
 }
 
 #[test]
-fn metadata_truncation_is_character_safe() {
+fn metadata_formatting_and_truncation_are_character_safe() {
+    let metadata = HashMap::from([
+        ("xesam:title", "  日本語 title  ".to_variant()),
+        (
+            "xesam:artist",
+            vec!["  Первый ", "", " Второй  "].to_variant(),
+        ),
+        ("mpris:artUrl", "file:///unused/art.png".to_variant()),
+    ])
+    .to_variant();
+    assert_eq!(
+        track_metadata_text(&metadata).as_deref(),
+        Some("Первый, Второй — 日本語 title")
+    );
+    let malformed = HashMap::from([("xesam:title", 42_u32.to_variant())]).to_variant();
+    assert_eq!(track_metadata_text(&malformed), None);
+    assert_eq!(track_metadata_text(&42_u32.to_variant()), None);
     assert_eq!(truncate_text("абвг", 3), "аб…");
     assert_eq!(truncate_text("abc", 3), "abc");
     assert_eq!(truncate_text("abc", 1), "…");
     assert_eq!(truncate_text("abc", 0), "");
+}
+
+#[test]
+#[ignore = "requires session D-Bus; emits property notifications only on isolated proxies"]
+fn repeated_property_signals_queue_one_update_and_keep_the_latest_metadata() {
+    let context = glib::MainContext::new();
+    context
+        .with_thread_default(|| {
+            let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).unwrap();
+            let make_proxy = |interface| {
+                gio::DBusProxy::new_sync(
+                    &bus,
+                    gio::DBusProxyFlags::DO_NOT_LOAD_PROPERTIES
+                        | gio::DBusProxyFlags::DO_NOT_CONNECT_SIGNALS,
+                    None,
+                    bus.unique_name().as_deref(),
+                    "/ObsidianPropertyBurstFixture",
+                    interface,
+                    gio::Cancellable::NONE,
+                )
+                .unwrap()
+            };
+            let player = make_proxy(MPRIS_PLAYER_INTERFACE);
+            let root = make_proxy(MPRIS_ROOT_INTERFACE);
+            for key in [
+                "CanControl",
+                "CanPlay",
+                "CanPause",
+                "CanGoPrevious",
+                "CanGoNext",
+            ] {
+                player.set_cached_property(key, Some(&true.to_variant()));
+            }
+            player.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
+            let (events, receiver) = async_channel::unbounded();
+            let handle =
+                PlayerHandle::from_proxies("fixture".into(), player.clone(), root.clone(), &events)
+                    .unwrap();
+            let mut state = PlayerState {
+                events,
+                players: vec![handle],
+                pending_players: HashMap::new(),
+                next_request_id: 0,
+                source_states: HashMap::new(),
+                active_bus: None,
+                pinned: false,
+                views: Vec::new(),
+            };
+            let emit = |proxy: &gio::DBusProxy, key: &str, value: glib::Variant| {
+                proxy.set_cached_property(key, Some(&value));
+                let changed = HashMap::from([(key, value)]).to_variant();
+                proxy.emit_by_name::<()>(
+                    "g-properties-changed",
+                    &[&changed, &glib::StrV::default()],
+                );
+            };
+            for index in 0..1000 {
+                emit(
+                    &player,
+                    "Metadata",
+                    HashMap::from([("xesam:title", format!("Track {index}").to_variant())])
+                        .to_variant(),
+                );
+                emit(&root, "Identity", format!("Source {index}").to_variant());
+            }
+            assert_eq!(receiver.len(), 2);
+            while let Ok(event) = receiver.try_recv() {
+                state.handle_event(event);
+            }
+            assert_eq!(state.current_view().unwrap().metadata, "Track 999");
+            emit(&player, "PlaybackStatus", "Playing".to_variant());
+            assert_eq!(
+                receiver.len(),
+                1,
+                "processing a burst must allow the next notification"
+            );
+            state.handle_event(receiver.try_recv().unwrap());
+            assert_eq!(
+                state.current_view().unwrap().status,
+                PlaybackStatus::Playing
+            );
+            emit(&player, "Position", 123_i64.to_variant());
+            assert!(receiver.is_empty());
+        })
+        .unwrap();
 }
 
 #[test]

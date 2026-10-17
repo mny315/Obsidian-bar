@@ -16,6 +16,27 @@ use std::process::{Command, Stdio};
 use super::*;
 
 #[test]
+fn managed_process_stop_waits_for_exit_and_allows_repeated_stop() {
+    let context = glib::MainContext::new();
+    context
+        .with_thread_default(|| {
+            context.block_on(async {
+                let process =
+                    ManagedSubprocess::spawn("stop-test", &[OsStr::new("sleep"), OsStr::new("30")])
+                        .unwrap();
+                assert!(process.is_running());
+                let started = Instant::now();
+                process.stop().await;
+                assert!(!process.is_running());
+                assert!(process.process.identifier().is_none());
+                process.stop().await;
+                assert!(started.elapsed() < Duration::from_secs(2));
+            })
+        })
+        .unwrap();
+}
+
+#[test]
 fn wallpaper_deletion_helper() {
     let Some(root) = env::var_os("OBSIDIAN_WALLPAPER_DELETE_TEST_DIR").map(PathBuf::from) else {
         return;
@@ -144,6 +165,12 @@ fn wallpaper_order_persists_per_folder_and_new_files_follow_saved_items() {
     assert_eq!(loaded.current, settings.current);
     fs::write(first.join("0-new.png"), b"fixture").unwrap();
     fs::remove_file(first.join("a.png")).unwrap();
+    // Directory entry types avoid redundant stats without changing symlink
+    // handling or accepting a directory with an image extension.
+    fs::create_dir(first.join("directory.png")).unwrap();
+    fs::write(first.join("notes.txt"), b"notes").unwrap();
+    std::os::unix::fs::symlink(first.join("c.png"), first.join("linked.png")).unwrap();
+    std::os::unix::fs::symlink(first.join("missing.png"), first.join("broken.png")).unwrap();
     let mut files = list_wallpapers(&first).unwrap();
     super::super::reorder::sort_by_order(
         &mut files,
@@ -155,7 +182,8 @@ fn wallpaper_order_persists_per_folder_and_new_files_follow_saved_items() {
         [
             first.join("c.png"),
             first.join("b.png"),
-            first.join("0-new.png")
+            first.join("0-new.png"),
+            first.join("linked.png")
         ]
     );
     fs::remove_dir_all(root).unwrap();

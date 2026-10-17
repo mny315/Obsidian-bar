@@ -2,12 +2,14 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
 use gtk::{gdk, glib, prelude::*};
 use tracing::{debug, warn};
 
+use super::dbus::{properties_changed, property_signal_changed};
 use super::tooltip::BarTooltipExt;
 use super::{
     BAR_POPUP_WIDTH, Generation, PopupReveal, RefreshGate, attach_popup_escape_handler,
@@ -51,7 +53,7 @@ const ICON_VLESS_INACTIVE: &str = "󰌿";
 
 #[derive(Default)]
 struct NetworkState {
-    wifi: WifiSnapshot,
+    wifi: Arc<WifiSnapshot>,
     vless: VlessState,
     password_target: Option<WifiNetwork>,
 }
@@ -156,6 +158,7 @@ struct NetworkController {
     rescan_busy: Cell<bool>,
     rescan_baseline: Cell<Option<i64>>,
     rescan_generation: Generation,
+    rescan_timer: super::Timer,
 }
 
 pub struct NetworkIndicator {
@@ -365,6 +368,7 @@ impl NetworkIndicator {
             rescan_busy: Cell::new(false),
             rescan_baseline: Cell::new(None),
             rescan_generation: Generation::default(),
+            rescan_timer: super::Timer::default(),
         });
 
         NetworkController::connect(&controller, bar_window, &cancel_button, &connect_button);
@@ -560,6 +564,16 @@ impl NetworkController {
                 Some("PropertiesChanged"),
                 Some(NM_ACCESS_POINT_INTERFACE),
             ),
+            (
+                Some(DBUS_PROPERTIES_INTERFACE),
+                Some("PropertiesChanged"),
+                Some(NM_SETTINGS_INTERFACE),
+            ),
+            (
+                Some(DBUS_PROPERTIES_INTERFACE),
+                Some("PropertiesChanged"),
+                Some(NM_SETTINGS_CONNECTION_INTERFACE),
+            ),
         ];
 
         let mut subscriptions = Vec::with_capacity(filters.len());
@@ -572,7 +586,14 @@ impl NetworkController {
                 None,
                 arg0,
                 gio::DBusSignalFlags::NONE,
-                move |_| {
+                move |signal| {
+                    if !network_signal_affects_snapshot(
+                        signal.interface_name,
+                        signal.signal_name,
+                        signal.parameters,
+                    ) {
+                        return;
+                    }
                     if let Some(this) = weak.upgrade() {
                         this.schedule_signal_refresh();
                     }
@@ -643,7 +664,7 @@ impl NetworkController {
                     Ok(snapshot) => this.apply_snapshot(snapshot),
                     Err(error) => {
                         debug!(%error, "failed to refresh NetworkManager state");
-                        this.apply_snapshot(WifiSnapshot::default());
+                        this.apply_snapshot(Arc::default());
                         this.set_notice(Some(&format!("NetworkManager: {error}")));
                     }
                 }
@@ -693,7 +714,7 @@ impl NetworkController {
         );
     }
 
-    fn apply_snapshot(self: &Rc<Self>, snapshot: WifiSnapshot) {
+    fn apply_snapshot(self: &Rc<Self>, snapshot: Arc<WifiSnapshot>) {
         let initialize_header = !self.header_initialized.replace(true);
         let last_scan = snapshot.last_scan;
         let wifi_enabled = snapshot.enabled;
@@ -727,6 +748,7 @@ impl NetworkController {
             .get()
             .is_some_and(|baseline| last_scan != baseline);
         if finished_rescan {
+            self.rescan_timer.cancel();
             self.rescan_baseline.set(None);
             self.rescan_busy.set(false);
             self.set_notice(None);
@@ -1093,9 +1115,10 @@ impl NetworkController {
         }
         {
             let mut state = self.state.borrow_mut();
-            state.wifi.enabled = enabled;
+            let wifi = Arc::make_mut(&mut state.wifi);
+            wifi.enabled = enabled;
             if !enabled {
-                for network in &mut state.wifi.networks {
+                for network in &mut wifi.networks {
                     network.active = false;
                 }
             }
@@ -1161,22 +1184,23 @@ impl NetworkController {
                         this.refresh_snapshot();
 
                         let weak = Rc::downgrade(&this);
-                        glib::timeout_add_local_once(SCAN_COMPLETION_TIMEOUT, move || {
-                            let Some(this) = weak.upgrade() else {
-                                return;
-                            };
-                            if !this.rescan_generation.is_current(generation) {
-                                return;
-                            }
-                            if this.rescan_baseline.get() == Some(previous_last_scan) {
-                                this.rescan_baseline.set(None);
-                                this.rescan_busy.set(false);
-                                this.set_rescan_animating(false);
-                                this.set_notice(Some("Wi-Fi scan completion timed out"));
-                                this.update_header();
-                                this.refresh_snapshot();
-                            }
-                        });
+                        this.rescan_timer
+                            .schedule(SCAN_COMPLETION_TIMEOUT, move || {
+                                let Some(this) = weak.upgrade() else {
+                                    return;
+                                };
+                                if !this.rescan_generation.is_current(generation) {
+                                    return;
+                                }
+                                if this.rescan_baseline.get() == Some(previous_last_scan) {
+                                    this.rescan_baseline.set(None);
+                                    this.rescan_busy.set(false);
+                                    this.set_rescan_animating(false);
+                                    this.set_notice(Some("Wi-Fi scan completion timed out"));
+                                    this.update_header();
+                                    this.refresh_snapshot();
+                                }
+                            });
                     }
                     Err(error) => {
                         warn!(%error, "Wi-Fi scan failed");
@@ -1272,6 +1296,7 @@ impl NetworkController {
 
     fn cancel_rescan_tracking(&self) {
         self.rescan_generation.bump();
+        self.rescan_timer.cancel();
         self.rescan_busy.set(false);
         self.rescan_baseline.set(None);
         self.set_rescan_animating(false);
@@ -1332,6 +1357,38 @@ fn refresh_password_target(
         .cloned()
 }
 
+fn network_signal_affects_snapshot(
+    interface: &str,
+    signal: &str,
+    parameters: &glib::Variant,
+) -> bool {
+    if signal != "PropertiesChanged" {
+        return true;
+    }
+    if interface == DBUS_PROPERTIES_INTERFACE {
+        return property_signal_changed(parameters, network_tracked_properties);
+    }
+    // Older NetworkManager versions also emit an interface-specific (a{sv})
+    // PropertiesChanged signal.
+    if parameters.type_().as_str() != "(a{sv})" {
+        return true;
+    }
+    let tracked = network_tracked_properties(interface);
+    !tracked.is_empty() && properties_changed(&parameters.child_value(0), [], tracked)
+}
+
+fn network_tracked_properties(interface: &str) -> &'static [&'static str] {
+    match interface {
+        NM_INTERFACE => &["WirelessEnabled", "WirelessHardwareEnabled", "Devices"],
+        NM_DEVICE_INTERFACE => &["DeviceType", "ActiveConnection", "State"],
+        NM_WIRELESS_INTERFACE => &["ActiveAccessPoint", "LastScan", "AccessPoints"],
+        NM_ACCESS_POINT_INTERFACE => &["Ssid", "Strength", "Flags", "WpaFlags", "RsnFlags"],
+        NM_SETTINGS_INTERFACE => &["VersionId", "Connections"],
+        NM_SETTINGS_CONNECTION_INTERFACE => &["Unsaved", "Flags", "VersionId"],
+        _ => &[],
+    }
+}
+
 fn wifi_header_changed(previous: &WifiSnapshot, next: &WifiSnapshot) -> bool {
     if previous.available != next.available || previous.enabled != next.enabled {
         return true;
@@ -1388,7 +1445,59 @@ fn wifi_signal_icon(signal: u8) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ICON_WIFI_GOOD, ICON_WIFI_HIGH, ICON_WIFI_LOW, ICON_WIFI_MID, wifi_signal_icon};
+    use super::*;
+
+    #[test]
+    fn wifi_signals_skip_unused_properties_and_keep_legacy_updates_and_invalidations() {
+        use glib::variant::ToVariant;
+        let changes = |name: &str| HashMap::from([(name.to_owned(), 42_u32.to_variant())]);
+        let signal = |interface: &str, name: &str, invalidated: Vec<String>| {
+            (interface, changes(name), invalidated).to_variant()
+        };
+        for name in ["LastSeen", "Frequency", "HwAddress"] {
+            assert!(!network_signal_affects_snapshot(
+                DBUS_PROPERTIES_INTERFACE,
+                "PropertiesChanged",
+                &signal(NM_ACCESS_POINT_INTERFACE, name, vec![])
+            ));
+        }
+        for name in network_tracked_properties(NM_ACCESS_POINT_INTERFACE) {
+            assert!(network_signal_affects_snapshot(
+                DBUS_PROPERTIES_INTERFACE,
+                "PropertiesChanged",
+                &signal(NM_ACCESS_POINT_INTERFACE, name, vec![])
+            ));
+            assert!(network_signal_affects_snapshot(
+                NM_ACCESS_POINT_INTERFACE,
+                "PropertiesChanged",
+                &(changes(name),).to_variant()
+            ));
+        }
+        assert!(network_signal_affects_snapshot(
+            DBUS_PROPERTIES_INTERFACE,
+            "PropertiesChanged",
+            &signal(
+                NM_ACCESS_POINT_INTERFACE,
+                "LastSeen",
+                vec!["Strength".into()]
+            )
+        ));
+        assert!(network_signal_affects_snapshot(
+            DBUS_PROPERTIES_INTERFACE,
+            "PropertiesChanged",
+            &signal(NM_SETTINGS_INTERFACE, "VersionId", vec![]),
+        ));
+        assert!(network_signal_affects_snapshot(
+            NM_INTERFACE,
+            "DeviceAdded",
+            &().to_variant()
+        ));
+        assert!(network_signal_affects_snapshot(
+            DBUS_PROPERTIES_INTERFACE,
+            "PropertiesChanged",
+            &42_u32.to_variant()
+        ));
+    }
 
     #[test]
     fn signal_icon_thresholds_are_stable() {

@@ -1,8 +1,9 @@
+use super::files::{EntryKind, ScanRequests, list_entries};
 use super::thumbnails::{request_thumbnail, thumbnail_cache_path};
 use super::{
     CARD_HEIGHT, CARD_WIDTH, ICON_WALLPAPER, MAX_RANDOM_INTERVAL_MINUTES,
-    MIN_RANDOM_INTERVAL_MINUTES, WallpaperController, WallpaperError, WallpaperSnapshot,
-    is_video_wallpaper, list_wallpapers, wallpaper_key,
+    MIN_RANDOM_INTERVAL_MINUTES, WallpaperController, WallpaperSnapshot, is_video_wallpaper,
+    wallpaper_key,
 };
 use crate::widgets::audio_spectrum::AudioSpectrumController;
 use crate::widgets::bar_features::{BarFeatureController, BarFeatureState};
@@ -10,21 +11,23 @@ use crate::widgets::reorder::{ReorderGrid, sort_by_order};
 use crate::widgets::system_monitor::SystemMonitorController;
 use crate::widgets::tooltip::BarTooltipExt;
 use crate::widgets::{
-    BAR_POPUP_TOP_MARGIN, Generation, PopupReveal, SmoothScrollConfig, attach_bar_click_dismiss,
-    attach_popup_focus_dismiss, clear_box, detach_application_window, install_smooth_scroll,
-    run_background_async, set_optional_label, set_spinner_active,
+    BAR_POPUP_TOP_MARGIN, Generation, PopupReveal, SmoothScrollConfig, Timer,
+    attach_bar_click_dismiss, attach_popup_focus_dismiss, clear_box, detach_application_window,
+    install_smooth_scroll, run_background_async, set_optional_label, set_spinner_active,
 };
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::LayerShell;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+mod directory;
+use directory::{DirectoryBrowser, build_directory_page};
 
 const GRID_COLUMNS: i32 = 3;
 const GRID_GAP: i32 = 8;
@@ -65,21 +68,21 @@ type LiveWallpaperCards = Rc<RefCell<HashMap<PathBuf, glib::WeakRef<gtk::Overlay
 struct GalleryReuse {
     cards: Rc<RefCell<HashMap<PathBuf, gtk::Box>>>,
     reordering: Rc<Cell<bool>>,
-    generation: Rc<Generation>,
+    settle_timer: Rc<Timer>,
 }
 
 impl GalleryReuse {
     fn begin_reordering(&self) {
         self.reordering.set(true);
-        let generation = self.generation.bump();
-        let reuse = self.clone();
+        let reordering = Rc::downgrade(&self.reordering);
         // ListView can bind changed rows on the next layout. Suppress their
         // entrance animation briefly, without disabling it for all later scrolls.
-        glib::timeout_add_local_once(Duration::from_millis(250), move || {
-            if reuse.generation.is_current(generation) {
-                reuse.reordering.set(false);
-            }
-        });
+        self.settle_timer
+            .schedule(Duration::from_millis(250), move || {
+                if let Some(reordering) = reordering.upgrade() {
+                    reordering.set(false);
+                }
+            });
     }
 }
 
@@ -96,6 +99,8 @@ struct GalleryView {
     notice: glib::WeakRef<gtk::Label>,
     rendered: Rc<RefCell<RenderedGallery>>,
     refresh_generation: Rc<Generation>,
+    scan_requests: ScanRequests,
+    refresh_animation_timer: Rc<Timer>,
     refresh_button: glib::WeakRef<gtk::Button>,
     refresh_icon: glib::WeakRef<gtk::Label>,
     refresh_spinner: glib::WeakRef<gtk::Spinner>,
@@ -579,163 +584,6 @@ fn build_gallery_page(
     }
 }
 
-struct DirectoryPage {
-    root: gtk::Box,
-    back_button: gtk::Button,
-    home_button: gtk::Button,
-    up_button: gtk::Button,
-    select_button: gtk::Button,
-    path_label: gtk::Label,
-    list: gtk::Box,
-    notice: gtk::Label,
-}
-
-#[derive(Clone)]
-struct DirectoryBrowser {
-    current: Rc<RefCell<PathBuf>>,
-    render_generation: Rc<Generation>,
-    list: glib::WeakRef<gtk::Box>,
-    path_label: glib::WeakRef<gtk::Label>,
-    notice: glib::WeakRef<gtk::Label>,
-}
-
-impl DirectoryBrowser {
-    fn new(initial: PathBuf, page: &DirectoryPage) -> Self {
-        page.path_label.set_label(&initial.to_string_lossy());
-        Self {
-            current: Rc::new(RefCell::new(initial)),
-            render_generation: Rc::new(Generation::default()),
-            list: page.list.downgrade(),
-            path_label: page.path_label.downgrade(),
-            notice: page.notice.downgrade(),
-        }
-    }
-
-    fn path(&self) -> PathBuf {
-        self.current.borrow().clone()
-    }
-
-    fn set_path(&self, path: PathBuf) {
-        self.current.replace(path);
-    }
-
-    fn navigate_to(&self, path: PathBuf) {
-        self.current.replace(path);
-        self.render();
-    }
-
-    fn navigate_up(&self) {
-        let parent = self.current.borrow().parent().map(Path::to_path_buf);
-        if let Some(parent) = parent {
-            self.navigate_to(parent);
-        }
-    }
-
-    fn render(&self) {
-        let (Some(list), Some(path_label), Some(notice)) = (
-            self.list.upgrade(),
-            self.path_label.upgrade(),
-            self.notice.upgrade(),
-        ) else {
-            return;
-        };
-        let generation = self.render_generation.bump();
-        let directory = self.path();
-        clear_box(&list);
-        path_label.set_label(&directory.to_string_lossy());
-        set_optional_label(&notice, Some("Loading folders…"));
-
-        let browser = self.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let result = run_background_async({
-                let directory = directory.clone();
-                move || list_directories(&directory).map_err(|error| error.to_string())
-            })
-            .await
-            .unwrap_or_else(|| Err("directory scan worker stopped".to_owned()));
-
-            if !browser.render_generation.is_current(generation)
-                || browser.current.borrow().as_path() != directory.as_path()
-            {
-                return;
-            }
-            let (Some(list), Some(notice)) = (browser.list.upgrade(), browser.notice.upgrade())
-            else {
-                return;
-            };
-            render_directory_items(&browser, &list, &notice, result);
-        });
-    }
-}
-
-fn build_directory_page() -> DirectoryPage {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    root.add_css_class("wallpaper-directory-page");
-
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    header.add_css_class("wallpaper-directory-header");
-    header.set_valign(gtk::Align::Center);
-
-    let back_button = header_button(ICON_BACK);
-    let title = gtk::Label::new(Some("Wallpaper folder"));
-    title.add_css_class("wallpaper-title");
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-
-    let home_button = header_button(ICON_HOME);
-    let up_button = header_button(ICON_UP);
-
-    header.append(&back_button);
-    header.append(&title);
-    header.append(&home_button);
-    header.append(&up_button);
-
-    let path_label = gtk::Label::new(None);
-    path_label.add_css_class("wallpaper-directory-path");
-    path_label.set_xalign(0.0);
-    path_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-
-    let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    frame.add_css_class("wallpaper-directory-frame");
-
-    let scroller = gtk::ScrolledWindow::new();
-    scroller.add_css_class("wallpaper-directory-list-wrap");
-    scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    scroller.set_min_content_width(GALLERY_WIDTH);
-    scroller.set_min_content_height(GALLERY_HEIGHT);
-    scroller.set_max_content_height(GALLERY_HEIGHT);
-    scroller.set_propagate_natural_height(false);
-
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    list.add_css_class("wallpaper-directory-list");
-    scroller.set_child(Some(&list));
-    install_smooth_scroll(&scroller, SMOOTH_SCROLL);
-    frame.append(&scroller);
-
-    let notice = wallpaper_notice_label();
-
-    let select_button = gtk::Button::with_label("Use this folder");
-    select_button.add_css_class("wallpaper-directory-select");
-    select_button.set_halign(gtk::Align::End);
-
-    root.append(&header);
-    root.append(&path_label);
-    root.append(&frame);
-    root.append(&notice);
-    root.append(&select_button);
-
-    DirectoryPage {
-        root,
-        back_button,
-        home_button,
-        up_button,
-        select_button,
-        path_label,
-        list,
-        notice,
-    }
-}
-
 fn build_picker_content(
     controller: &Rc<WallpaperController>,
     bar_features: &Rc<BarFeatureController>,
@@ -785,6 +633,14 @@ fn build_picker_content(
         loaded: false,
         order: initial_snapshot.gallery_order.clone(),
     }));
+    let scan_requests = ScanRequests::default();
+    let scans_on_destroy = scan_requests.clone();
+    let refresh_animation_timer = Rc::new(Timer::default());
+    let animation_on_destroy = Rc::clone(&refresh_animation_timer);
+    root.connect_destroy(move |_| {
+        scans_on_destroy.cancel();
+        animation_on_destroy.cancel();
+    });
     let gallery_view = GalleryView {
         model,
         reorder,
@@ -797,6 +653,8 @@ fn build_picker_content(
         notice: notice.downgrade(),
         rendered,
         refresh_generation: Rc::new(Generation::default()),
+        scan_requests,
+        refresh_animation_timer,
         refresh_button: refresh_button.downgrade(),
         refresh_icon: refresh_icon.downgrade(),
         refresh_spinner: refresh_spinner.downgrade(),
@@ -888,83 +746,6 @@ fn build_picker_content(
     root
 }
 
-fn render_directory_items(
-    browser: &DirectoryBrowser,
-    directory_list: &gtk::Box,
-    notice: &gtk::Label,
-    result: Result<Vec<PathBuf>, String>,
-) {
-    clear_box(directory_list);
-    let directories = match result {
-        Ok(directories) => {
-            set_optional_label(notice, None);
-            directories
-        }
-        Err(error) => {
-            set_optional_label(notice, Some(&error));
-            return;
-        }
-    };
-
-    if directories.is_empty() {
-        let label = gtk::Label::new(Some("No subdirectories"));
-        label.add_css_class("wallpaper-directory-empty");
-        label.set_halign(gtk::Align::Start);
-        directory_list.append(&label);
-        return;
-    }
-
-    for path in directories {
-        let button = gtk::Button::new();
-        button.add_css_class("wallpaper-directory-row");
-
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.add_css_class("wallpaper-directory-row-content");
-
-        let icon = gtk::Label::new(Some(ICON_FOLDER));
-        icon.add_css_class("wallpaper-directory-row-icon");
-
-        let name = path.file_name().and_then(OsStr::to_str).unwrap_or("/");
-        let label = gtk::Label::new(Some(name));
-        label.add_css_class("wallpaper-directory-row-label");
-        label.set_xalign(0.0);
-        label.set_hexpand(true);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-
-        row.append(&icon);
-        row.append(&label);
-        button.set_child(Some(&row));
-
-        let browser = browser.clone();
-        button.connect_clicked(move |_| {
-            browser.navigate_to(path.clone());
-        });
-
-        directory_list.append(&button);
-    }
-}
-
-fn list_directories(directory: &Path) -> Result<Vec<PathBuf>, WallpaperError> {
-    let entries = fs::read_dir(directory).map_err(WallpaperError::Io)?;
-    let mut directories = Vec::new();
-
-    for entry in entries {
-        let entry = entry.map_err(WallpaperError::Io)?;
-        let path = entry.path();
-        if path.is_dir() {
-            directories.push(path);
-        }
-    }
-
-    directories.sort_by_cached_key(|path| {
-        path.file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-    });
-    Ok(directories)
-}
-
 fn render_gallery_items(
     model: &gio::ListStore,
     active_wallpaper: &Rc<RefCell<Option<PathBuf>>>,
@@ -1010,6 +791,7 @@ impl GalleryView {
         self.reuse.reordering.set(false);
         self.reuse.cards.borrow_mut().clear();
         let generation = self.refresh_generation.bump();
+        let request = self.scan_requests.begin();
         let animation_started = animate.then(Instant::now);
         if animate {
             self.set_refresh_animating(true);
@@ -1061,12 +843,16 @@ impl GalleryView {
         glib::MainContext::default().spawn_local(async move {
             let result = run_background_async({
                 let directory = directory.clone();
-                move || list_wallpapers(&directory).map_err(|error| error.to_string())
+                let request = request.clone();
+                move || {
+                    list_entries(&directory, EntryKind::Wallpaper, Some(&request))
+                        .map_err(|error| error.to_string())
+                }
             })
             .await
             .unwrap_or_else(|| Err("wallpaper scan worker stopped".to_owned()));
 
-            if !view.refresh_generation.is_current(generation) {
+            if request.is_cancelled() || !view.refresh_generation.is_current(generation) {
                 return;
             }
             if preserve_cards && let Ok(items) = &result {
@@ -1235,20 +1021,25 @@ impl GalleryView {
                     count.set_label(&items.len().to_string());
                     scroller.set_visible(!items.is_empty());
                     empty.set_visible(items.is_empty());
-                    self.live_wallpaper_cards
-                        .borrow_mut()
-                        .retain(|path, _| items.contains(path));
+                    let remaining = items.iter().collect::<HashSet<_>>();
+                    self.live_wallpaper_cards.borrow_mut().retain(|path, weak| {
+                        if !remaining.contains(path) {
+                            return false;
+                        }
+                        let Some(card) = weak.upgrade() else {
+                            return false;
+                        };
+                        if rendered.current.as_ref() == Some(path) {
+                            card.add_css_class("wallpaper-thumb-wrap-active");
+                        } else {
+                            card.remove_css_class("wallpaper-thumb-wrap-active");
+                        }
+                        true
+                    });
                     self.reuse
                         .cards
                         .borrow_mut()
-                        .retain(|path, _| items.contains(path));
-                    for path in &items {
-                        set_live_wallpaper_card_active(
-                            &self.live_wallpaper_cards,
-                            path,
-                            rendered.current.as_deref() == Some(path.as_path()),
-                        );
-                    }
+                        .retain(|path, _| remaining.contains(path));
                     rendered.loaded = true;
                     drop(rendered);
                     self.finish_refresh_animation(generation, animation_started);
@@ -1294,15 +1085,23 @@ impl GalleryView {
             return;
         }
 
-        let view = self.clone();
-        glib::timeout_add_local_once(remaining, move || {
-            if view.refresh_generation.is_current(generation) {
-                view.set_refresh_animating(false);
+        let refresh_generation = Rc::clone(&self.refresh_generation);
+        let button = self.refresh_button.clone();
+        let icon = self.refresh_icon.clone();
+        let spinner = self.refresh_spinner.clone();
+        self.refresh_animation_timer.schedule(remaining, move || {
+            if refresh_generation.is_current(generation)
+                && let (Some(button), Some(icon), Some(spinner)) =
+                    (button.upgrade(), icon.upgrade(), spinner.upgrade())
+            {
+                button.set_sensitive(true);
+                set_spinner_active(&icon, &spinner, false);
             }
         });
     }
 
     fn set_refresh_animating(&self, active: bool) {
+        self.refresh_animation_timer.cancel();
         if let (Some(button), Some(icon), Some(spinner)) = (
             self.refresh_button.upgrade(),
             self.refresh_icon.upgrade(),
@@ -1494,16 +1293,14 @@ fn attach_wallpaper_delete(
     overlay.add_overlay(&corner);
 
     let deadline = Rc::new(Cell::new(None::<Instant>));
-    let timeout = Rc::new(RefCell::new(None::<glib::SourceId>));
+    let timeout = Rc::new(Timer::default());
     {
         let deadline = Rc::clone(&deadline);
         let timeout = Rc::clone(&timeout);
         let confirmation = confirmation.downgrade();
         corner.connect_unmap(move |_| {
             deadline.set(None);
-            if let Some(source) = timeout.borrow_mut().take() {
-                source.remove();
-            }
+            timeout.cancel();
             if let Some(confirmation) = confirmation.upgrade() {
                 confirmation.set_reveal_child(false);
             }
@@ -1522,9 +1319,7 @@ fn attach_wallpaper_delete(
         let Some(confirmation) = weak_confirmation.upgrade() else {
             return;
         };
-        if let Some(source) = timeout.borrow_mut().take() {
-            source.remove();
-        }
+        timeout.cancel();
         if deadline.take().is_some_and(|at| Instant::now() < at) {
             confirmation.set_reveal_child(false);
             match controller.delete_wallpaper(&path) {
@@ -1552,17 +1347,12 @@ fn attach_wallpaper_delete(
         confirmation.set_reveal_child(true);
         let weak = confirmation.downgrade();
         let deadline = Rc::clone(&deadline);
-        let timeout_slot = Rc::clone(&timeout);
-        timeout.replace(Some(glib::timeout_add_local_once(
-            DELETE_CONFIRM_DURATION,
-            move || {
-                timeout_slot.borrow_mut().take();
-                deadline.set(None);
-                if let Some(confirmation) = weak.upgrade() {
-                    confirmation.set_reveal_child(false);
-                }
-            },
-        )));
+        timeout.schedule(DELETE_CONFIRM_DURATION, move || {
+            deadline.set(None);
+            if let Some(confirmation) = weak.upgrade() {
+                confirmation.set_reveal_child(false);
+            }
+        });
     });
     confirmation
 }
@@ -2110,584 +1900,5 @@ fn queue_thumbnail(overlay: &gtk::Overlay, source: PathBuf) {
 }
 
 #[cfg(test)]
-mod reorder_tests {
-    use super::*;
-    use crate::widgets::test_support::{
-        capture_if_requested, drag_pointer, drag_pointer_with_wheel, pump,
-    };
-
-    #[test]
-    fn wallpaper_delete_ui_helper() {
-        let Some(root) = std::env::var_os("OBSIDIAN_WALLPAPER_DELETE_UI_DIR").map(PathBuf::from)
-        else {
-            return;
-        };
-        gtk::init().unwrap();
-        let app = gtk::Application::builder()
-            .application_id("dev.obsidian.WallpaperDeleteTest")
-            .flags(gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gio::Cancellable>).unwrap();
-        let css = gtk::CssProvider::new();
-        css.connect_parsing_error(|_, _, error| panic!("CSS error: {error}"));
-        css.load_from_data(include_str!("../../../assets/window.css"));
-        gtk::style_context_add_provider_for_display(
-            &gdk::Display::default().unwrap(),
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-        let directory = root.join("wallpapers");
-        fs::create_dir_all(&directory).unwrap();
-        let paths = (0..8)
-            .map(|i| directory.join(format!("{i}.png")))
-            .collect::<Vec<_>>();
-        let pixbuf = gdk_pixbuf::Pixbuf::new(
-            gdk_pixbuf::Colorspace::Rgb,
-            false,
-            8,
-            CARD_WIDTH,
-            CARD_HEIGHT,
-        )
-        .unwrap();
-        for (i, path) in paths.iter().enumerate() {
-            pixbuf.fill(0x234578ff + (i as u32 * 0x12050000));
-            pixbuf.savev(path, "png", &[]).unwrap();
-        }
-        let controller = WallpaperController::new();
-        controller.settings.borrow_mut().directory = directory;
-        controller.settings.borrow_mut().current = Some(paths[0].clone());
-        let content = build_picker_content(
-            &controller,
-            &BarFeatureController::new(),
-            &AudioSpectrumController::new(),
-            &SystemMonitorController::new(),
-        );
-        let window = gtk::ApplicationWindow::builder()
-            .application(&app)
-            .child(&content)
-            .build();
-        window.init_layer_shell();
-        window.set_namespace(Some("obsidian-wallpaper-delete-test"));
-        window.set_layer(Layer::Overlay);
-        window.set_exclusive_zone(-1);
-        window.set_margin(Edge::Top, 100);
-        window.set_margin(Edge::Left, 100);
-        window.set_anchor(Edge::Top, true);
-        window.set_anchor(Edge::Left, true);
-        window.set_keyboard_mode(KeyboardMode::None);
-        window.present();
-        pump(700);
-
-        fn descendants(widget: &gtk::Widget, class: &str) -> Vec<gtk::Widget> {
-            let mut found = Vec::new();
-            if widget.has_css_class(class) {
-                found.push(widget.clone());
-            }
-            let mut child = widget.first_child();
-            while let Some(current) = child {
-                found.extend(descendants(&current, class));
-                child = current.next_sibling();
-            }
-            found
-        }
-        let cards = || descendants(content.upcast_ref(), "wallpaper-card");
-        let card = cards()[0].clone().downcast::<gtk::Button>().unwrap();
-        let retained = cards()[1].clone();
-        let overlay = card.parent().unwrap().downcast::<gtk::Overlay>().unwrap();
-        let corner = overlay
-            .last_child()
-            .unwrap()
-            .downcast::<gtk::Button>()
-            .unwrap();
-        let confirmation = corner
-            .prev_sibling()
-            .unwrap()
-            .downcast::<gtk::Revealer>()
-            .unwrap();
-        let bounds = corner.compute_bounds(&window).unwrap();
-        let position = (bounds.x() + 107.0, bounds.y() + bounds.height() + 93.0);
-        let activations = Rc::new(Cell::new(0));
-        let clicked = Rc::clone(&activations);
-        card.connect_clicked(move |_| clicked.set(clicked.get() + 1));
-        let corner_clicks = Rc::new(Cell::new(0));
-        let corner_clicked = Rc::clone(&corner_clicks);
-        corner.connect_clicked(move |_| {
-            corner_clicked.set(corner_clicked.get() + 1);
-        });
-        capture_if_requested(&window, "wallpaper-delete-corner");
-        drag_pointer(position, position);
-        capture_if_requested(&window, "wallpaper-delete-after-click");
-        assert!(
-            confirmation.reveals_child(),
-            "native corner click must show confirmation: bounds={bounds:?}, pointer={position:?}, flags={:?}, card clicks={}, corner clicks={}, file exists={}",
-            corner.state_flags(),
-            activations.get(),
-            corner_clicks.get(),
-            paths[0].exists()
-        );
-        assert!(paths[0].exists());
-        assert_eq!(
-            corner_clicks.get(),
-            1,
-            "one press must request confirmation only"
-        );
-        assert_eq!(
-            activations.get(),
-            0,
-            "corner click must not activate the card"
-        );
-        assert_eq!(
-            controller.selection_generation.current(),
-            0,
-            "corner click must not apply wallpaper"
-        );
-        capture_if_requested(&window, "wallpaper-delete-confirmation");
-        pump(3300);
-        assert!(!confirmation.reveals_child());
-        assert!(!confirmation.is_child_revealed());
-        assert!(paths[0].exists(), "expiration must never delete a file");
-
-        corner.emit_clicked();
-        pump(220);
-        assert!(
-            confirmation.reveals_child(),
-            "click after expiry must ask again"
-        );
-        card.emit_clicked();
-        assert_eq!(controller.selection_generation.current(), 0);
-        corner.emit_clicked();
-        assert!(
-            !paths[0].exists(),
-            "second corner click must unlink the file"
-        );
-        assert!(overlay.has_css_class("wallpaper-removing"));
-        assert!(!card.is_sensitive());
-        pump(650);
-        assert_eq!(cards().len(), 7);
-        assert!(
-            cards().contains(&retained),
-            "surviving cards must be reused"
-        );
-        assert_eq!(controller.settings.borrow().current, None);
-        assert_eq!(controller.selection_generation.current(), 1);
-        capture_if_requested(&window, "wallpaper-deleted");
-
-        let corner = descendants(&retained.parent().unwrap(), "wallpaper-delete-corner")[0]
-            .clone()
-            .downcast::<gtk::Button>()
-            .unwrap();
-        let confirmation = corner
-            .prev_sibling()
-            .unwrap()
-            .downcast::<gtk::Revealer>()
-            .unwrap();
-        corner.emit_clicked();
-        pump(180);
-        window.set_visible(false);
-        pump(180);
-        assert!(!confirmation.reveals_child());
-        window.present();
-        pump(250);
-        corner.emit_clicked();
-        assert!(
-            paths[1].exists(),
-            "closing the picker must disarm confirmation"
-        );
-        assert!(confirmation.reveals_child());
-        corner.emit_clicked();
-        pump(350);
-        assert!(!paths[1].exists());
-        assert_eq!(cards().len(), 6);
-
-        // An I/O error leaves the card available and exposes the failure.
-        fs::remove_file(&paths[2]).unwrap();
-        fs::create_dir(&paths[2]).unwrap();
-        let corner = descendants(&cards()[0].parent().unwrap(), "wallpaper-delete-corner")[0]
-            .clone()
-            .downcast::<gtk::Button>()
-            .unwrap();
-        corner.emit_clicked();
-        corner.emit_clicked();
-        assert!(paths[2].is_dir());
-        assert_eq!(cards().len(), 6);
-        let notices = descendants(content.upcast_ref(), "wallpaper-notice");
-        assert!(notices.iter().any(|notice| {
-            notice.is_visible()
-                && notice
-                    .clone()
-                    .downcast::<gtk::Label>()
-                    .unwrap()
-                    .text()
-                    .contains("filesystem error")
-        }));
-        fs::remove_dir(&paths[2]).unwrap();
-        pixbuf.savev(&paths[2], "png", &[]).unwrap();
-        for remaining in (1..=6).rev() {
-            let card = cards()[0].clone();
-            let corner = descendants(&card.parent().unwrap(), "wallpaper-delete-corner")[0]
-                .clone()
-                .downcast::<gtk::Button>()
-                .unwrap();
-            corner.emit_clicked();
-            corner.emit_clicked();
-            pump(350);
-            assert_eq!(cards().len(), remaining - 1);
-        }
-        assert!(paths.iter().all(|path| !path.exists()));
-        assert!(descendants(content.upcast_ref(), "wallpaper-empty")[0].is_visible());
-        assert_eq!(
-            descendants(content.upcast_ref(), "wallpaper-count")[0]
-                .clone()
-                .downcast::<gtk::Label>()
-                .unwrap()
-                .text(),
-            "0"
-        );
-        window.close();
-        pump(100);
-    }
-
-    #[test]
-    #[ignore = "moves the pointer; requires a single Niri output and /dev/uinput access; run alone"]
-    fn wallpaper_delete_corner_confirms_expires_and_preserves_gallery() {
-        let root = std::env::temp_dir().join(format!(
-            "obsidian-wallpaper-delete-ui-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "widgets::wallpaper::picker::reorder_tests::wallpaper_delete_ui_helper",
-                "--nocapture",
-            ])
-            .env("OBSIDIAN_WALLPAPER_DELETE_UI_DIR", &root)
-            .env("XDG_STATE_HOME", &root)
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .output()
-            .unwrap();
-        fs::remove_dir_all(root).unwrap();
-        assert!(
-            result.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
-    }
-
-    #[test]
-    #[ignore = "moves the pointer; requires a single Niri output and /dev/uinput access; run alone"]
-    fn virtualized_gallery_reorders_and_preserves_scroll_and_selection() {
-        gtk::init().unwrap();
-        let app = gtk::Application::builder()
-            .application_id("dev.obsidian.GalleryReorderTest")
-            .flags(gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gio::Cancellable>).unwrap();
-        let css = gtk::CssProvider::new();
-        css.load_from_data(include_str!("../../../assets/window.css"));
-        gtk::style_context_add_provider_for_display(
-            &gdk::Display::default().unwrap(),
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-        let controller = WallpaperController::new();
-        let directory = PathBuf::from("/tmp/obsidian-gallery-reorder-fixture");
-        let paths = (0..90)
-            .map(|index| directory.join(format!("{index}.png")))
-            .collect::<Vec<_>>();
-        controller.settings.borrow_mut().directory = directory.clone();
-        controller.settings.borrow_mut().current = Some(paths[0].clone());
-        let page = build_gallery_page(
-            &controller,
-            &BarFeatureController::new(),
-            &AudioSpectrumController::new(),
-            &SystemMonitorController::new(),
-        );
-        let view = Rc::new(GalleryView {
-            model: page.model.clone(),
-            reorder: page.reorder.clone(),
-            active_wallpaper: Rc::clone(&page.active_wallpaper),
-            live_wallpaper_cards: Rc::clone(&page.live_wallpaper_cards),
-            reuse: page.reuse.clone(),
-            scroller: page.scroller.downgrade(),
-            empty: page.empty.downgrade(),
-            count: page.count.downgrade(),
-            notice: page.notice.downgrade(),
-            rendered: Rc::new(RefCell::new(RenderedGallery {
-                revision: 0,
-                directory: directory.clone(),
-                current: Some(paths[0].clone()),
-                loaded: true,
-                order: Vec::new(),
-            })),
-            refresh_generation: Rc::new(Generation::default()),
-            refresh_button: page.refresh_button.downgrade(),
-            refresh_icon: page.refresh_icon.downgrade(),
-            refresh_spinner: page.refresh_spinner.downgrade(),
-        });
-        let saved = Rc::new(RefCell::new(Vec::new()));
-        let saved_order = Rc::clone(&saved);
-        let weak_view = Rc::downgrade(&view);
-        let current = paths[0].clone();
-        page.reorder.on_commit(move |order| {
-            saved_order.replace(order.clone());
-            weak_view
-                .upgrade()
-                .unwrap()
-                .apply_snapshot(WallpaperSnapshot {
-                    gallery_revision: 0,
-                    directory: directory.clone(),
-                    current: Some(current.clone()),
-                    gallery_order: order,
-                });
-            true
-        });
-        page.reorder
-            .set_order(paths.iter().map(|path| wallpaper_key(path)).collect());
-        render_gallery_items(
-            &page.model,
-            &page.active_wallpaper,
-            GalleryRenderWidgets {
-                scroller: &page.scroller,
-                empty: &page.empty,
-                count: &page.count,
-                notice: &page.notice,
-            },
-            Some(paths[0].clone()),
-            paths.clone(),
-        );
-        let window = gtk::ApplicationWindow::builder()
-            .application(&app)
-            .child(&page.root)
-            .build();
-        window.init_layer_shell();
-        window.set_namespace(Some("obsidian-gallery-reorder-test"));
-        window.set_layer(Layer::Overlay);
-        window.set_exclusive_zone(-1);
-        window.set_anchor(Edge::Left, true);
-        window.set_anchor(Edge::Top, true);
-        window.set_margin(Edge::Left, 100);
-        window.set_margin(Edge::Top, 100);
-        window.present();
-        pump(350);
-        page.scroller.vadjustment().set_value(900.0);
-        pump(300);
-        let scroll = page.scroller.vadjustment().value();
-        let bounds = |index: usize| {
-            page.live_wallpaper_cards.borrow()[&paths[index]]
-                .upgrade()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .compute_bounds(&window)
-                .unwrap()
-        };
-        let source = bounds(40);
-        let target = bounds(33);
-        let original_cards = paths[33..42]
-            .iter()
-            .map(|path| {
-                let card = page.live_wallpaper_cards.borrow()[path].upgrade().unwrap();
-                (path.clone(), card.clone(), card.child())
-            })
-            .collect::<Vec<_>>();
-        let untouched_row = page.model.item(0).unwrap();
-        let changed_rows = Rc::new(RefCell::new(Vec::new()));
-        let changes = Rc::clone(&changed_rows);
-        page.model
-            .connect_items_changed(move |_, position, removed, added| {
-                changes.borrow_mut().push((position, removed, added));
-            });
-        drag_pointer(
-            (
-                100.0 + source.x() + source.width() / 2.0,
-                100.0 + source.y() + source.height() / 2.0,
-            ),
-            (
-                100.0 + target.x() + target.width() / 2.0,
-                100.0 + target.y() + target.height() / 2.0,
-            ),
-        );
-        let expected = crate::widgets::reorder::move_item(&paths, &paths[40], 33).unwrap();
-        assert_eq!(gallery_paths(&page.model), expected);
-        assert_eq!(
-            page.model.item(0).unwrap(),
-            untouched_row,
-            "unaffected rows must stay intact"
-        );
-        assert_eq!(
-            *changed_rows.borrow(),
-            [(11, 3, 3)],
-            "only the moved range must be rebound"
-        );
-        for (path, original, picture) in original_cards {
-            let current = page.live_wallpaper_cards.borrow()[&path].upgrade().unwrap();
-            assert_eq!(current, original, "reordering must retain card widgets");
-            assert_eq!(
-                current.child(),
-                picture,
-                "reordering must retain loaded thumbnails"
-            );
-            assert!(
-                !current
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .has_css_class("wallpaper-grid-row-enter")
-            );
-        }
-        assert_eq!(
-            *saved.borrow(),
-            expected
-                .iter()
-                .map(|path| wallpaper_key(path))
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            (page.scroller.vadjustment().value() - scroll).abs() < 2.0,
-            "reordering must preserve scroll"
-        );
-        assert_eq!(*page.active_wallpaper.borrow(), Some(paths[0].clone()));
-        assert!(
-            !controller.applying.get(),
-            "drop must not apply a wallpaper"
-        );
-        capture_if_requested(&window, "gallery-reordered-scrolled");
-        let source = bounds(40);
-        let viewport = page.scroller.compute_bounds(&window).unwrap();
-        let weak_window = window.downgrade();
-        glib::timeout_add_local_once(Duration::from_millis(2000), move || {
-            if let Some(window) = weak_window.upgrade() {
-                capture_if_requested(&window, "gallery-drag-wheel");
-            }
-        });
-        drag_pointer_with_wheel(
-            (
-                100.0 + source.x() + source.width() / 2.0,
-                100.0 + source.y() + source.height() / 2.0,
-            ),
-            (
-                100.0 + viewport.x() + viewport.width() / 2.0,
-                100.0 + viewport.y() + viewport.height() / 2.0,
-            ),
-            -12,
-        );
-        assert!(
-            page.scroller.vadjustment().value() > scroll + 700.0,
-            "wheel must scroll far enough to recycle the source row: {} from {scroll}",
-            page.scroller.vadjustment().value()
-        );
-        let moved_index = gallery_paths(&page.model)
-            .iter()
-            .position(|path| path == &paths[40])
-            .unwrap();
-        assert!(
-            moved_index > 60,
-            "the drop must follow the newly scrolled destination, got {moved_index}"
-        );
-        assert!(!controller.applying.get());
-        // Move the last card all the way to the first row. Keep only weak
-        // references: a strong test reference would conceal premature disposal.
-        let adjustment = page.scroller.vadjustment();
-        adjustment.set_value(adjustment.upper() - adjustment.page_size());
-        pump(300);
-        let last_path = paths.last().unwrap();
-        let (original_card, original_picture) = {
-            let visual = page.live_wallpaper_cards.borrow()[last_path]
-                .upgrade()
-                .unwrap();
-            let texture = gdk::MemoryTexture::new(
-                1,
-                1,
-                gdk::MemoryFormat::R8g8b8,
-                &glib::Bytes::from_owned([231u8, 101, 77]),
-                3,
-            );
-            let picture = gtk::Picture::for_paintable(&texture);
-            picture.set_size_request(CARD_WIDTH, CARD_HEIGHT);
-            visual
-                .child()
-                .and_downcast::<gtk::Button>()
-                .unwrap()
-                .child()
-                .and_downcast::<gtk::Overlay>()
-                .unwrap()
-                .set_child(Some(&picture));
-            (visual.downgrade(), picture.downgrade())
-        };
-        pump(50);
-        let source = bounds(89);
-        let floating_layer = page
-            .scroller
-            .parent()
-            .unwrap()
-            .downcast::<gtk::Overlay>()
-            .unwrap()
-            .last_child()
-            .unwrap();
-        let missing_frames = Rc::new(Cell::new(0));
-        let gaps = Rc::clone(&missing_frames);
-        let original = original_card.clone();
-        let watch = page.scroller.add_tick_callback(move |scroller, _| {
-            let floating = floating_layer
-                .first_child()
-                .is_some_and(|child| child.is_mapped());
-            let in_grid = original.upgrade().is_some_and(|visual| {
-                visual.is_mapped()
-                    && visual.compute_bounds(scroller).is_some_and(|bounds| {
-                        bounds.y() + bounds.height() / 2.0 >= 0.0
-                            && bounds.y() + bounds.height() / 2.0 < scroller.height() as f32
-                    })
-            });
-            if !floating && !in_grid {
-                gaps.set(gaps.get() + 1);
-            }
-            glib::ControlFlow::Continue
-        });
-        drag_pointer_with_wheel(
-            (
-                100.0 + source.x() + source.width() / 2.0,
-                100.0 + source.y() + source.height() / 2.0,
-            ),
-            (
-                100.0 + viewport.x() + CARD_WIDTH as f32 / 2.0,
-                100.0 + viewport.y() + CARD_HEIGHT as f32 / 2.0,
-            ),
-            32,
-        );
-        watch.remove();
-        assert_eq!(
-            gallery_paths(&page.model).first(),
-            Some(last_path),
-            "last card must reach the first slot; scroll={}",
-            adjustment.value()
-        );
-        assert_eq!(
-            missing_frames.get(),
-            0,
-            "the dragged preview must remain visible through the drop"
-        );
-        let retained = original_card
-            .upgrade()
-            .expect("a long drag must retain its original card");
-        assert_eq!(
-            page.live_wallpaper_cards.borrow()[last_path].upgrade(),
-            Some(retained.clone())
-        );
-        assert_eq!(
-            retained
-                .child()
-                .and_downcast::<gtk::Button>()
-                .unwrap()
-                .child()
-                .and_downcast::<gtk::Overlay>()
-                .unwrap()
-                .child(),
-            original_picture.upgrade().map(|picture| picture.upcast())
-        );
-        window.close();
-        pump(50);
-    }
-}
+#[path = "picker/tests.rs"]
+mod reorder_tests;

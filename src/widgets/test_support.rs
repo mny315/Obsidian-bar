@@ -10,6 +10,19 @@ pub(super) fn pump(ms: u64) {
     }
 }
 
+pub(super) fn widgets_with_class(widget: &gtk::Widget, class: &str) -> Vec<gtk::Widget> {
+    let mut found = Vec::new();
+    if widget.has_css_class(class) {
+        found.push(widget.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        found.extend(widgets_with_class(&current, class));
+        child = current.next_sibling();
+    }
+    found
+}
+
 pub(super) fn drag_pointer(from: (f32, f32), to: (f32, f32)) {
     drag_pointer_with_wheel(from, to, 0);
 }

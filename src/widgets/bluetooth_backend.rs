@@ -14,7 +14,7 @@ use std::{
 use gio::glib;
 use glib::variant::{ObjectPath, ToVariant};
 
-use super::dbus::{object_path, variant_value};
+use super::dbus::{object_path, property_signal_changed, variant_value};
 
 const BLUEZ_SERVICE: &str = "org.bluez";
 const BLUEZ_ROOT_PATH: &str = "/";
@@ -1131,16 +1131,9 @@ fn bluez_signal_affects_snapshot(
         (BLUEZ_OBJECT_MANAGER_INTERFACE, "InterfacesRemoved") => parameters
             .get::<(ObjectPath, Vec<String>)>()
             .is_none_or(|(_, interfaces)| interfaces.iter().any(|name| is_tracked_interface(name))),
-        (DBUS_PROPERTIES_INTERFACE, "PropertiesChanged") => parameters
-            .get::<(String, PropertyMap, Vec<String>)>()
-            .is_none_or(|(interface, changed, invalidated)| {
-                let tracked = tracked_properties(&interface);
-                !tracked.is_empty()
-                    && (changed.keys().any(|name| tracked.contains(&name.as_str()))
-                        || invalidated
-                            .iter()
-                            .any(|name| tracked.contains(&name.as_str())))
-            }),
+        (DBUS_PROPERTIES_INTERFACE, "PropertiesChanged") => {
+            property_signal_changed(parameters, tracked_properties)
+        }
         _ => false,
     }
 }

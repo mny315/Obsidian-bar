@@ -1,3 +1,4 @@
+use super::super::files::{read_u64, sorted_directory_paths};
 use super::*;
 
 #[derive(Clone, Debug, Default)]
@@ -69,9 +70,20 @@ fn parse_client(text: &str) -> Option<Client> {
 #[derive(Default)]
 pub(super) struct IntelSampler {
     previous: HashMap<String, (Instant, HashMap<String, Client>)>,
+    clients: Option<ClientSnapshot>,
+}
+
+struct ClientSnapshot {
+    at: Instant,
+    devices: HashMap<String, HashMap<String, Client>>,
+    denied: bool,
 }
 
 impl IntelSampler {
+    pub(super) fn begin_sample(&mut self) {
+        self.clients = None;
+    }
+
     pub(super) fn pause(&mut self, pci: &str) {
         self.previous.remove(pci);
     }
@@ -88,12 +100,12 @@ impl IntelSampler {
             ..GpuSnapshot::default()
         };
         if request.load || request.memory {
-            let (clients, denied) = read_clients(pci);
-            let now = Instant::now();
-            let mut clients = clients
-                .into_iter()
-                .map(|client| (client.id.clone(), client))
-                .collect::<HashMap<_, _>>();
+            let snapshot = self
+                .clients
+                .get_or_insert_with(|| read_clients(Path::new("/proc")));
+            let mut clients = snapshot.devices.remove(pci).unwrap_or_default();
+            let denied = snapshot.denied;
+            let now = snapshot.at;
             if request.load {
                 data.utilization_percent = self.previous.get(pci).and_then(|(time, previous)| {
                     utilization(previous, &mut clients, now.duration_since(*time))
@@ -148,38 +160,11 @@ impl IntelSampler {
             }
         }
         if request.frequency {
-            let mut paths = vec![card.join("gt_cur_freq_mhz"), card.join("gt_act_freq_mhz")];
-            for root in [card.join("gt"), device.join("gt")] {
-                for gt in sorted_directory_paths(&root) {
-                    paths.push(gt.join("rps_act_freq_mhz"));
-                    paths.push(gt.join("rps_cur_freq_mhz"));
+            match read_frequency(frequency_paths(card, device)) {
+                Ok(value) => data.frequency_mhz = Some(value),
+                Err(state) => {
+                    data.states.insert("frequency", state);
                 }
-            }
-            for tile in sorted_directory_paths(device).into_iter().filter(|path| {
-                path.file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with("tile"))
-            }) {
-                for gt in sorted_directory_paths(&tile).into_iter().filter(|path| {
-                    path.file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with("gt"))
-                }) {
-                    paths.push(gt.join("freq0/act_freq"));
-                    paths.push(gt.join("freq0/cur_freq"));
-                }
-            }
-            let mut state = DataState::Unsupported;
-            for path in paths {
-                match read_value(&path) {
-                    Ok(value) => {
-                        data.frequency_mhz = Some(value);
-                        break;
-                    }
-                    Err(DataState::PermissionDenied) => state = DataState::PermissionDenied,
-                    _ => {}
-                }
-            }
-            if data.frequency_mhz.is_none() {
-                data.states.insert("frequency", state);
             }
         } else {
             data.states.insert("frequency", DataState::Paused);
@@ -189,19 +174,67 @@ impl IntelSampler {
     }
 }
 
+fn frequency_paths<'a>(card: &'a Path, device: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
+    [card.join("gt_cur_freq_mhz"), card.join("gt_act_freq_mhz")]
+        .into_iter()
+        .chain(
+            [card.join("gt"), device.join("gt")]
+                .into_iter()
+                .flat_map(|root| {
+                    sorted_directory_paths(&root)
+                        .into_iter()
+                        .flat_map(|gt| [gt.join("rps_act_freq_mhz"), gt.join("rps_cur_freq_mhz")])
+                }),
+        )
+        // Keep directory walks lazy: i915's direct attributes usually suffice.
+        .chain(
+            std::iter::once(device)
+                .flat_map(sorted_directory_paths)
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"tile"))
+                })
+                .flat_map(|tile| sorted_directory_paths(&tile))
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"gt"))
+                })
+                .flat_map(|gt| [gt.join("freq0/act_freq"), gt.join("freq0/cur_freq")]),
+        )
+}
+
+fn read_frequency(paths: impl IntoIterator<Item = PathBuf>) -> Result<f64, DataState> {
+    let mut state = DataState::Unsupported;
+    for path in paths {
+        match read_value(&path) {
+            Ok(value) => return Ok(value),
+            Err(DataState::PermissionDenied) => state = DataState::PermissionDenied,
+            _ => {}
+        }
+    }
+    Err(state)
+}
+
 // Reading fdinfo does not open a GPU device or create a context. i915 reports
 // engine nanoseconds; xe reports busy/total GPU cycles. Both are documented at
 // https://docs.kernel.org/gpu/drm-usage-stats.html
-fn read_clients(pci: &str) -> (Vec<Client>, bool) {
-    let mut clients = HashMap::new();
+fn read_clients(proc_root: &Path) -> ClientSnapshot {
+    let mut devices = HashMap::<String, HashMap<String, Client>>::new();
     let mut denied = false;
-    for process in sorted_directory_paths(Path::new("/proc")) {
+    for process in fs::read_dir(proc_root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+    {
         if !process
             .file_name()
-            .is_some_and(|name| name.to_string_lossy().chars().all(|c| c.is_ascii_digit()))
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
         {
             continue;
         }
+        let process = process.path();
         let Ok(fds) = fs::read_dir(process.join("fd")) else {
             continue;
         };
@@ -214,10 +247,12 @@ fn read_clients(pci: &str) -> (Vec<Client>, bool) {
             }
             match fs::read_to_string(process.join("fdinfo").join(fd.file_name())) {
                 Ok(text) => {
-                    if let Some(client) = parse_client(&text)
-                        && client.pci == pci
-                    {
-                        clients.entry(client.id.clone()).or_insert(client);
+                    if let Some(client) = parse_client(&text) {
+                        devices
+                            .entry(client.pci.clone())
+                            .or_default()
+                            .entry(client.id.clone())
+                            .or_insert(client);
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => denied = true,
@@ -225,7 +260,11 @@ fn read_clients(pci: &str) -> (Vec<Client>, bool) {
             }
         }
     }
-    (clients.into_values().collect(), denied)
+    ClientSnapshot {
+        at: Instant::now(),
+        devices,
+        denied,
+    }
 }
 
 fn utilization(
@@ -280,6 +319,64 @@ fn utilization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_proc_scan_keeps_clients_separate_per_gpu_and_deduplicates_fds() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("obsidian-intel-clients-{}", std::process::id()));
+        for (pid, fd, pci) in [
+            (101, 3, "0000:00:02.0"),
+            (101, 4, "0000:00:02.0"),
+            (202, 5, "0000:03:00.0"),
+        ] {
+            let process = root.join(pid.to_string());
+            fs::create_dir_all(process.join("fd")).unwrap();
+            fs::create_dir_all(process.join("fdinfo")).unwrap();
+            symlink(
+                "/dev/dri/renderD128",
+                process.join("fd").join(fd.to_string()),
+            )
+            .unwrap();
+            fs::write(process.join("fdinfo").join(fd.to_string()), format!(
+                "drm-driver: i915\ndrm-client-id: 7\ndrm-pdev: {pci}\ndrm-resident-system: 2 MiB\n"
+            )).unwrap();
+        }
+        let snapshot = read_clients(&root);
+        assert!(!snapshot.denied);
+        assert_eq!(snapshot.devices.len(), 2);
+        for pci in ["0000:00:02.0", "0000:03:00.0"] {
+            assert_eq!(snapshot.devices[pci].len(), 1);
+            assert_eq!(snapshot.devices[pci]["7"].memory, Some(2 * 1024 * 1024));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn frequency_fallbacks_are_lazy_and_cover_i915_and_xe_paths() {
+        let root =
+            std::env::temp_dir().join(format!("obsidian-intel-frequency-{}", std::process::id()));
+        let card = root.join("card");
+        let device = root.join("device");
+        fs::create_dir_all(&card).unwrap();
+        fs::create_dir_all(device.join("tile0/gt0/freq0")).unwrap();
+        fs::write(card.join("gt_cur_freq_mhz"), "850\n").unwrap();
+        assert_eq!(
+            read_frequency(
+                std::iter::once(card.join("gt_cur_freq_mhz"))
+                    .chain(std::iter::once_with(|| panic!("unneeded fallback read")))
+            ),
+            Ok(850.0)
+        );
+        fs::write(card.join("gt_cur_freq_mhz"), "not available\n").unwrap();
+        fs::write(device.join("tile0/gt0/freq0/act_freq"), "1250\n").unwrap();
+        assert_eq!(read_frequency(frequency_paths(&card, &device)), Ok(1250.0));
+        fs::remove_file(device.join("tile0/gt0/freq0/act_freq")).unwrap();
+        fs::create_dir_all(card.join("gt/gt0")).unwrap();
+        fs::write(card.join("gt/gt0/rps_cur_freq_mhz"), "950\n").unwrap();
+        assert_eq!(read_frequency(frequency_paths(&card, &device)), Ok(950.0));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn i915_and_xe_use_their_own_counter_units() {

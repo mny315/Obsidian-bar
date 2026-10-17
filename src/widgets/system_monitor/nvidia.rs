@@ -9,10 +9,10 @@ use std::{
 
 use libloading::Library;
 
+use super::files::read_trimmed;
 use super::{
     GpuSnapshot,
     gpu::{DataState, GpuRequest},
-    read_trimmed,
 };
 
 type Device = *mut c_void;
@@ -299,7 +299,7 @@ mod tests {
     #[ignore = "requires access to an active NVIDIA GPU"]
     fn active_nvidia_reports_metrics_and_releases_the_session() {
         let enabled = AtomicBool::new(true);
-        let device = super::super::sorted_directory_paths(Path::new("/sys/class/drm"))
+        let device = super::super::files::sorted_directory_paths(Path::new("/sys/class/drm"))
             .into_iter()
             .map(|card| card.join("device"))
             .find(|device| super::super::device_is_nvidia(device) && can_sample(device, &enabled))

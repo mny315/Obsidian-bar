@@ -1,5 +1,5 @@
 //! Peripheral batteries. Slow receiver queries run away from the monitor sampler.
-use super::sampler::{battery_capacity, read_trimmed, sorted_directory_paths};
+use super::files::{read_trimmed, sorted_directory_paths};
 use gio::glib::{
     self,
     variant::{FromVariant, ObjectPath, ToVariant},
@@ -12,6 +12,10 @@ use std::{
 };
 
 mod hid;
+mod system;
+#[cfg(test)]
+pub(super) use system::read_battery_snapshot_at;
+pub(super) use system::{battery_capacity, read_battery_snapshot};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PowerOffTarget {
