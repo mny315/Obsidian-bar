@@ -375,9 +375,8 @@ fn power_off_button(target: PowerOffTarget, name: &str) -> gtk::Button {
     let button = gtk::Button::from_icon_name("system-shutdown-symbolic");
     button.add_css_class("system-monitor-device-power");
     button.set_valign(gtk::Align::Center);
-    let tooltip = format!("Turn off {name}");
-    button.set_tooltip_text(Some(&tooltip));
-    button.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
+    let label = format!("Turn off {name}");
+    button.update_property(&[gtk::accessible::Property::Label(&label)]);
     button.connect_clicked(move |button| {
         if !button.is_sensitive() {
             return;
@@ -385,10 +384,8 @@ fn power_off_button(target: PowerOffTarget, name: &str) -> gtk::Button {
         button.set_sensitive(false);
         button.remove_css_class("error");
         button.set_icon_name("content-loading-symbolic");
-        button.set_tooltip_text(Some("Sending power-off command…"));
         let weak = button.downgrade();
         let target = target.clone();
-        let tooltip = tooltip.clone();
         run_background(
             move || target.turn_off(),
             move |result| {
@@ -398,7 +395,6 @@ fn power_off_button(target: PowerOffTarget, name: &str) -> gtk::Button {
                 match result {
                     Ok(()) => {
                         button.set_icon_name("emblem-ok-symbolic");
-                        button.set_tooltip_text(Some("Power-off command sent"));
                         // A successful USB transfer is not a wireless acknowledgement.
                         // Let the next battery poll remove the row; allow retry if
                         // it stays visible (or the controller is switched on again).
@@ -407,7 +403,6 @@ fn power_off_button(target: PowerOffTarget, name: &str) -> gtk::Button {
                             move || {
                                 if let Some(button) = weak.upgrade() {
                                     button.set_icon_name("system-shutdown-symbolic");
-                                    button.set_tooltip_text(Some(&tooltip));
                                     button.set_sensitive(true);
                                 }
                             },
@@ -417,9 +412,6 @@ fn power_off_button(target: PowerOffTarget, name: &str) -> gtk::Button {
                         tracing::warn!(%error, "device power-off failed");
                         button.set_icon_name("dialog-warning-symbolic");
                         button.add_css_class("error");
-                        button.set_tooltip_text(Some(&format!(
-                            "Could not turn off device: {error}. Click to retry."
-                        )));
                         button.set_sensitive(true);
                     }
                 }

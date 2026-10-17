@@ -159,12 +159,13 @@ separator.system-monitor-divider {
 }
 
 button.system-monitor-device-power {
-  min-width: 1.45em;
-  min-height: 1.45em;
+  min-width: 1.1em;
+  min-height: 1.1em;
+  -gtk-icon-size: 1em;
   padding: 0;
-  margin-left: 0.36em;
+  margin-left: 0.27em;
   border: none;
-  border-radius: 0.36em;
+  border-radius: 0.27em;
   background: transparent;
   color: @fg;
   box-shadow: none;

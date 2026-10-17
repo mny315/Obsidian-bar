@@ -132,10 +132,8 @@ fn peripheral_battery_labels_fit_narrow_panel() {
                 button_bounds.x() + button_bounds.width() <= value_bounds.x(),
                 "button {button_bounds:?} overlaps battery value {value_bounds:?}"
             );
-            assert_eq!(
-                button.tooltip_text().as_deref(),
-                Some("Turn off Steam Controller")
-            );
+            assert!(button.tooltip_text().is_none());
+            assert!(!button.has_tooltip());
             assert!(!button.can_target());
             let motions = label.observe_controllers();
             for index in 0..motions.n_items() {
@@ -173,6 +171,8 @@ fn peripheral_battery_labels_fit_narrow_panel() {
     let button = power_button.unwrap();
     button.emit_clicked();
     assert!(!button.is_sensitive());
+    assert!(button.tooltip_text().is_none());
+    assert!(!button.has_tooltip());
     button.emit_clicked();
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while !button.is_sensitive() && std::time::Instant::now() < deadline {
@@ -180,12 +180,8 @@ fn peripheral_battery_labels_fit_narrow_panel() {
     }
     assert!(button.is_sensitive());
     assert!(button.has_css_class("error"));
-    assert!(
-        button
-            .tooltip_text()
-            .unwrap()
-            .contains("receiver unavailable")
-    );
+    assert!(button.tooltip_text().is_none());
+    assert!(!button.has_tooltip());
     let mut metric = DisplayMetric::new("steam", "Steam Controller", "61%");
     section.update(vec![metric.clone()], None, false);
     assert!(
