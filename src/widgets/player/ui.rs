@@ -834,6 +834,7 @@ mod tests {
                 ),
             );
             controller.state.borrow_mut().players.push(PlayerHandle {
+                process_id: None,
                 bus_name: format!("source-{index}"),
                 player: proxy.clone(),
                 root: proxy,

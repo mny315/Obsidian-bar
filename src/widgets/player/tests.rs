@@ -1,5 +1,69 @@
 use super::*;
 
+#[test]
+fn auto_uses_audio_activity_instead_of_a_stale_playing_flag() {
+    let choices = vec![("chrome".into(), None), ("music".into(), Some(1))];
+    assert_eq!(
+        preferred_audio_source(&choices, Some("chrome"), false, None).as_deref(),
+        Some("music")
+    );
+    assert_eq!(
+        preferred_audio_source(&choices[..1], Some("chrome"), false, None),
+        None
+    );
+}
+
+#[test]
+fn auto_switches_to_new_audio_and_returns_to_still_playing_source() {
+    let choices = vec![
+        ("chrome".into(), Some(1)),
+        ("audio:telegram".into(), Some(2)),
+    ];
+    assert_eq!(
+        preferred_audio_source(&choices, Some("chrome"), false, None).as_deref(),
+        Some("audio:telegram")
+    );
+    assert_eq!(
+        preferred_audio_source(&choices[..1], Some("audio:telegram"), false, None).as_deref(),
+        Some("chrome")
+    );
+    let stopped = vec![("chrome".into(), None)];
+    assert_eq!(
+        preferred_audio_source(&stopped, Some("audio:telegram"), false, None),
+        None
+    );
+}
+
+#[test]
+fn explicit_pause_can_resume_but_does_not_override_audible_audio() {
+    let choices = vec![("paused".into(), None), ("active".into(), Some(2))];
+    assert_eq!(
+        preferred_audio_source(&choices[..1], Some("paused"), false, Some("paused")).as_deref(),
+        Some("paused")
+    );
+    assert_eq!(
+        preferred_audio_source(&choices, Some("paused"), false, Some("paused")).as_deref(),
+        Some("active")
+    );
+    assert_eq!(
+        preferred_audio_source(&choices, Some("paused"), true, None).as_deref(),
+        Some("paused")
+    );
+}
+
+#[test]
+fn audio_source_pin_disappears_when_the_stream_is_removed() {
+    let choices = vec![("music".into(), Some(4))];
+    assert_eq!(
+        preferred_audio_source(&choices, Some("audio:gone"), true, None).as_deref(),
+        Some("music")
+    );
+    assert_eq!(
+        preferred_audio_source(&[], Some("audio:gone"), true, None),
+        None
+    );
+}
+
 fn source(status: PlaybackStatus, selectable: bool) -> PlayerSourceState {
     PlayerSourceState { status, selectable }
 }
@@ -163,6 +227,10 @@ fn repeated_property_signals_queue_one_update_and_keep_the_latest_metadata() {
                 active_bus: None,
                 pinned: false,
                 views: Vec::new(),
+                audio: None,
+                audio_started: HashMap::new(),
+                audio_sequence: 0,
+                resume_bus: RefCell::new(None),
             };
             let emit = |proxy: &gio::DBusProxy, key: &str, value: glib::Variant| {
                 proxy.set_cached_property(key, Some(&value));
@@ -264,4 +332,105 @@ fn discovery_recovers_from_a_transient_list_names_failure() {
         matches!(event, PlayerEvent::Discovered(names) if names == ["org.mpris.MediaPlayer2.Fixture"])
     );
     bus.unregister_object(registration).unwrap();
+}
+
+#[test]
+#[ignore = "requires session D-Bus; uses only an isolated fixture player"]
+fn audio_activity_drives_selection_and_transport_commands() {
+    let context = glib::MainContext::new();
+    context.with_thread_default(|| {
+        let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).unwrap();
+        let xml = gio::DBusNodeInfo::for_xml(
+            "<node><interface name='org.mpris.MediaPlayer2.Player'><method name='Pause'/><method name='Play'/><method name='PlayPause'/></interface></node>",
+        ).unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let recorded = calls.clone();
+        let registration = bus.register_object(MPRIS_PATH, &xml.lookup_interface(MPRIS_PLAYER_INTERFACE).unwrap())
+            .method_call(move |_, _, _, _, method, _, invocation| {
+                recorded.borrow_mut().push(method.to_owned());
+                invocation.return_value(None);
+            }).build().unwrap();
+        let (events, _) = async_channel::unbounded();
+        let make_handle = |name: &str, pid| {
+            let proxy = |interface| gio::DBusProxy::new_sync(&bus,
+                gio::DBusProxyFlags::DO_NOT_LOAD_PROPERTIES | gio::DBusProxyFlags::DO_NOT_CONNECT_SIGNALS,
+                None, bus.unique_name().as_deref(), MPRIS_PATH, interface, gio::Cancellable::NONE).unwrap();
+            let player = proxy(MPRIS_PLAYER_INTERFACE);
+            for key in ["CanControl", "CanPlay", "CanPause"] {
+                player.set_cached_property(key, Some(&true.to_variant()));
+            }
+            player.set_cached_property("PlaybackStatus", Some(&"Playing".to_variant()));
+            let root = proxy(MPRIS_ROOT_INTERFACE);
+            root.set_cached_property("Identity", Some(&name.to_variant()));
+            let mut handle = PlayerHandle::from_proxies(name.into(), player, root, &events).unwrap();
+            handle.process_id = Some(pid);
+            handle
+        };
+        let browser = make_handle("browser", 1001);
+        let browser_proxy = browser.player.clone();
+        let music = make_handle("music", 1002);
+        let mut state = PlayerState {
+            events, players: vec![browser, music], pending_players: HashMap::new(),
+            next_request_id: 0, source_states: HashMap::new(), active_bus: None,
+            pinned: false, views: Vec::new(), audio: None, audio_started: HashMap::new(),
+            audio_sequence: 0, resume_bus: RefCell::new(None),
+        };
+        let audio = |name: &str, pid| AudioSource {
+            key: format!("audio:{pid}"), name: name.into(), app_id: String::new(),
+            binary: String::new(), process_ids: vec![pid],
+        };
+        let browser_audio = audio("browser", 1001);
+        let telegram_audio = audio("Telegram", 2000);
+        state.audio_changed(Some(vec![]));
+        assert!(state.current_view().is_none(), "stale Playing alone must not show a source");
+        state.audio_changed(Some(vec![browser_audio.clone()]));
+        assert_eq!(state.active_bus.as_deref(), Some("browser"));
+        state.audio_changed(Some(vec![browser_audio.clone(), telegram_audio]));
+        let view = state.current_view().unwrap();
+        assert_eq!(view.metadata, "Telegram");
+        assert!(!view.can_play_pause, "audio-only apps must not control another player");
+        state.player_properties_changed("browser");
+        assert_eq!(state.active_bus.as_deref(), Some("audio:2000"));
+        state.audio_changed(Some(vec![browser_audio]));
+        assert_eq!(state.active_bus.as_deref(), Some("browser"));
+
+        let expect_call = |method: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while calls.borrow().is_empty() {
+                context.iteration(false);
+                assert!(std::time::Instant::now() < deadline, "missing {method} call");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(calls.borrow_mut().remove(0), method);
+        };
+        state.call_active(PlayerAction::PlayPause);
+        expect_call("Pause");
+        // A pause acknowledgement can arrive before PipeWire drains its stream.
+        browser_proxy.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
+        state.player_properties_changed("browser");
+        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Paused);
+        state.audio_changed(Some(vec![]));
+        assert_eq!(state.active_bus.as_deref(), Some("browser"));
+        state.call_active(PlayerAction::PlayPause);
+        expect_call("Play");
+        // Even a stale Playing flag must not turn resume into another Pause.
+        browser_proxy.set_cached_property("PlaybackStatus", Some(&"Playing".to_variant()));
+        state.player_properties_changed("browser");
+        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Paused);
+
+        state.select_source(Some("browser"));
+        state.audio_changed(Some(vec![audio("music", 1002)]));
+        assert_eq!(state.active_bus.as_deref(), Some("browser"));
+        state.call_active(PlayerAction::PlayPause);
+        expect_call("PlayPause");
+        state.select_source(None);
+        assert_eq!(state.active_bus.as_deref(), Some("music"));
+        state.audio_changed(Some(vec![]));
+        assert!(state.current_view().is_none());
+        state.audio_changed(None);
+        assert!(state.current_view().is_some(), "monitor failure must retain MPRIS fallback");
+        bus.unregister_object(registration).unwrap();
+        // Drain asynchronous replies before dropping this thread's main context.
+        while context.pending() { context.iteration(false); }
+    }).unwrap();
 }

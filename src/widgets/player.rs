@@ -11,7 +11,9 @@ use gio::prelude::*;
 use gtk::glib;
 use tracing::{debug, warn};
 
+mod audio;
 mod ui;
+use audio::{AudioMonitor, AudioSource};
 pub use ui::PlayerIndicator;
 use ui::PlayerUi;
 
@@ -38,6 +40,7 @@ struct PlayerHandle {
     bus_name: String,
     player: gio::DBusProxy,
     root: gio::DBusProxy,
+    process_id: Option<u32>,
 }
 
 impl PlayerHandle {
@@ -103,6 +106,7 @@ impl PlayerHandle {
             bus_name,
             player,
             root,
+            process_id: None,
         })
     }
 
@@ -245,7 +249,39 @@ fn preferred_source<'a>(
         .map(|(bus, _)| *bus)
 }
 
+fn preferred_audio_source(
+    choices: &[(String, Option<u64>)],
+    current: Option<&str>,
+    pinned: bool,
+    resume: Option<&str>,
+) -> Option<String> {
+    if pinned
+        && let Some((bus, _)) = choices
+            .iter()
+            .find(|(bus, _)| Some(bus.as_str()) == current)
+    {
+        return Some(bus.clone());
+    }
+    choices
+        .iter()
+        .filter(|(_, rank)| rank.is_some())
+        .max_by_key(|(bus, rank)| (*rank, Some(bus.as_str()) == current))
+        .map(|(bus, _)| bus.clone())
+        .or_else(|| {
+            choices
+                .iter()
+                .find(|(bus, _)| Some(bus.as_str()) == resume)
+                .map(|(bus, _)| bus.clone())
+        })
+}
+
 enum PlayerEvent {
+    AudioChanged(Option<Vec<AudioSource>>),
+    ProcessReady {
+        bus_name: String,
+        owner: String,
+        pid: u32,
+    },
     Discovered(Vec<String>),
     OwnerChanged {
         bus_name: String,
@@ -324,11 +360,29 @@ struct PlayerState {
     active_bus: Option<String>,
     pinned: bool,
     views: Vec<Weak<PlayerUi>>,
+    audio: Option<Vec<AudioSource>>,
+    audio_started: HashMap<String, u64>,
+    audio_sequence: u64,
+    resume_bus: RefCell<Option<String>>,
 }
 
 impl PlayerState {
     fn handle_event(&mut self, event: PlayerEvent) {
         match event {
+            PlayerEvent::AudioChanged(audio) => self.audio_changed(audio),
+            PlayerEvent::ProcessReady {
+                bus_name,
+                owner,
+                pid,
+            } => {
+                if let Some(player) = self.players.iter_mut().find(|p| {
+                    p.bus_name == bus_name
+                        && p.player.name_owner().as_deref() == Some(owner.as_str())
+                }) {
+                    player.process_id = Some(pid);
+                    self.refresh_views();
+                }
+            }
             PlayerEvent::Discovered(names) => self.add_discovered_players(names),
             PlayerEvent::OwnerChanged {
                 bus_name,
@@ -371,6 +425,9 @@ impl PlayerState {
     }
 
     fn owner_changed(&mut self, bus_name: &str, has_owner: bool) {
+        if self.resume_bus.borrow().as_deref() == Some(bus_name) {
+            self.resume_bus.borrow_mut().take();
+        }
         self.players.retain(|player| player.bus_name != bus_name);
         self.source_states.remove(bus_name);
         // A replacement owner can arrive while the previous proxy is still
@@ -498,8 +555,9 @@ impl PlayerState {
         };
 
         let state = player.source_state();
-        let started_playing = became_playing(None, state);
+        let started_playing = self.audio.is_none() && became_playing(None, state);
         self.source_states.insert(bus_name.clone(), state);
+        self.resolve_process_id(&player);
         self.players.push(player);
         self.players
             .sort_by(|left, right| left.bus_name.cmp(&right.bus_name));
@@ -522,7 +580,7 @@ impl PlayerState {
         let previous = self.source_states.insert(bus_name.to_owned(), current);
         let started_playing = became_playing(previous, current);
 
-        if started_playing && !self.pinned {
+        if started_playing && !self.pinned && self.audio.is_none() {
             self.active_bus = Some(bus_name.to_owned());
         }
 
@@ -572,26 +630,95 @@ impl PlayerState {
 
     fn current_view(&self) -> Option<PlayerView> {
         let active_bus = self.active_bus.as_deref()?;
-        let source_count = self
+        let source_count = self.players.iter().filter(|p| p.is_selectable()).count()
+            + self.uncontrolled_audio().len();
+        if let Some(player) = self
             .players
             .iter()
-            .filter(|player| player.is_selectable())
-            .count();
-        self.players
-            .iter()
             .find(|player| player.bus_name == active_bus && player.is_selectable())
-            .map(|player| player.view(source_count, !self.pinned))
+        {
+            let mut view = player.view(source_count, !self.pinned);
+            view.status = self.effective_status(player);
+            view.can_play_pause = player.capabilities(view.status).play_pause;
+            return Some(view);
+        }
+        self.uncontrolled_audio()
+            .into_iter()
+            .find(|source| source.key == active_bus)
+            .map(|source| PlayerView {
+                bus_name: source.key.clone(),
+                automatic: !self.pinned,
+                status: PlaybackStatus::Playing,
+                source_count,
+                can_previous: false,
+                can_play_pause: false,
+                can_next: false,
+                can_raise: false,
+                metadata: source.name.clone(),
+                display_metadata: truncate_text(&source.name, META_CHAR_LIMIT),
+            })
     }
 
     fn source_views(&self) -> Vec<PlayerSourceView> {
-        self.players
+        let mut sources: Vec<_> = self
+            .players
             .iter()
             .filter(|player| player.is_selectable())
-            .map(PlayerHandle::source_view)
-            .collect()
+            .map(|player| {
+                let mut view = player.source_view();
+                view.status = self.effective_status(player);
+                view.can_play_pause = player.capabilities(view.status).play_pause;
+                view
+            })
+            .collect();
+        sources.extend(
+            self.uncontrolled_audio()
+                .into_iter()
+                .map(|source| PlayerSourceView {
+                    bus_name: source.key.clone(),
+                    identity: source.name.clone(),
+                    metadata: source.name.clone(),
+                    status: PlaybackStatus::Playing,
+                    can_play_pause: false,
+                    can_previous: false,
+                    can_next: false,
+                }),
+        );
+        sources
     }
 
     fn ensure_active_bus(&mut self) {
+        if self.audio.is_some() {
+            let mut choices: Vec<_> = self
+                .players
+                .iter()
+                .filter(|p| p.is_selectable())
+                .map(|player| {
+                    let rank = self.audio_rank(player);
+                    (player.bus_name.clone(), rank)
+                })
+                .collect();
+            choices.extend(self.uncontrolled_audio().into_iter().map(|source| {
+                (
+                    source.key.clone(),
+                    self.audio_started.get(&source.key).copied(),
+                )
+            }));
+            let next = preferred_audio_source(
+                &choices,
+                self.active_bus.as_deref(),
+                self.pinned,
+                self.resume_bus.borrow().as_deref(),
+            );
+            if self.pinned && next != self.active_bus {
+                self.pinned = false;
+            }
+            if next != self.active_bus {
+                debug!(source = ?next, "automatic media source follows audio activity");
+            }
+            self.active_bus = next;
+            return;
+        }
         let sources = self
             .players
             .iter()
@@ -609,9 +736,9 @@ impl PlayerState {
     fn select_source(&mut self, bus_name: Option<&str>) {
         if let Some(bus_name) = bus_name {
             if !self
-                .players
+                .source_views()
                 .iter()
-                .any(|player| player.bus_name == bus_name && player.is_selectable())
+                .any(|source| source.bus_name == bus_name)
             {
                 return;
             }
@@ -622,11 +749,7 @@ impl PlayerState {
     }
 
     fn cycle_source(&mut self) {
-        let sources = self
-            .players
-            .iter()
-            .filter(|player| player.is_selectable())
-            .collect::<Vec<_>>();
+        let sources = self.source_views();
         if sources.is_empty() {
             return;
         }
@@ -663,7 +786,8 @@ impl PlayerState {
             return;
         };
 
-        let capabilities = player.capabilities(player.playback_status());
+        let status = self.effective_status(player);
+        let capabilities = player.capabilities(status);
         let allowed = match action {
             PlayerAction::Previous => capabilities.previous,
             PlayerAction::PlayPause => capabilities.play_pause,
@@ -681,7 +805,17 @@ impl PlayerState {
             }
         };
         let bus_name = player.bus_name.clone();
-        let method = action.method();
+        let method =
+            if matches!(action, PlayerAction::PlayPause) && self.audio.is_some() && !self.pinned {
+                self.resume_bus.replace(Some(bus_name.clone()));
+                if status == PlaybackStatus::Playing {
+                    "Pause"
+                } else {
+                    "Play"
+                }
+            } else {
+                action.method()
+            };
 
         proxy.call(
             method,
@@ -696,6 +830,109 @@ impl PlayerState {
             },
         );
     }
+
+    fn resolve_process_id(&self, player: &PlayerHandle) {
+        let Some(owner) = player.player.name_owner() else {
+            return;
+        };
+        let owner = owner.to_string();
+        let bus_name = player.bus_name.clone();
+        let events = self.events.clone();
+        player.player.connection().call(
+            Some(DBUS_NAME),
+            DBUS_PATH,
+            DBUS_NAME,
+            "GetConnectionUnixProcessID",
+            Some(&(owner.as_str(),).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            DBUS_TIMEOUT_MS,
+            gio::Cancellable::NONE,
+            move |reply| {
+                if let Ok(reply) = reply
+                    && let Some((pid,)) = reply.get::<(u32,)>()
+                {
+                    enqueue_player_event(
+                        &events,
+                        PlayerEvent::ProcessReady {
+                            bus_name,
+                            owner,
+                            pid,
+                        },
+                    );
+                }
+            },
+        );
+    }
+
+    fn matches_audio(player: &PlayerHandle, source: &AudioSource) -> bool {
+        let desktop = property_string(&player.root, "DesktopEntry").unwrap_or_default();
+        source.matches(player.process_id, &[&player.identity(), &desktop])
+    }
+
+    fn audio_rank(&self, player: &PlayerHandle) -> Option<u64> {
+        self.audio
+            .as_ref()?
+            .iter()
+            .filter(|source| Self::matches_audio(player, source))
+            .filter_map(|source| self.audio_started.get(&source.key).copied())
+            .max()
+    }
+
+    fn effective_status(&self, player: &PlayerHandle) -> PlaybackStatus {
+        if self.audio.is_none() || self.pinned {
+            return player.playback_status();
+        }
+        // Acknowledged pauses can precede PipeWire's drained/idle event. Keep
+        // the resume button usable during that interval, but only for an
+        // explicit command from this bar, not arbitrary stale MPRIS status.
+        if self.resume_bus.borrow().as_deref() == Some(player.bus_name.as_str())
+            && player.playback_status() == PlaybackStatus::Paused
+        {
+            return PlaybackStatus::Paused;
+        }
+        if self.audio_rank(player).is_some() {
+            PlaybackStatus::Playing
+        } else {
+            PlaybackStatus::Paused
+        }
+    }
+
+    fn uncontrolled_audio(&self) -> Vec<&AudioSource> {
+        self.audio
+            .iter()
+            .flatten()
+            .filter(|source| {
+                !self
+                    .players
+                    .iter()
+                    .any(|player| player.is_selectable() && Self::matches_audio(player, source))
+            })
+            .collect()
+    }
+
+    fn audio_changed(&mut self, audio: Option<Vec<AudioSource>>) {
+        if let Some(active) = &audio {
+            for source in active {
+                let was_active = self
+                    .audio
+                    .as_ref()
+                    .is_some_and(|old| old.iter().any(|s| s.key == source.key));
+                if !was_active {
+                    self.audio_sequence = self.audio_sequence.saturating_add(1);
+                    self.audio_started
+                        .insert(source.key.clone(), self.audio_sequence);
+                    // A newly audible application supersedes an older paused
+                    // resume target, even if it has no MPRIS controls.
+                    self.resume_bus.borrow_mut().take();
+                }
+            }
+            self.audio_started
+                .retain(|key, _| active.iter().any(|source| &source.key == key));
+        }
+        self.audio = audio;
+        self.refresh_views();
+    }
 }
 
 pub struct PlayerController {
@@ -703,6 +940,7 @@ pub struct PlayerController {
     manager_init_pending: Rc<Cell<bool>>,
     manager_retry_attempt: Rc<Cell<u32>>,
     state: Rc<RefCell<PlayerState>>,
+    audio_monitor: RefCell<Option<AudioMonitor>>,
 }
 
 impl PlayerController {
@@ -719,6 +957,10 @@ impl PlayerController {
             active_bus: None,
             pinned: false,
             views: Vec::new(),
+            audio: None,
+            audio_started: HashMap::new(),
+            audio_sequence: 0,
+            resume_bus: RefCell::new(None),
         }));
 
         let weak_state = Rc::downgrade(&state);
@@ -744,10 +986,19 @@ impl PlayerController {
             manager_init_pending,
             manager_retry_attempt,
             state,
+            audio_monitor: RefCell::new(None),
         }
     }
 
     pub fn start(&self) {
+        if self.audio_monitor.borrow().is_none() {
+            match AudioMonitor::start(self.state.borrow().events.clone()) {
+                Ok(monitor) => {
+                    self.audio_monitor.replace(Some(monitor));
+                }
+                Err(error) => warn!(%error, "cannot monitor audio activity; using MPRIS status"),
+            }
+        }
         initialize_player_manager(
             &self.manager,
             &self.state,
