@@ -459,7 +459,8 @@ impl PlayerState {
         let events = self.events.clone();
         gio::DBusProxy::for_bus(
             gio::BusType::Session,
-            gio::DBusProxyFlags::DO_NOT_AUTO_START,
+            gio::DBusProxyFlags::DO_NOT_AUTO_START
+                | gio::DBusProxyFlags::GET_INVALIDATED_PROPERTIES,
             None,
             bus_name,
             MPRIS_PATH,
@@ -501,7 +502,8 @@ impl PlayerState {
                 let ready_events = events;
                 gio::DBusProxy::for_bus(
                     gio::BusType::Session,
-                    gio::DBusProxyFlags::DO_NOT_AUTO_START,
+                    gio::DBusProxyFlags::DO_NOT_AUTO_START
+                        | gio::DBusProxyFlags::GET_INVALIDATED_PROPERTIES,
                     None,
                     &root_bus_name,
                     MPRIS_PATH,
@@ -637,10 +639,7 @@ impl PlayerState {
             .iter()
             .find(|player| player.bus_name == active_bus && player.is_selectable())
         {
-            let mut view = player.view(source_count, !self.pinned);
-            view.status = self.effective_status(player);
-            view.can_play_pause = player.capabilities(view.status).play_pause;
-            return Some(view);
+            return Some(player.view(source_count, !self.pinned));
         }
         self.uncontrolled_audio()
             .into_iter()
@@ -664,12 +663,7 @@ impl PlayerState {
             .players
             .iter()
             .filter(|player| player.is_selectable())
-            .map(|player| {
-                let mut view = player.source_view();
-                view.status = self.effective_status(player);
-                view.can_play_pause = player.capabilities(view.status).play_pause;
-                view
-            })
+            .map(PlayerHandle::source_view)
             .collect();
         sources.extend(
             self.uncontrolled_audio()
@@ -786,7 +780,7 @@ impl PlayerState {
             return;
         };
 
-        let status = self.effective_status(player);
+        let status = player.playback_status();
         let capabilities = player.capabilities(status);
         let allowed = match action {
             PlayerAction::Previous => capabilities.previous,
@@ -805,17 +799,18 @@ impl PlayerState {
             }
         };
         let bus_name = player.bus_name.clone();
-        let method =
-            if matches!(action, PlayerAction::PlayPause) && self.audio.is_some() && !self.pinned {
-                self.resume_bus.replace(Some(bus_name.clone()));
-                if status == PlaybackStatus::Playing {
-                    "Pause"
-                } else {
-                    "Play"
-                }
-            } else {
-                action.method()
-            };
+        if matches!(action, PlayerAction::PlayPause) && self.audio.is_some() && !self.pinned {
+            self.resume_bus.replace(Some(bus_name.clone()));
+        }
+        // Let the source toggle its actual state. Stream activity can lag or
+        // belong to another tab, so it must not choose Play versus Pause.
+        let method = if matches!(action, PlayerAction::PlayPause)
+            && !property_bool(&player.player, "CanPause")
+        {
+            "Play"
+        } else {
+            action.method()
+        };
 
         proxy.call(
             method,
@@ -877,25 +872,6 @@ impl PlayerState {
             .filter(|source| Self::matches_audio(player, source))
             .filter_map(|source| self.audio_started.get(&source.key).copied())
             .max()
-    }
-
-    fn effective_status(&self, player: &PlayerHandle) -> PlaybackStatus {
-        if self.audio.is_none() || self.pinned {
-            return player.playback_status();
-        }
-        // Acknowledged pauses can precede PipeWire's drained/idle event. Keep
-        // the resume button usable during that interval, but only for an
-        // explicit command from this bar, not arbitrary stale MPRIS status.
-        if self.resume_bus.borrow().as_deref() == Some(player.bus_name.as_str())
-            && player.playback_status() == PlaybackStatus::Paused
-        {
-            return PlaybackStatus::Paused;
-        }
-        if self.audio_rank(player).is_some() {
-            PlaybackStatus::Playing
-        } else {
-            PlaybackStatus::Paused
-        }
     }
 
     fn uncontrolled_audio(&self) -> Vec<&AudioSource> {

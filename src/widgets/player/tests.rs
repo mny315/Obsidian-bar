@@ -336,6 +336,165 @@ fn discovery_recovers_from_a_transient_list_names_failure() {
 
 #[test]
 #[ignore = "requires session D-Bus; uses only an isolated fixture player"]
+fn source_signals_and_transport_stay_in_sync_when_audio_activity_lags() {
+    let context = glib::MainContext::new();
+    context
+        .with_thread_default(|| {
+            let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).unwrap();
+            let xml = gio::DBusNodeInfo::for_xml(
+                "<node>
+                    <interface name='org.mpris.MediaPlayer2.Player'>
+                        <method name='PlayPause'/><method name='Play'/><method name='Pause'/>
+                        <property name='PlaybackStatus' type='s' access='read'/>
+                        <property name='CanControl' type='b' access='read'/>
+                        <property name='CanPlay' type='b' access='read'/>
+                        <property name='CanPause' type='b' access='read'/>
+                    </interface>
+                    <interface name='org.mpris.MediaPlayer2'>
+                        <property name='Identity' type='s' access='read'/>
+                    </interface>
+                </node>",
+            )
+            .unwrap();
+            let status = Rc::new(Cell::new("Playing"));
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let emit_status = |bus: &gio::DBusConnection, status: &str, invalidated: bool| {
+                let changed = if invalidated {
+                    HashMap::new()
+                } else {
+                    HashMap::from([("PlaybackStatus", status.to_variant())])
+                };
+                let invalidated = if invalidated {
+                    vec!["PlaybackStatus"]
+                } else {
+                    vec![]
+                };
+                bus.emit_signal(
+                    None,
+                    MPRIS_PATH,
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    Some(&(MPRIS_PLAYER_INTERFACE, changed, invalidated).to_variant()),
+                )
+                .unwrap();
+            };
+            let method_status = status.clone();
+            let property_status = status.clone();
+            let recorded = calls.clone();
+            let player_registration = bus
+                .register_object(
+                    MPRIS_PATH,
+                    &xml.lookup_interface(MPRIS_PLAYER_INTERFACE).unwrap(),
+                )
+                .property(move |_, _, _, _, property| match property {
+                    "PlaybackStatus" => property_status.get().to_variant(),
+                    _ => true.to_variant(),
+                })
+                .method_call(move |bus, _, _, _, method, _, invocation| {
+                    recorded.borrow_mut().push(method.to_owned());
+                    method_status.set(match method {
+                        "Play" => "Playing",
+                        "Pause" => "Paused",
+                        "PlayPause" if method_status.get() == "Playing" => "Paused",
+                        "PlayPause" => "Playing",
+                        _ => unreachable!(),
+                    });
+                    emit_status(&bus, method_status.get(), false);
+                    invocation.return_value(None);
+                })
+                .build()
+                .unwrap();
+            let root_registration = bus
+                .register_object(
+                    MPRIS_PATH,
+                    &xml.lookup_interface(MPRIS_ROOT_INTERFACE).unwrap(),
+                )
+                .property(|_, _, _, _, _| "Fixture".to_variant())
+                .build()
+                .unwrap();
+            let (events, receiver) = async_channel::unbounded();
+            let mut state = PlayerState {
+                events,
+                players: Vec::new(),
+                pending_players: HashMap::new(),
+                next_request_id: 0,
+                source_states: HashMap::new(),
+                active_bus: None,
+                pinned: false,
+                views: Vec::new(),
+                audio: None,
+                audio_started: HashMap::new(),
+                audio_sequence: 0,
+                resume_bus: RefCell::new(None),
+            };
+            let wait_for_status = |state: &mut PlayerState, expected| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    while context.pending() {
+                        context.iteration(false);
+                    }
+                    while let Ok(event) = receiver.try_recv() {
+                        state.handle_event(event);
+                    }
+                    if !state.players.is_empty()
+                        && state
+                            .current_view()
+                            .is_some_and(|view| view.status == expected)
+                    {
+                        assert_eq!(state.source_views()[0].status, expected);
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "missing {expected:?} update"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            state.connect_player(bus.unique_name().unwrap().as_str());
+            state.audio_changed(Some(vec![AudioSource {
+                key: "audio:fixture".into(),
+                name: "Fixture".into(),
+                app_id: String::new(),
+                binary: String::new(),
+                process_ids: Vec::new(),
+            }]));
+            wait_for_status(&mut state, PlaybackStatus::Playing);
+
+            // Pause in the source while its audio stream remains active.
+            status.set("Paused");
+            emit_status(&bus, status.get(), false);
+            wait_for_status(&mut state, PlaybackStatus::Paused);
+            state.call_active(PlayerAction::PlayPause);
+            wait_for_status(&mut state, PlaybackStatus::Playing);
+            assert_eq!(status.get(), "Playing");
+
+            // Stream activity must not turn this pause into an ineffective Play.
+            state.audio_changed(Some(vec![]));
+            assert_eq!(
+                state.current_view().unwrap().status,
+                PlaybackStatus::Playing
+            );
+            state.call_active(PlayerAction::PlayPause);
+            wait_for_status(&mut state, PlaybackStatus::Paused);
+            assert_eq!(status.get(), "Paused");
+            assert_eq!(*calls.borrow(), ["PlayPause", "PlayPause"]);
+
+            // Sources can invalidate a property instead of sending its value.
+            status.set("Playing");
+            emit_status(&bus, status.get(), true);
+            wait_for_status(&mut state, PlaybackStatus::Playing);
+            status.set("Paused");
+            emit_status(&bus, status.get(), true);
+            wait_for_status(&mut state, PlaybackStatus::Paused);
+            bus.unregister_object(player_registration).unwrap();
+            bus.unregister_object(root_registration).unwrap();
+        })
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires session D-Bus; uses only an isolated fixture player"]
 fn audio_activity_drives_selection_and_transport_commands() {
     let context = glib::MainContext::new();
     context.with_thread_default(|| {
@@ -394,6 +553,20 @@ fn audio_activity_drives_selection_and_transport_commands() {
         state.audio_changed(Some(vec![browser_audio]));
         assert_eq!(state.active_bus.as_deref(), Some("browser"));
 
+        // An external pause must reach both views even while the browser keeps
+        // its output stream running. No command from the bar precedes it.
+        browser_proxy.set_cached_property("CanPause", Some(&false.to_variant()));
+        browser_proxy.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
+        state.player_properties_changed("browser");
+        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Paused);
+        assert_eq!(state.source_views()[0].status, PlaybackStatus::Paused);
+        assert!(state.current_view().unwrap().can_play_pause);
+        assert!(state.source_views()[0].can_play_pause);
+        browser_proxy.set_cached_property("CanPause", Some(&true.to_variant()));
+        browser_proxy.set_cached_property("PlaybackStatus", Some(&"Playing".to_variant()));
+        state.player_properties_changed("browser");
+        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Playing);
+
         let expect_call = |method: &str| {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while calls.borrow().is_empty() {
@@ -404,7 +577,7 @@ fn audio_activity_drives_selection_and_transport_commands() {
             assert_eq!(calls.borrow_mut().remove(0), method);
         };
         state.call_active(PlayerAction::PlayPause);
-        expect_call("Pause");
+        expect_call("PlayPause");
         // A pause acknowledgement can arrive before PipeWire drains its stream.
         browser_proxy.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
         state.player_properties_changed("browser");
@@ -412,17 +585,25 @@ fn audio_activity_drives_selection_and_transport_commands() {
         state.audio_changed(Some(vec![]));
         assert_eq!(state.active_bus.as_deref(), Some("browser"));
         state.call_active(PlayerAction::PlayPause);
-        expect_call("Play");
-        // Even a stale Playing flag must not turn resume into another Pause.
+        expect_call("PlayPause");
+        // Playback can resume before PipeWire reports a new active stream.
         browser_proxy.set_cached_property("PlaybackStatus", Some(&"Playing".to_variant()));
         state.player_properties_changed("browser");
-        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Paused);
+        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Playing);
+        assert_eq!(state.source_views()[0].status, PlaybackStatus::Playing);
+        state.call_active(PlayerAction::PlayPause);
+        expect_call("PlayPause");
 
         state.select_source(Some("browser"));
         state.audio_changed(Some(vec![audio("music", 1002)]));
         assert_eq!(state.active_bus.as_deref(), Some("browser"));
         state.call_active(PlayerAction::PlayPause);
         expect_call("PlayPause");
+        browser_proxy.set_cached_property("CanPause", Some(&false.to_variant()));
+        browser_proxy.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
+        state.player_properties_changed("browser");
+        state.call_active(PlayerAction::PlayPause);
+        expect_call("Play");
         state.select_source(None);
         assert_eq!(state.active_bus.as_deref(), Some("music"));
         state.audio_changed(Some(vec![]));
