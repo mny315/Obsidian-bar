@@ -363,6 +363,7 @@ struct PlayerState {
     audio: Option<Vec<AudioSource>>,
     audio_started: HashMap<String, u64>,
     audio_sequence: u64,
+    last_audio_bus: Option<String>,
     resume_bus: RefCell<Option<String>>,
 }
 
@@ -425,6 +426,9 @@ impl PlayerState {
     }
 
     fn owner_changed(&mut self, bus_name: &str, has_owner: bool) {
+        if self.last_audio_bus.as_deref() == Some(bus_name) {
+            self.last_audio_bus = None;
+        }
         if self.resume_bus.borrow().as_deref() == Some(bus_name) {
             self.resume_bus.borrow_mut().take();
         }
@@ -698,12 +702,32 @@ impl PlayerState {
                     self.audio_started.get(&source.key).copied(),
                 )
             }));
-            let next = preferred_audio_source(
-                &choices,
-                self.active_bus.as_deref(),
-                self.pinned,
-                self.resume_bus.borrow().as_deref(),
-            );
+            let next = {
+                // Remember the audible source across stream removal: an
+                // external pause notification can arrive before or after it.
+                let paused = self.last_audio_bus.as_deref().filter(|bus| {
+                    self.players.iter().any(|player| {
+                        player.bus_name == *bus
+                            && player.playback_status() == PlaybackStatus::Paused
+                    })
+                });
+                preferred_audio_source(
+                    &choices,
+                    self.active_bus.as_deref(),
+                    self.pinned,
+                    self.resume_bus.borrow().as_deref().or(paused),
+                )
+            };
+            if let Some((bus, _)) = choices
+                .iter()
+                .find(|(bus, rank)| Some(bus.as_str()) == next.as_deref() && rank.is_some())
+            {
+                self.last_audio_bus = self
+                    .players
+                    .iter()
+                    .any(|player| player.bus_name == *bus)
+                    .then(|| bus.clone());
+            }
             if self.pinned && next != self.active_bus {
                 self.pinned = false;
             }
@@ -900,6 +924,7 @@ impl PlayerState {
                         .insert(source.key.clone(), self.audio_sequence);
                     // A newly audible application supersedes an older paused
                     // resume target, even if it has no MPRIS controls.
+                    self.last_audio_bus = None;
                     self.resume_bus.borrow_mut().take();
                 }
             }
@@ -936,6 +961,7 @@ impl PlayerController {
             audio: None,
             audio_started: HashMap::new(),
             audio_sequence: 0,
+            last_audio_bus: None,
             resume_bus: RefCell::new(None),
         }));
 

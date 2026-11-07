@@ -11,8 +11,10 @@ belong to another browser tab; muted playback can still be playing.
   streams, sinks, corked streams, and idle streams do not select a player.
 - The most recently activated application wins. When it stops, Auto returns to
   an application that still has an active stream. With no active streams the
-  indicator hides, except for a player explicitly paused from the bar, which
-  remains available to resume.
+  last audible player remains available to resume while paused, including pauses
+  made in the source application. This works regardless of whether the pause
+  notification arrives before or after the stream stops. An idle player with
+  only a stale `Playing` flag does not keep the indicator visible.
 - Stream process IDs and their parent processes are matched to the MPRIS D-Bus
   owner's process ID. Application names are a fallback when process information
   is unavailable. This also handles browser audio subprocesses.

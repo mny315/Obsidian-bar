@@ -230,6 +230,7 @@ fn repeated_property_signals_queue_one_update_and_keep_the_latest_metadata() {
                 audio: None,
                 audio_started: HashMap::new(),
                 audio_sequence: 0,
+                last_audio_bus: None,
                 resume_bus: RefCell::new(None),
             };
             let emit = |proxy: &gio::DBusProxy, key: &str, value: glib::Variant| {
@@ -425,6 +426,7 @@ fn source_signals_and_transport_stay_in_sync_when_audio_activity_lags() {
                 audio: None,
                 audio_started: HashMap::new(),
                 audio_sequence: 0,
+                last_audio_bus: None,
                 resume_bus: RefCell::new(None),
             };
             let wait_for_status = |state: &mut PlayerState, expected| {
@@ -452,22 +454,35 @@ fn source_signals_and_transport_stay_in_sync_when_audio_activity_lags() {
                 }
             };
             state.connect_player(bus.unique_name().unwrap().as_str());
-            state.audio_changed(Some(vec![AudioSource {
+            let fixture_audio = AudioSource {
                 key: "audio:fixture".into(),
                 name: "Fixture".into(),
                 app_id: String::new(),
                 binary: String::new(),
                 process_ids: Vec::new(),
-            }]));
+            };
+            state.audio_changed(Some(vec![fixture_audio.clone()]));
             wait_for_status(&mut state, PlaybackStatus::Playing);
 
             // Pause in the source while its audio stream remains active.
             status.set("Paused");
             emit_status(&bus, status.get(), false);
             wait_for_status(&mut state, PlaybackStatus::Paused);
+            state.audio_changed(Some(vec![]));
+            assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Paused);
             state.call_active(PlayerAction::PlayPause);
             wait_for_status(&mut state, PlaybackStatus::Playing);
             assert_eq!(status.get(), "Playing");
+
+            // PipeWire can report silence before the external pause arrives.
+            state.audio_changed(Some(vec![fixture_audio]));
+            assert!(state.resume_bus.borrow().is_none());
+            state.audio_changed(Some(vec![]));
+            status.set("Paused");
+            emit_status(&bus, status.get(), false);
+            wait_for_status(&mut state, PlaybackStatus::Paused);
+            state.call_active(PlayerAction::PlayPause);
+            wait_for_status(&mut state, PlaybackStatus::Playing);
 
             // Stream activity must not turn this pause into an ineffective Play.
             state.audio_changed(Some(vec![]));
@@ -478,7 +493,7 @@ fn source_signals_and_transport_stay_in_sync_when_audio_activity_lags() {
             state.call_active(PlayerAction::PlayPause);
             wait_for_status(&mut state, PlaybackStatus::Paused);
             assert_eq!(status.get(), "Paused");
-            assert_eq!(*calls.borrow(), ["PlayPause", "PlayPause"]);
+            assert_eq!(*calls.borrow(), ["PlayPause", "PlayPause", "PlayPause"]);
 
             // Sources can invalidate a property instead of sending its value.
             status.set("Playing");
@@ -487,6 +502,11 @@ fn source_signals_and_transport_stay_in_sync_when_audio_activity_lags() {
             status.set("Paused");
             emit_status(&bus, status.get(), true);
             wait_for_status(&mut state, PlaybackStatus::Paused);
+            state.owner_changed(bus.unique_name().unwrap().as_str(), false);
+            assert!(
+                state.current_view().is_none(),
+                "a closed source must disappear"
+            );
             bus.unregister_object(player_registration).unwrap();
             bus.unregister_object(root_registration).unwrap();
         })
@@ -528,11 +548,12 @@ fn audio_activity_drives_selection_and_transport_commands() {
         let browser = make_handle("browser", 1001);
         let browser_proxy = browser.player.clone();
         let music = make_handle("music", 1002);
+        let music_proxy = music.player.clone();
         let mut state = PlayerState {
             events, players: vec![browser, music], pending_players: HashMap::new(),
             next_request_id: 0, source_states: HashMap::new(), active_bus: None,
             pinned: false, views: Vec::new(), audio: None, audio_started: HashMap::new(),
-            audio_sequence: 0, resume_bus: RefCell::new(None),
+            audio_sequence: 0, last_audio_bus: None, resume_bus: RefCell::new(None),
         };
         let audio = |name: &str, pid| AudioSource {
             key: format!("audio:{pid}"), name: name.into(), app_id: String::new(),
@@ -608,6 +629,19 @@ fn audio_activity_drives_selection_and_transport_commands() {
         assert_eq!(state.active_bus.as_deref(), Some("music"));
         state.audio_changed(Some(vec![]));
         assert!(state.current_view().is_none());
+        music_proxy.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
+        state.player_properties_changed("music");
+        assert_eq!(state.active_bus.as_deref(), Some("music"));
+        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Paused);
+        music_proxy.set_cached_property("PlaybackStatus", Some(&"Stopped".to_variant()));
+        state.player_properties_changed("music");
+        assert!(state.current_view().is_none(), "a stopped source is not paused");
+        music_proxy.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
+        state.player_properties_changed("music");
+        state.audio_changed(Some(vec![audio("Telegram", 2000)]));
+        assert_eq!(state.current_view().unwrap().metadata, "Telegram");
+        state.audio_changed(Some(vec![]));
+        assert!(state.current_view().is_none(), "new audio supersedes the paused source");
         state.audio_changed(None);
         assert!(state.current_view().is_some(), "monitor failure must retain MPRIS fallback");
         bus.unregister_object(registration).unwrap();
