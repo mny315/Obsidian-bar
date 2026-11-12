@@ -73,39 +73,33 @@ fn empty_state_label(text: &str, xalign: Option<f32>) -> gtk::Label {
     label
 }
 
-fn build_refresh_button(icon_text: &str) -> (gtk::Button, gtk::Label, gtk::Spinner) {
+fn build_refresh_button(icon_text: &str) -> (gtk::Button, gtk::Label) {
     let icon = gtk::Label::new(Some(icon_text));
     icon.add_css_class("network-action-icon");
-
-    let spinner = gtk::Spinner::new();
-    spinner.add_css_class("network-refresh-spinner");
-    spinner.set_halign(gtk::Align::Center);
-    spinner.set_valign(gtk::Align::Center);
-    spinner.set_visible(false);
 
     let indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     indicator.add_css_class("network-refresh-indicator");
     indicator.set_halign(gtk::Align::Center);
     indicator.set_valign(gtk::Align::Center);
     indicator.append(&icon);
-    indicator.append(&spinner);
 
     let button = gtk::Button::new();
     button.add_css_class("network-icon-button");
     button.set_valign(gtk::Align::Center);
     button.set_child(Some(&indicator));
 
-    (button, icon, spinner)
+    (button, icon)
 }
 
-fn set_spinner_active(icon: &gtk::Label, spinner: &gtk::Spinner, active: bool) {
-    icon.set_visible(!active);
-    spinner.set_visible(active);
+fn set_refreshing(icon: &gtk::Label, active: bool) {
+    // Keep the bar's refresh glyph and animate it with our own CSS. GtkSpinner
+    // gets both its artwork and its animation from the desktop's GTK theme.
     if active {
-        spinner.start();
+        icon.add_css_class("refresh-icon-spinning");
     } else {
-        spinner.stop();
+        icon.remove_css_class("refresh-icon-spinning");
     }
+    icon.update_state(&[gtk::accessible::State::Busy(active)]);
 }
 
 fn detach_application_window(window: &gtk::ApplicationWindow) {

@@ -17,7 +17,7 @@ use super::{
     clear_box, detach_application_window, empty_state_label,
     network_backend::{NetworkBackend, VlessState, WifiNetwork, WifiSnapshot},
     reset_hidden_popup_state, run_background, run_background_async, run_when_popup_visible,
-    set_optional_label, set_spinner_active,
+    set_optional_label, set_refreshing,
 };
 
 const SCAN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -128,7 +128,6 @@ struct NetworkController {
     vless_icon: gtk::Label,
     rescan_button: gtk::Button,
     rescan_icon: gtk::Label,
-    rescan_spinner: gtk::Spinner,
     list: gtk::Box,
     network_rows: RefCell<HashMap<Vec<u8>, NetworkRow>>,
     header_initialized: Cell<bool>,
@@ -237,7 +236,7 @@ impl NetworkIndicator {
         vless_button.set_child(Some(&vless_icon));
         vless_button.set_visible(false);
 
-        let (rescan_button, rescan_icon, rescan_spinner) = build_refresh_button(ICON_REFRESH);
+        let (rescan_button, rescan_icon) = build_refresh_button(ICON_REFRESH);
 
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         header_actions.add_css_class("network-header-action-capsule");
@@ -339,7 +338,6 @@ impl NetworkIndicator {
             vless_icon,
             rescan_button,
             rescan_icon,
-            rescan_spinner,
             list,
             network_rows: RefCell::new(HashMap::new()),
             header_initialized: Cell::new(false),
@@ -1291,7 +1289,7 @@ impl NetworkController {
     }
 
     fn set_rescan_animating(&self, active: bool) {
-        set_spinner_active(&self.rescan_icon, &self.rescan_spinner, active);
+        set_refreshing(&self.rescan_icon, active);
     }
 
     fn cancel_rescan_tracking(&self) {

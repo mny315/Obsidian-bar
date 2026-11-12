@@ -18,7 +18,7 @@ use super::{
     },
     build_bar_popup, build_quick_toggle_button, build_refresh_button, clear_box,
     detach_application_window, empty_state_label, reset_hidden_popup_state, run_background,
-    run_when_popup_visible, set_optional_label, set_spinner_active,
+    run_when_popup_visible, set_optional_label, set_refreshing,
 };
 
 mod device_row;
@@ -94,7 +94,6 @@ struct BluetoothController {
     header_actions: gtk::Box,
     scan_button: gtk::Button,
     scan_icon: gtk::Label,
-    scan_spinner: gtk::Spinner,
     pairing_box: gtk::Box,
     pairing_title: gtk::Label,
     pairing_message: gtk::Label,
@@ -205,7 +204,7 @@ impl BluetoothIndicator {
         header_text.append(&popup_title);
         header_text.append(&popup_status);
 
-        let (scan_button, scan_icon, scan_spinner) = build_refresh_button(ICON_REFRESH);
+        let (scan_button, scan_icon) = build_refresh_button(ICON_REFRESH);
 
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         header_actions.add_css_class("network-header-action-capsule");
@@ -326,7 +325,6 @@ impl BluetoothIndicator {
             header_actions,
             scan_button,
             scan_icon,
-            scan_spinner,
             pairing_box,
             pairing_title,
             pairing_message,
@@ -1346,7 +1344,7 @@ impl BluetoothController {
     }
 
     fn set_scan_animating(&self, active: bool) {
-        set_spinner_active(&self.scan_icon, &self.scan_spinner, active);
+        set_refreshing(&self.scan_icon, active);
     }
 
     fn set_notice(self: &Rc<Self>, text: Option<&str>) {

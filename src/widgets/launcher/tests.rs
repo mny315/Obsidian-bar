@@ -1,6 +1,126 @@
 use super::*;
 
 #[test]
+#[ignore = "requires GTK layer-shell, SVG loader and XDG_DATA_HOME under /tmp; run alone"]
+fn svg_desktop_icons_render_in_app_rows_and_favorites() {
+    use crate::widgets::test_support::{pump, snapshot_pixels, widgets_with_class};
+    use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+
+    let directory = glib::user_data_dir();
+    assert!(directory.starts_with("/tmp"));
+    let applications = directory.join("applications");
+    let icons = directory.join("icons");
+    let theme = icons.join("obsidian-svg-test");
+    let scalable = theme.join("scalable/apps");
+    fs::create_dir_all(&applications).unwrap();
+    fs::create_dir_all(&scalable).unwrap();
+    fs::write(
+        theme.join("index.theme"),
+        "[Icon Theme]\nName=Obsidian SVG Test\nDirectories=scalable/apps\n\n\
+         [scalable/apps]\nSize=48\nMinSize=1\nMaxSize=256\nType=Scalable\nContext=Applications\n",
+    )
+    .unwrap();
+    let svg = scalable.join("obsidian-svg-fixture.svg");
+    fs::write(
+        &svg,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48"><rect width="48" height="48" fill="#13e74b"/></svg>"##,
+    )
+    .unwrap();
+    for (name, icon) in [
+        ("file", svg.to_str().unwrap()),
+        ("themed", "obsidian-svg-fixture"),
+    ] {
+        fs::write(
+            applications.join(format!("obsidian-svg-{name}.desktop")),
+            format!("[Desktop Entry]\nType=Application\nName=SVG {name}\nExec=true\nIcon={icon}\n"),
+        )
+        .unwrap();
+    }
+    // Fail explicitly if the runtime is missing librsvg, rather than accepting
+    // GTK's image-missing fallback as a successfully loaded application icon.
+    let pixbuf = gdk_pixbuf::Pixbuf::from_file_at_scale(&svg, 40, 40, true)
+        .expect("the runtime must provide an SVG image loader");
+    assert_eq!((pixbuf.width(), pixbuf.height()), (40, 40));
+    gtk::init().unwrap();
+    let display = gdk::Display::default().unwrap();
+    gtk::IconTheme::for_display(&display).add_search_path(&icons);
+    gtk::Settings::for_display(&display).set_gtk_icon_theme_name(Some("obsidian-svg-test"));
+    let application = gtk::Application::builder()
+        .application_id("dev.obsidian.LauncherSvgTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    application.register(gio::Cancellable::NONE).unwrap();
+    let bar = gtk::ApplicationWindow::builder()
+        .application(&application)
+        .build();
+    let monitor = display
+        .monitors()
+        .item(0)
+        .and_downcast::<gdk::Monitor>()
+        .unwrap();
+    let indicator = LauncherIndicator::new(&application, &bar, &monitor, &LauncherCatalog::new());
+    let controller = &indicator._controller;
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let mut images = Vec::new();
+    let mut keys = HashSet::new();
+    let mut rows = Vec::new();
+    let mut favorites = Vec::new();
+    for name in ["file", "themed"] {
+        let id = format!("obsidian-svg-{name}.desktop");
+        let info = gio::AppInfo::all()
+            .into_iter()
+            .find(|info| info.id().as_deref() == Some(&id))
+            .expect("temporary desktop entry must be discovered");
+        let app = Rc::new(catalog_app(info, &mut keys).unwrap());
+        let row = controller.build_app_row(Rc::clone(&app));
+        let icon_wrap =
+            widgets_with_class(row.root.upcast_ref(), "launcher-app-icon-wrap")[0].clone();
+        images.push(
+            icon_wrap
+                .first_child()
+                .and_downcast::<gtk::Image>()
+                .unwrap(),
+        );
+        content.append(&row.root);
+        let favorite = controller.build_favorite_tile(app);
+        images.push(
+            widgets_with_class(favorite.root.upcast_ref(), "launcher-favorite-tile-icon")[0]
+                .clone()
+                .downcast::<gtk::Image>()
+                .unwrap(),
+        );
+        content.append(&favorite.root);
+        rows.push(row);
+        favorites.push(favorite);
+    }
+    let window = gtk::ApplicationWindow::builder()
+        .application(&application)
+        .child(&content)
+        .build();
+    window.init_layer_shell();
+    window.set_namespace(Some("obsidian-bar-launcher-svg-test"));
+    window.set_layer(Layer::Overlay);
+    window.set_keyboard_mode(KeyboardMode::None);
+    window.set_anchor(Edge::Right, true);
+    window.set_anchor(Edge::Bottom, true);
+    window.present();
+    pump(300);
+    for image in &images {
+        let pixels = snapshot_pixels(image, &window);
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .filter(|p| p[0] < 40 && p[1] > 200 && p[2] < 110 && p[3] > 200)
+                .count()
+                > 100,
+            "both launcher views must render the SVG's green pixels, not a missing-image placeholder"
+        );
+    }
+    window.destroy();
+    detach_application_window(&bar);
+}
+
+#[test]
 #[ignore = "requires a GTK display; uses unmapped widgets and does not move the pointer"]
 fn favorite_rebuild_respects_explicit_scroll_reset() {
     gtk::init().unwrap();

@@ -1,6 +1,27 @@
 use std::time::{Duration, Instant};
 
-use gtk::{glib, prelude::*};
+use gtk::{gdk, glib, prelude::*};
+
+pub(super) fn snapshot_pixels(
+    widget: &impl IsA<gtk::Widget>,
+    window: &gtk::ApplicationWindow,
+) -> Vec<u8> {
+    let widget = widget.as_ref();
+    let snapshot = gtk::Snapshot::new();
+    gtk::WidgetPaintable::new(Some(widget)).snapshot(
+        &snapshot,
+        f64::from(widget.width()),
+        f64::from(widget.height()),
+    );
+    let bounds = gtk::graphene::Rect::new(0.0, 0.0, widget.width() as f32, widget.height() as f32);
+    let texture = window.renderer().unwrap().render_texture(
+        snapshot.to_node().expect("mapped widget must render"),
+        Some(&bounds),
+    );
+    let mut downloader = gdk::TextureDownloader::new(&texture);
+    downloader.set_format(gdk::MemoryFormat::R8g8b8a8);
+    downloader.download_bytes().0.as_ref().to_vec()
+}
 
 pub(super) fn pump(ms: u64) {
     let until = Instant::now() + Duration::from_millis(ms);

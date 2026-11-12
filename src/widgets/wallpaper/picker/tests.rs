@@ -1,8 +1,94 @@
 use super::*;
 use crate::widgets::test_support::{
-    capture_if_requested, drag_pointer, drag_pointer_with_wheel, pump, widgets_with_class,
+    capture_if_requested, drag_pointer, drag_pointer_with_wheel, pump, snapshot_pixels,
+    widgets_with_class,
 };
 use std::fs;
+
+#[test]
+#[ignore = "requires GTK layer-shell; verifies rendered refresh frames without moving the pointer"]
+fn refresh_icons_rotate_without_theme_spinner_rules_and_resume_after_reopening() {
+    gtk::init().unwrap();
+    let app = gtk::Application::builder()
+        .application_id("dev.obsidian.RefreshAnimationTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let display = gdk::Display::default().unwrap();
+    let settings = gtk::Settings::for_display(&display);
+    settings.set_gtk_enable_animations(true);
+    let css = gtk::CssProvider::new();
+    css.load_from_data(include_str!("../../../../assets/window.css"));
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    // Simulate a theme that supplies neither the spinner image nor its motion.
+    let theme = gtk::CssProvider::new();
+    theme.load_from_data("spinner { -gtk-icon-source: none; animation: none; }");
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &theme,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    content.add_css_class("widget-popup-frame");
+    let network = crate::widgets::build_refresh_button(ICON_REFRESH);
+    let wallpaper = wallpaper_refresh_button(ICON_REFRESH);
+    for (button, icon) in [&network, &wallpaper] {
+        content.append(button);
+        button.set_sensitive(false);
+        // Wi-Fi starts scanning before the popup has received its first frame.
+        set_refreshing(icon, true);
+    }
+    let window = gtk::ApplicationWindow::builder()
+        .application(&app)
+        .child(&content)
+        .build();
+    window.init_layer_shell();
+    window.set_namespace(Some("obsidian-bar-refresh-test"));
+    window.set_layer(Layer::Overlay);
+    window.set_keyboard_mode(KeyboardMode::None);
+    window.set_anchor(Edge::Right, true);
+    window.set_anchor(Edge::Bottom, true);
+    let frames = || {
+        [&network, &wallpaper].map(|(_, icon)| snapshot_pixels(&icon.parent().unwrap(), &window))
+    };
+    let assert_rotating = || {
+        let before = frames();
+        pump(137);
+        for (before, after) in before.iter().zip(frames()) {
+            assert!(before.chunks_exact(4).any(|pixel| pixel[3] != 0));
+            assert_ne!(
+                *before, after,
+                "refresh glyph must visibly rotate while busy"
+            );
+        }
+    };
+    window.present();
+    pump(150);
+    assert_rotating();
+    window.set_visible(false);
+    pump(50);
+    window.present();
+    pump(100);
+    assert_rotating();
+    for (_, icon) in [&network, &wallpaper] {
+        set_refreshing(icon, false);
+        assert!(icon.is_visible());
+    }
+    pump(100);
+    let stopped = frames();
+    pump(137);
+    assert_eq!(stopped, frames(), "completed refresh must stop repainting");
+    for (_, icon) in [&network, &wallpaper] {
+        set_refreshing(icon, true);
+    }
+    pump(100);
+    assert_rotating();
+    window.destroy();
+}
 
 #[test]
 #[ignore = "requires GTK layer-shell and XDG_STATE_HOME/XDG_CACHE_HOME under /tmp; run alone"]
@@ -200,8 +286,10 @@ fn gallery_loads_thumbnails_after_scrolling_reuses_cards_and_releases_widgets() 
     drop(count);
     // Close during the two-second refresh indication. The pending callback
     // must not keep the gallery model or its loaded thumbnail cards alive.
-    let spinner = widgets_with_class(content.upcast_ref(), "wallpaper-refresh-spinner")[0].clone();
-    let refresh = spinner
+    let refresh_icon = widgets_with_class(content.upcast_ref(), "wallpaper-refresh-indicator")[0]
+        .first_child()
+        .unwrap();
+    let refresh = refresh_icon
         .parent()
         .unwrap()
         .parent()
@@ -226,7 +314,7 @@ fn gallery_loads_thumbnails_after_scrolling_reuses_cards_and_releases_widgets() 
     drop(model);
     drop(gallery);
     drop(refresh);
-    drop(spinner);
+    drop(refresh_icon);
     drop(original);
     drop(scroller);
     drop(adjustment);
@@ -555,7 +643,6 @@ fn virtualized_gallery_reorders_and_preserves_scroll_and_selection() {
         refresh_animation_timer: Rc::new(Timer::default()),
         refresh_button: page.refresh_button.downgrade(),
         refresh_icon: page.refresh_icon.downgrade(),
-        refresh_spinner: page.refresh_spinner.downgrade(),
     });
     let saved = Rc::new(RefCell::new(Vec::new()));
     let saved_order = Rc::clone(&saved);

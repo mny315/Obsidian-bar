@@ -23,8 +23,12 @@
                 $out/lib/udev/rules.d/70-obsidian-bar-batteries.rules
             '';
 
-            nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
-            buildInputs = [ pkgs.gdk-pixbuf pkgs.gtk4 pkgs.gtk4-layer-shell pkgs.pipewire ];
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.rustPlatform.bindgenHook
+              pkgs.wrapGAppsHook4
+            ];
+            buildInputs = [ pkgs.gdk-pixbuf pkgs.gtk4 pkgs.gtk4-layer-shell pkgs.librsvg pkgs.pipewire ];
             OBSIDIAN_BAR_MPVPAPER_BIN = "${pkgs.mpvpaper}/bin/mpvpaper";
             OBSIDIAN_BAR_AWWW_BIN = "${pkgs.awww}/bin/awww";
             OBSIDIAN_BAR_AWWW_DAEMON_BIN = "${pkgs.awww}/bin/awww-daemon";
@@ -51,6 +55,9 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+          # Cargo's debug binary is not wrapped by wrapGAppsHook4. Give it the
+          # same SVG loader as the installed launcher (file and themed icons).
+          GDK_PIXBUF_MODULE_FILE = "${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache";
           OBSIDIAN_BAR_MPVPAPER_BIN = "${pkgs.mpvpaper}/bin/mpvpaper";
           OBSIDIAN_BAR_AWWW_BIN = "${pkgs.awww}/bin/awww";
           OBSIDIAN_BAR_AWWW_DAEMON_BIN = "${pkgs.awww}/bin/awww-daemon";

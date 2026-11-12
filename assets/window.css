@@ -1302,9 +1302,14 @@ button.wallpaper-refresh-button:focus {
   min-height: 16px;
 }
 
-spinner.wallpaper-refresh-spinner {
-  min-width: 16px;
-  min-height: 16px;
+@keyframes obsidian-refresh-spin {
+  from { transform: rotate(0turn); }
+  to { transform: rotate(1turn); }
+}
+
+.refresh-icon-spinning {
+  transform-origin: 50% 50%;
+  animation: obsidian-refresh-spin 1s linear infinite;
 }
 
 button.wallpaper-refresh-button:hover,
@@ -2583,13 +2588,6 @@ switch.network-wifi-switch:disabled {
 .network-refresh-indicator {
   min-width: 18px;
   min-height: 18px;
-}
-
-.network-refresh-spinner {
-  min-width: 16px;
-  min-height: 16px;
-  color: @fg;
-  opacity: 0.88;
 }
 
 .network-section-title {

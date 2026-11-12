@@ -13,7 +13,7 @@ use crate::widgets::tooltip::BarTooltipExt;
 use crate::widgets::{
     BAR_POPUP_TOP_MARGIN, Generation, PopupReveal, SmoothScrollConfig, Timer,
     attach_bar_click_dismiss, attach_popup_focus_dismiss, clear_box, detach_application_window,
-    install_smooth_scroll, run_background_async, set_optional_label, set_spinner_active,
+    install_smooth_scroll, run_background_async, set_optional_label, set_refreshing,
 };
 use gtk::{gdk, glib, prelude::*};
 use gtk4_layer_shell::LayerShell;
@@ -103,7 +103,6 @@ struct GalleryView {
     refresh_animation_timer: Rc<Timer>,
     refresh_button: glib::WeakRef<gtk::Button>,
     refresh_icon: glib::WeakRef<gtk::Label>,
-    refresh_spinner: glib::WeakRef<gtk::Spinner>,
 }
 
 struct GalleryRenderWidgets<'a> {
@@ -318,7 +317,6 @@ struct GalleryPage {
     folder_button: gtk::Button,
     refresh_button: gtk::Button,
     refresh_icon: gtk::Label,
-    refresh_spinner: gtk::Spinner,
 }
 
 fn wallpaper_notice_label() -> gtk::Label {
@@ -375,7 +373,7 @@ fn build_gallery_page(
     path_actions.set_valign(gtk::Align::Center);
 
     let folder_button = header_button(ICON_FOLDER);
-    let (refresh_button, refresh_icon, refresh_spinner) = wallpaper_refresh_button(ICON_REFRESH);
+    let (refresh_button, refresh_icon) = wallpaper_refresh_button(ICON_REFRESH);
     let random_button = random_menu_button(controller);
     path_actions.append(&folder_button);
     path_actions.append(&refresh_button);
@@ -580,7 +578,6 @@ fn build_gallery_page(
         folder_button,
         refresh_button,
         refresh_icon,
-        refresh_spinner,
     }
 }
 
@@ -615,7 +612,6 @@ fn build_picker_content(
         folder_button,
         refresh_button,
         refresh_icon,
-        refresh_spinner,
     } = build_gallery_page(controller, bar_features, audio_spectrum, system_monitor);
     let directory_page = build_directory_page();
 
@@ -657,7 +653,6 @@ fn build_picker_content(
         refresh_animation_timer,
         refresh_button: refresh_button.downgrade(),
         refresh_icon: refresh_icon.downgrade(),
-        refresh_spinner: refresh_spinner.downgrade(),
     };
     gallery_view.refresh(initial_snapshot, false);
 
@@ -1088,27 +1083,23 @@ impl GalleryView {
         let refresh_generation = Rc::clone(&self.refresh_generation);
         let button = self.refresh_button.clone();
         let icon = self.refresh_icon.clone();
-        let spinner = self.refresh_spinner.clone();
         self.refresh_animation_timer.schedule(remaining, move || {
             if refresh_generation.is_current(generation)
-                && let (Some(button), Some(icon), Some(spinner)) =
-                    (button.upgrade(), icon.upgrade(), spinner.upgrade())
+                && let (Some(button), Some(icon)) = (button.upgrade(), icon.upgrade())
             {
                 button.set_sensitive(true);
-                set_spinner_active(&icon, &spinner, false);
+                set_refreshing(&icon, false);
             }
         });
     }
 
     fn set_refresh_animating(&self, active: bool) {
         self.refresh_animation_timer.cancel();
-        if let (Some(button), Some(icon), Some(spinner)) = (
-            self.refresh_button.upgrade(),
-            self.refresh_icon.upgrade(),
-            self.refresh_spinner.upgrade(),
-        ) {
+        if let (Some(button), Some(icon)) =
+            (self.refresh_button.upgrade(), self.refresh_icon.upgrade())
+        {
             button.set_sensitive(!active);
-            set_spinner_active(&icon, &spinner, active);
+            set_refreshing(&icon, active);
         }
     }
 }
@@ -1821,22 +1812,15 @@ fn random_menu_button(controller: &Rc<WallpaperController>) -> gtk::MenuButton {
     button
 }
 
-fn wallpaper_refresh_button(icon_text: &str) -> (gtk::Button, gtk::Label, gtk::Spinner) {
+fn wallpaper_refresh_button(icon_text: &str) -> (gtk::Button, gtk::Label) {
     let icon = gtk::Label::new(Some(icon_text));
     icon.add_css_class("wallpaper-refresh-icon");
-
-    let spinner = gtk::Spinner::new();
-    spinner.add_css_class("wallpaper-refresh-spinner");
-    spinner.set_halign(gtk::Align::Center);
-    spinner.set_valign(gtk::Align::Center);
-    spinner.set_visible(false);
 
     let indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     indicator.add_css_class("wallpaper-refresh-indicator");
     indicator.set_halign(gtk::Align::Center);
     indicator.set_valign(gtk::Align::Center);
     indicator.append(&icon);
-    indicator.append(&spinner);
 
     let button = gtk::Button::new();
     button.add_css_class("wallpaper-refresh-button");
@@ -1844,7 +1828,7 @@ fn wallpaper_refresh_button(icon_text: &str) -> (gtk::Button, gtk::Label, gtk::S
     button.set_valign(gtk::Align::Center);
     button.set_child(Some(&indicator));
 
-    (button, icon, spinner)
+    (button, icon)
 }
 
 fn header_button(icon: &str) -> gtk::Button {
