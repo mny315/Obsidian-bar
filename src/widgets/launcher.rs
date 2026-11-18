@@ -276,6 +276,7 @@ struct LauncherController {
     catalog: Rc<LauncherCatalog>,
     rows: RefCell<Vec<LauncherAppRow>>,
     rows_dirty: Cell<bool>,
+    initial_rows_queued: Cell<bool>,
     row_state_dirty: Cell<bool>,
     user_state: RefCell<LauncherUserState>,
     selected_category: Cell<LauncherCategory>,
@@ -546,6 +547,7 @@ impl LauncherIndicator {
             catalog: Rc::clone(catalog),
             rows: RefCell::new(Vec::new()),
             rows_dirty: Cell::new(true),
+            initial_rows_queued: Cell::new(false),
             row_state_dirty: Cell::new(true),
             user_state: RefCell::new(user_state),
             selected_category: Cell::new(initial_category),
@@ -648,11 +650,12 @@ impl LauncherController {
                 this.selected_category.set(category);
                 this.sync_category_buttons();
                 if searching {
+                    this.search_updates_suspended.set(true);
                     this.search.set_text("");
-                } else {
-                    this.refresh_list();
-                    this.scroll_to_top();
+                    this.search_updates_suspended.set(false);
                 }
+                this.refresh_list();
+                this.scroll_to_top();
 
                 if leaving_hidden {
                     this.replay_view_transition(LauncherViewTransition::HiddenBack);
@@ -1005,8 +1008,8 @@ impl LauncherController {
             && !searching
             && self.selected_category.get() == LauncherCategory::Favorites;
         let (visible_count, hidden_count) = if favorites_view {
-            // Favorites use their own tiles. Do not build the full application
-            // list until a category or search actually needs those rows.
+            // Favorites use their own tiles and leave list preparation to idle.
+            self.prepare_initial_rows();
             for row in self.rows.borrow().iter() {
                 row.set_visible(false);
             }
@@ -1112,6 +1115,56 @@ impl LauncherController {
             let lower = adjustment.lower();
             let upper = (adjustment.upper() - adjustment.page_size()).max(lower);
             adjustment.set_value(previous_scroll.clamp(lower, upper));
+        });
+    }
+
+    fn prepare_initial_rows(self: &Rc<Self>) {
+        if !self.catalog.initialized.get()
+            || !self.rows.borrow().is_empty()
+            || self.initial_rows_queued.replace(true)
+        {
+            return;
+        }
+
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local(move || {
+            const ROWS_PER_IDLE: usize = 8;
+
+            let Some(this) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if this.rows_dirty.get() {
+                let catalog = this.catalog.data.borrow();
+                let mut rows = this.rows.borrow_mut();
+                // A catalog refresh during preparation invalidates the partial list.
+                if rows.first().is_none_or(|first| {
+                    catalog
+                        .apps
+                        .first()
+                        .is_some_and(|app| Rc::ptr_eq(&first.app, app))
+                }) {
+                    let state = this.user_state.borrow();
+                    let start = rows.len();
+                    for app in catalog.apps.iter().skip(start).take(ROWS_PER_IDLE) {
+                        let row = this.build_app_row(app.clone());
+                        row.sync_state(&state);
+                        row.set_visible(false);
+                        this.list
+                            .insert_child_after(&row.root, rows.last().map(|row| &row.root));
+                        rows.push(row);
+                    }
+                    if rows.len() != catalog.apps.len() {
+                        return glib::ControlFlow::Continue;
+                    }
+                    this.rows_dirty.set(false);
+                } else {
+                    drop(rows);
+                    drop(catalog);
+                    this.rebuild_rows();
+                }
+            }
+            this.initial_rows_queued.set(false);
+            glib::ControlFlow::Break
         });
     }
 

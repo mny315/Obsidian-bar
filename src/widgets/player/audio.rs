@@ -16,6 +16,9 @@ use super::{PlayerEvent, enqueue_player_event};
 use crate::widgets::command::ExternalProgram;
 use serde_json::Value;
 
+mod meter;
+use meter::PlaybackMeter;
+
 static PW_DUMP: ExternalProgram = ExternalProgram::new(
     "OBSIDIAN_BAR_PW_DUMP_BIN",
     option_env!("OBSIDIAN_BAR_PW_DUMP_BIN"),
@@ -48,6 +51,14 @@ impl AudioSource {
             })
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaybackStream {
+    serial: u64,
+    source: AudioSource,
+}
+
+type PlaybackStreams = Arc<Mutex<Option<Arc<[PlaybackStream]>>>>;
 
 fn normalized_name(name: &str) -> String {
     let name = name
@@ -106,17 +117,21 @@ impl Graph {
         }
     }
 
-    fn active(&mut self) -> Vec<AudioSource> {
-        let mut sources = HashMap::new();
+    fn playback_streams(&mut self) -> Vec<PlaybackStream> {
+        let mut streams = Vec::new();
         for (id, node) in &self.objects {
             let info = &node["info"];
             let props = &info["props"];
             if props["media.class"] != "Stream/Output/Audio"
                 || info["state"] != "running"
                 || props["pulse.corked"].as_bool() == Some(true)
+                || matches!(props["pulse.corked"].as_str(), Some("true" | "1"))
             {
                 continue;
             }
+            let Some(serial) = unsigned(&props["object.serial"]) else {
+                continue;
+            };
             let controls = info["params"]["Props"].as_array().into_iter().flatten();
             if controls.clone().any(|p| {
                 p["mute"].as_bool() == Some(true)
@@ -166,25 +181,33 @@ impl Graph {
                         number(&props["client.id"]).unwrap_or(*id)
                     )
                 });
-            sources.entry(key.clone()).or_insert(AudioSource {
-                key,
-                name,
-                app_id: property("application.id").into(),
-                binary: property("application.process.binary").into(),
-                process_ids,
+            streams.push(PlaybackStream {
+                serial,
+                source: AudioSource {
+                    key,
+                    name,
+                    app_id: property("application.id").into(),
+                    binary: property("application.process.binary").into(),
+                    process_ids,
+                },
             });
         }
-        let mut result: Vec<_> = sources.into_values().collect();
-        result.sort_by(|a, b| a.key.cmp(&b.key));
-        result
+        streams.sort_by(|a, b| {
+            a.source
+                .key
+                .cmp(&b.source.key)
+                .then(a.serial.cmp(&b.serial))
+        });
+        streams
     }
 }
 
 fn number(value: &Value) -> Option<u32> {
-    value
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok())
-        .or_else(|| value.as_str()?.parse().ok())
+    u32::try_from(unsigned(value)?).ok()
+}
+
+fn unsigned(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
 }
 
 fn process_ancestors(mut pid: u32) -> Vec<u32> {
@@ -212,10 +235,13 @@ pub(super) struct AudioMonitor {
     child: Arc<Mutex<Option<Child>>>,
     wake: mpsc::Sender<()>,
     thread: Option<JoinHandle<()>>,
+    _meter: PlaybackMeter,
 }
 
 impl AudioMonitor {
     pub fn start(events: async_channel::Sender<PlayerEvent>) -> std::io::Result<Self> {
+        let streams: PlaybackStreams = Arc::new(Mutex::new(Some(Arc::from([]))));
+        let meter = PlaybackMeter::start(streams.clone(), events)?;
         let stopping = Arc::new(AtomicBool::new(false));
         let child = Arc::new(Mutex::new(None::<Child>));
         let (wake, wait) = mpsc::channel();
@@ -247,13 +273,11 @@ impl AudioMonitor {
                         {
                             let Ok(updates) = updates else { break };
                             graph.update(updates);
-                            let active = graph.active();
-                            if previous.as_ref() != Some(&active) {
-                                previous = Some(active.clone());
-                                enqueue_player_event(
-                                    &events,
-                                    PlayerEvent::AudioChanged(Some(active)),
-                                );
+                            let current = graph.playback_streams();
+                            if previous.as_deref() != Some(current.as_slice()) {
+                                let current: Arc<[PlaybackStream]> = current.into();
+                                previous = Some(current.clone());
+                                *streams.lock().unwrap() = Some(current);
                             }
                             if stop.load(Ordering::Acquire) {
                                 break;
@@ -264,7 +288,7 @@ impl AudioMonitor {
                             let _ = child.wait();
                         }
                     }
-                    enqueue_player_event(&events, PlayerEvent::AudioChanged(None));
+                    *streams.lock().unwrap() = None;
                     if stop.load(Ordering::Acquire)
                         || wait.recv_timeout(Duration::from_secs(2)).is_ok()
                     {
@@ -277,6 +301,7 @@ impl AudioMonitor {
             child,
             wake,
             thread: Some(thread),
+            _meter: meter,
         })
     }
 }
@@ -303,21 +328,21 @@ mod tests {
     fn tracks_stream_state_mute_zero_volume_and_removal() {
         let mut graph = Graph::default();
         graph.update(vec![json!({"id":10,"type":"PipeWire:Interface:Node","info":{
-            "state":"running","props":{"media.class":"Stream/Output/Audio","application.name":"Player"},
+            "state":"running","props":{"media.class":"Stream/Output/Audio","object.serial":"100","application.name":"Player"},
             "params":{"Props":[{"mute":false,"channelVolumes":[0.5,0.5]}]}}})]);
-        assert_eq!(graph.active()[0].name, "Player");
+        assert_eq!(graph.playback_streams()[0].source.name, "Player");
         for update in [
             json!({"state":"idle"}),
             json!({"state":"running","params":{"Props":[{"mute":true}]}}),
             json!({"params":{"Props":[{"mute":false,"channelVolumes":[0.0,0.0]}]}}),
         ] {
             graph.update(vec![json!({"id":10,"info":update})]);
-            assert!(graph.active().is_empty());
+            assert!(graph.playback_streams().is_empty());
         }
         graph.update(vec![json!({"id":10,"info":{"params":{"Props":[{"mute":false,"channelVolumes":[0.3,0.0]}]}}})]);
-        assert_eq!(graph.active().len(), 1);
+        assert_eq!(graph.playback_streams().len(), 1);
         graph.update(vec![json!({"id":10,"info":null})]);
-        assert!(graph.active().is_empty());
+        assert!(graph.playback_streams().is_empty());
     }
 
     #[test]
@@ -329,10 +354,10 @@ mod tests {
             (2, "Stream/Input/Audio"),
             (3, "Audio/Sink"),
         ] {
-            graph.update(vec![json!({"id":id,"type":"PipeWire:Interface:Node","info":{"state":"running","props":{"media.class":class,"client.id":7}}})]);
+            graph.update(vec![json!({"id":id,"type":"PipeWire:Interface:Node","info":{"state":"running","props":{"media.class":class,"client.id":7,"object.serial":id + 100}}})]);
         }
-        assert_eq!(graph.active().len(), 1);
-        assert_eq!(graph.active()[0].name, "Native player");
+        assert_eq!(graph.playback_streams().len(), 1);
+        assert_eq!(graph.playback_streams()[0].source.name, "Native player");
     }
 
     #[test]
@@ -351,58 +376,138 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a live PipeWire session; creates a temporary silent playback stream"]
-    fn live_monitor_follows_stream_creation_and_removal() {
-        struct Playback(Child);
-        impl Drop for Playback {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+    #[ignore = "requires a live PipeWire session with a test sink for synthetic audio"]
+    fn live_monitor_follows_signal_in_each_playback_stream() {
+        use std::{io::Write, time::Instant};
+
+        struct Playback {
+            child: Child,
+            signal: Arc<AtomicBool>,
+            writer: Option<JoinHandle<()>>,
+        }
+
+        impl Playback {
+            fn start() -> Self {
+                let binary = std::path::Path::new(PW_DUMP.get()).with_file_name("pw-cat");
+                let target = std::env::var_os("OBSIDIAN_BAR_TEST_AUDIO_SINK")
+                    .expect("set OBSIDIAN_BAR_TEST_AUDIO_SINK to the name of a test sink");
+                let mut child = Command::new(binary)
+                    .arg("--target")
+                    .arg(target)
+                    .args([
+                        "--playback",
+                        "--raw",
+                        "--rate",
+                        "48000",
+                        "--channels",
+                        "2",
+                        "--format",
+                        "f32",
+                        "-",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let mut input = child.stdin.take().unwrap();
+                let signal = Arc::new(AtomicBool::new(false));
+                let writer = thread::spawn({
+                    let signal = signal.clone();
+                    move || {
+                        let silence = [0; 3840];
+                        let tone: Vec<_> = (0..480)
+                            .flat_map(|frame| {
+                                let level = if frame % 96 < 48 { 0.02_f32 } else { -0.02 };
+                                [level, -level].into_iter().flat_map(f32::to_le_bytes)
+                            })
+                            .collect();
+                        while input
+                            .write_all(if signal.load(Ordering::Relaxed) {
+                                &tone
+                            } else {
+                                &silence
+                            })
+                            .is_ok()
+                        {}
+                    }
+                });
+                Self {
+                    child,
+                    signal,
+                    writer: Some(writer),
+                }
             }
         }
+
+        impl Drop for Playback {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                self.writer.take().unwrap().join().unwrap();
+            }
+        }
+
         let (events, receiver) = async_channel::unbounded();
         let monitor = AudioMonitor::start(events).unwrap();
-        let binary = std::path::Path::new(PW_DUMP.get()).with_file_name("pw-cat");
-        let mut playback = Playback(
-            Command::new(binary)
-                .args([
-                    "--playback",
-                    "--raw",
-                    "--rate",
-                    "48000",
-                    "--channels",
-                    "2",
-                    "--format",
-                    "f32",
-                    "-",
-                ])
-                .stdin(std::fs::File::open("/dev/zero").unwrap())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap(),
-        );
-        let pid = playback.0.id();
-        let wait_for = |present: bool| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(8);
-            while std::time::Instant::now() < deadline {
-                if let Ok(PlayerEvent::AudioChanged(Some(sources))) = receiver.try_recv()
-                    && sources
+        let first = Playback::start();
+        let first_pid = first.child.id();
+        first.signal.store(true, Ordering::Relaxed);
+        let wait_for = |expected: &[u32]| {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < deadline {
+                if let Ok(PlayerEvent::AudioChanged(Some(sources))) = receiver.try_recv() {
+                    let actual: Vec<_> = sources
                         .iter()
-                        .any(|source| source.process_ids.first() == Some(&pid))
-                        == present
-                {
-                    return;
+                        .filter_map(|source| source.process_ids.first().copied())
+                        .collect();
+                    if actual.len() == expected.len()
+                        && expected.iter().all(|pid| actual.contains(pid))
+                    {
+                        return;
+                    }
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            panic!("audio stream presence did not become {present}");
+            panic!("audible stream IDs did not become {expected:?}");
         };
-        wait_for(true);
-        playback.0.kill().unwrap();
-        playback.0.wait().unwrap();
-        wait_for(false);
-        let stop = std::time::Instant::now();
+        wait_for(&[first_pid]);
+
+        let second = Playback::start();
+        let second_pid = second.child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let dump = Command::new(PW_DUMP.get())
+                .arg("--no-colors")
+                .output()
+                .unwrap();
+            let mut graph = Graph::default();
+            graph.update(serde_json::from_slice(&dump.stdout).unwrap());
+            if graph
+                .playback_streams()
+                .iter()
+                .any(|stream| stream.source.process_ids.first() == Some(&second_pid))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "silent stream must already be running"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(600));
+        assert!(
+            receiver.try_recv().is_err(),
+            "a new silent stream must not change the audible sources"
+        );
+
+        second.signal.store(true, Ordering::Relaxed);
+        wait_for(&[first_pid, second_pid]);
+        second.signal.store(false, Ordering::Relaxed);
+        wait_for(&[first_pid]);
+        drop(first);
+        wait_for(&[]);
+        let stop = Instant::now();
         drop(monitor);
         assert!(stop.elapsed() < Duration::from_secs(2));
     }

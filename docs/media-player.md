@@ -1,14 +1,16 @@
 # Automatic media sources
 
-Auto selects sources using active PipeWire playback streams instead of trusting
-MPRIS `PlaybackStatus` alone. A stale `Playing` flag from a browser preview cannot
-keep an application selected after its playback stream stops. The selected
+Auto selects sources using audio levels measured separately for each PipeWire
+playback stream. An open stream carrying silence and a stale MPRIS `Playing`
+flag cannot take over selection while the monitor is available. The selected
 player's transport state and capabilities always come from MPRIS, including
 pauses made in the source application. A running stream can outlive a pause or
 belong to another browser tab; muted playback can still be playing.
 
-- A running output stream with nonzero volume and no mute is active. Capture
-  streams, sinks, corked streams, and idle streams do not select a player.
+- A running, unmuted output stream with nonzero volume becomes active when
+  its samples exceed the playback meter's noise floor. Brief gaps of up to
+  400 ms do not change the source. Capture streams, sinks, corked streams,
+  and idle streams do not select a player.
 - The most recently activated application wins. When it stops, Auto returns to
   an application that still has an active stream. With no active streams the
   last audible player remains available to resume while paused, including pauses
@@ -25,16 +27,15 @@ belong to another browser tab; muted playback can still be playing.
   selection. If PipeWire monitoring is unavailable, selection falls back to
   MPRIS status.
 
-The monitor uses one persistent `pw-dump --monitor --no-colors` process, restarted
-after disconnects and terminated when the controller is dropped. The flake's
-existing `OBSIDIAN_BAR_PW_DUMP_BIN` supplies its executable; no extra service or
-browser extension is needed.
+The monitor uses one persistent `pw-dump --monitor --no-colors` process to
+discover playback nodes. It measures each eligible node using a passive PipeWire
+connection with an explicit target. The connections yield peak levels in memory
+and are released when the controller is dropped. The flake supplies `pw-dump`
+through `OBSIDIAN_BAR_PW_DUMP_BIN`.
 
-PipeWire identifies application streams, not individual browser tabs or video
-elements. It also does not guarantee that samples contain audible sound: an
-application can keep a running stream filled with silence. If a browser assigns
-its MPRIS session to the wrong video inside the same application, the bar cannot
-repair that assignment. Play/pause sends MPRIS `PlayPause` so that the source
+PipeWire identifies playback streams and their applications. The browser owns
+the mapping from its MPRIS session to a tab or video. Play/pause sends MPRIS
+`PlayPause` so that the source
 toggles its actual state without the bar guessing from stream activity. Sources
 that cannot pause receive `Play` when starting playback. The browser still owns
 the command's target. Invalidated MPRIS properties are fetched again before
@@ -48,11 +49,13 @@ by default because they require system services:
 ```sh
 dbus-run-session -- cargo test audio_activity_drives_selection_and_transport_commands -- --ignored
 dbus-run-session -- cargo test source_signals_and_transport_stay_in_sync_when_audio_activity_lags -- --ignored
-cargo test live_monitor_follows_stream_creation_and_removal -- --ignored
+OBSIDIAN_BAR_TEST_AUDIO_SINK=obsidian-test-sink cargo test live_monitor_follows_signal_in_each_playback_stream -- --ignored
 ```
 
 The D-Bus tests use fixture MPRIS players and never control desktop applications.
-The PipeWire test uses the current session and creates a temporary playback
-stream containing zero samples; it checks discovery, removal, and monitor shutdown.
+Run the PipeWire check in an isolated PipeWire session with a null sink named
+`obsidian-test-sink`. The test checks that a second running stream remains
+unselected while silent, appears when it emits a tone, and goes away when it
+returns to silence. It also checks stream removal and monitor shutdown.
 Set `CARGO_TARGET_DIR` to a temporary directory to keep test binaries out of the
 source tree, and remove that directory after testing.

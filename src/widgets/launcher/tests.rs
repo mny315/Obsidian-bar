@@ -121,8 +121,10 @@ fn svg_desktop_icons_render_in_app_rows_and_favorites() {
 }
 
 #[test]
-#[ignore = "requires a GTK display; uses unmapped widgets and does not move the pointer"]
-fn favorite_rebuild_respects_explicit_scroll_reset() {
+#[ignore = "requires GTK layer-shell; checks launcher rows, scrolling, and the first category transition"]
+fn favorites_prepare_the_first_category_switch_and_preserve_scroll() {
+    use crate::widgets::test_support::{pump, widgets_with_class};
+
     gtk::init().unwrap();
     let application = gtk::Application::builder()
         .application_id("dev.obsidian.LauncherScrollTest")
@@ -132,8 +134,15 @@ fn favorite_rebuild_respects_explicit_scroll_reset() {
     let bar = gtk::ApplicationWindow::builder()
         .application(&application)
         .build();
-    let monitor = gdk::Display::default()
-        .unwrap()
+    let display = gdk::Display::default().unwrap();
+    let css = gtk::CssProvider::new();
+    css.load_from_data(include_str!("../../../assets/window.css"));
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    let monitor = display
         .monitors()
         .item(0)
         .and_downcast::<gdk::Monitor>()
@@ -159,7 +168,7 @@ fn favorite_rebuild_respects_explicit_scroll_reset() {
     adjustment.configure(300.0, 0.0, 1000.0, 10.0, 100.0, 100.0);
     controller.sync_favorites_grid(vec![make_app("first")]);
     controller.scroll_to_top();
-    super::super::test_support::pump(20);
+    pump(20);
     assert_eq!(
         adjustment.value(),
         0.0,
@@ -168,30 +177,83 @@ fn favorite_rebuild_respects_explicit_scroll_reset() {
 
     adjustment.configure(300.0, 0.0, 1000.0, 10.0, 100.0, 100.0);
     controller.sync_favorites_grid(vec![make_app("second")]);
-    super::super::test_support::pump(20);
+    pump(20);
     assert_eq!(
         adjustment.value(),
         300.0,
         "a plain reorder must preserve scrolling"
     );
 
-    controller.catalog.data.borrow_mut().apps = ["first", "second", "third"].map(make_app).into();
+    let mut apps: Vec<_> = ["first", "second", "third"].map(make_app).into();
+    apps.extend((0..40).map(|index| make_app(&format!("fixture {index}"))));
+    controller.catalog.data.borrow_mut().apps = apps;
     controller.user_state.borrow_mut().favorites = HashSet::from(["first".into(), "second".into()]);
     controller
         .selected_category
         .set(LauncherCategory::Favorites);
+    controller.catalog.initialized.set(true);
     controller.refresh_list();
     assert!(
         controller.rows.borrow().is_empty(),
-        "opening favorites must not construct the full list"
+        "opening favorites must not construct the full list synchronously"
     );
     assert_eq!(
         *controller.favorites_grid_keys.borrow(),
         ["first", "second"]
     );
+
+    controller.sync_category_buttons();
+    controller.popup_reveal.show(&controller.popup);
+    pump(300);
+    let prepared = controller.rows.borrow()[0].root.clone();
+    assert_eq!(controller.rows.borrow().len(), 43);
+    assert!(!controller.rows_dirty.get());
+    assert!(!prepared.get_visible());
+    let view = widgets_with_class(controller.popup_root.upcast_ref(), "launcher-view")[0].clone();
+    assert!(view.is_mapped());
+    let clock = view.frame_clock().unwrap();
+    let positions = Rc::new(RefCell::new(Vec::new()));
+    let after_paint = clock.connect_after_paint({
+        let positions = positions.clone();
+        let view = view.clone();
+        let parent = view.parent().unwrap();
+        move |clock| {
+            if let Some(bounds) = view.compute_bounds(&parent) {
+                positions
+                    .borrow_mut()
+                    .push((clock.frame_time(), bounds.x()));
+            }
+        }
+    });
+    let all = controller
+        .category_buttons
+        .iter()
+        .find(|(category, _)| *category == LauncherCategory::All)
+        .unwrap();
+    all.1.emit_clicked();
+    pump(35);
+    assert!(view.has_css_class("launcher-view-category-forward"));
+    assert_eq!(controller.rows.borrow()[0].root, prepared);
+    assert!(prepared.get_visible());
+    pump(220);
+    assert!(!view.has_css_class("launcher-view-category-forward"));
+    clock.disconnect(after_paint);
+    let positions = positions.borrow();
+    assert!(
+        positions.len() >= 3,
+        "the first switch should paint intermediate frames: {positions:?}"
+    );
+    assert!(
+        positions[0].1 > positions.last().unwrap().1,
+        "the first frame should already be offset: {positions:?}"
+    );
+
+    controller
+        .selected_category
+        .set(LauncherCategory::Favorites);
     controller.search.set_text("third");
     controller.refresh_list();
-    assert_eq!(controller.rows.borrow().len(), 3);
+    assert_eq!(controller.rows.borrow().len(), 43);
     assert_eq!(
         controller
             .rows

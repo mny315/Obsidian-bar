@@ -994,8 +994,10 @@ impl PlayerController {
 
     pub fn start(&self) {
         if self.audio_monitor.borrow().is_none() {
-            match AudioMonitor::start(self.state.borrow().events.clone()) {
+            let events = self.state.borrow().events.clone();
+            match AudioMonitor::start(events) {
                 Ok(monitor) => {
+                    self.state.borrow_mut().audio_changed(Some(Vec::new()));
                     self.audio_monitor.replace(Some(monitor));
                 }
                 Err(error) => warn!(%error, "cannot monitor audio activity; using MPRIS status"),
