@@ -129,14 +129,15 @@ fn hidpp_function(device: u8, function: u8) -> u8 {
     // OpenRGB's ID 7, or Solaar's IDs 8..=15 (older versions rotate them).
     static REQUEST_ID: AtomicU8 = AtomicU8::new(2);
     if device == 0xff {
-        function
-    } else {
-        let id = REQUEST_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-                Some(if id == 6 { 2 } else { id + 1 })
-            })
-            .expect("software ID rotation always succeeds");
-        (function & 0xf0) | id
+        return function;
+    }
+    let mut id = REQUEST_ID.load(Ordering::Relaxed);
+    loop {
+        let next_id = if id == 6 { 2 } else { id + 1 };
+        match REQUEST_ID.compare_exchange_weak(id, next_id, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return (function & 0xf0) | id,
+            Err(current_id) => id = current_id,
+        }
     }
 }
 
