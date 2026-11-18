@@ -11,12 +11,12 @@ belong to another browser tab; muted playback can still be playing.
   its samples exceed the playback meter's noise floor. Brief gaps of up to
   400 ms do not change the source. Capture streams, sinks, corked streams,
   and idle streams do not select a player.
-- The most recently activated application wins. When it stops, Auto returns to
-  an application that still has an active stream. With no active streams the
-  last audible player remains available to resume while paused, including pauses
-  made in the source application. This works regardless of whether the pause
-  notification arrives before or after the stream stops. An idle player with
-  only a stale `Playing` flag does not keep the indicator visible.
+- The most recently activated application wins. When it goes quiet, Auto
+  returns to an application that still has an audible stream. With no audible
+  streams, the last audible MPRIS player stays visible during quiet passages and
+  manual pauses. It remains selected while its session reports `Playing` or
+  `Paused`. A stopped or closed session loses this fallback. A source needs
+  audible playback to take over automatically.
 - Stream process IDs and their parent processes are matched to the MPRIS D-Bus
   owner's process ID. Application names are a fallback when process information
   is unavailable. This also handles browser audio subprocesses.

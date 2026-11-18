@@ -464,6 +464,15 @@ fn source_signals_and_transport_stay_in_sync_when_audio_activity_lags() {
             state.audio_changed(Some(vec![fixture_audio.clone()]));
             wait_for_status(&mut state, PlaybackStatus::Playing);
 
+            // A quiet passage can outlast the meter's silence grace period.
+            state.audio_changed(Some(vec![]));
+            assert_eq!(
+                state.current_view().unwrap().status,
+                PlaybackStatus::Playing
+            );
+            state.audio_changed(Some(vec![fixture_audio.clone()]));
+            wait_for_status(&mut state, PlaybackStatus::Playing);
+
             // Pause in the source while its audio stream remains active.
             status.set("Paused");
             emit_status(&bus, status.get(), false);
@@ -478,6 +487,10 @@ fn source_signals_and_transport_stay_in_sync_when_audio_activity_lags() {
             state.audio_changed(Some(vec![fixture_audio]));
             assert!(state.resume_bus.borrow().is_none());
             state.audio_changed(Some(vec![]));
+            assert_eq!(
+                state.current_view().unwrap().status,
+                PlaybackStatus::Playing
+            );
             status.set("Paused");
             emit_status(&bus, status.get(), false);
             wait_for_status(&mut state, PlaybackStatus::Paused);
@@ -628,16 +641,30 @@ fn audio_activity_drives_selection_and_transport_commands() {
         state.select_source(None);
         assert_eq!(state.active_bus.as_deref(), Some("music"));
         state.audio_changed(Some(vec![]));
-        assert!(state.current_view().is_none());
+        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Playing);
+        music_proxy.set_cached_property("CanPlay", Some(&false.to_variant()));
         music_proxy.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
         state.player_properties_changed("music");
         assert_eq!(state.active_bus.as_deref(), Some("music"));
         assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Paused);
+        assert!(!state.current_view().unwrap().can_play_pause);
+        music_proxy.set_cached_property("CanPlay", Some(&true.to_variant()));
+        state.player_properties_changed("music");
+        assert!(state.current_view().unwrap().can_play_pause);
+        state.call_active(PlayerAction::PlayPause);
+        expect_call("PlayPause");
         music_proxy.set_cached_property("PlaybackStatus", Some(&"Stopped".to_variant()));
         state.player_properties_changed("music");
-        assert!(state.current_view().is_none(), "a stopped source is not paused");
+        assert!(state.current_view().is_none(), "a stopped source must disappear");
+        music_proxy.set_cached_property("PlaybackStatus", Some(&"Playing".to_variant()));
+        state.player_properties_changed("music");
+        assert!(state.current_view().is_none(), "stale Playing must not revive a stopped source");
+        state.audio_changed(Some(vec![audio("music", 1002)]));
+        assert_eq!(state.active_bus.as_deref(), Some("music"));
         music_proxy.set_cached_property("PlaybackStatus", Some(&"Paused".to_variant()));
         state.player_properties_changed("music");
+        state.audio_changed(Some(vec![]));
+        assert_eq!(state.current_view().unwrap().status, PlaybackStatus::Paused);
         state.audio_changed(Some(vec![audio("Telegram", 2000)]));
         assert_eq!(state.current_view().unwrap().metadata, "Telegram");
         state.audio_changed(Some(vec![]));

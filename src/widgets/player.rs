@@ -36,6 +36,12 @@ enum PlaybackStatus {
     Unknown,
 }
 
+impl PlaybackStatus {
+    fn has_media(self) -> bool {
+        matches!(self, Self::Playing | Self::Paused)
+    }
+}
+
 struct PlayerHandle {
     bus_name: String,
     player: gio::DBusProxy,
@@ -142,8 +148,9 @@ impl PlayerHandle {
             return false;
         }
 
-        let capabilities = self.capabilities(self.playback_status());
-        capabilities.previous || capabilities.play_pause || capabilities.next
+        let status = self.playback_status();
+        let capabilities = self.capabilities(status);
+        status.has_media() || capabilities.previous || capabilities.play_pause || capabilities.next
     }
 
     fn identity(&self) -> String {
@@ -426,12 +433,7 @@ impl PlayerState {
     }
 
     fn owner_changed(&mut self, bus_name: &str, has_owner: bool) {
-        if self.last_audio_bus.as_deref() == Some(bus_name) {
-            self.last_audio_bus = None;
-        }
-        if self.resume_bus.borrow().as_deref() == Some(bus_name) {
-            self.resume_bus.borrow_mut().take();
-        }
+        self.forget_resume_source(bus_name);
         self.players.retain(|player| player.bus_name != bus_name);
         self.source_states.remove(bus_name);
         // A replacement owner can arrive while the previous proxy is still
@@ -443,6 +445,16 @@ impl PlayerState {
         }
 
         self.refresh_views();
+    }
+
+    fn forget_resume_source(&mut self, bus_name: &str) {
+        if self.last_audio_bus.as_deref() == Some(bus_name) {
+            self.last_audio_bus = None;
+        }
+        let resume = self.resume_bus.get_mut();
+        if resume.as_deref() == Some(bus_name) {
+            *resume = None;
+        }
     }
 
     fn connect_player(&mut self, bus_name: &str) {
@@ -586,6 +598,9 @@ impl PlayerState {
         let previous = self.source_states.insert(bus_name.to_owned(), current);
         let started_playing = became_playing(previous, current);
 
+        if current.status == PlaybackStatus::Stopped {
+            self.forget_resume_source(bus_name);
+        }
         if started_playing && !self.pinned && self.audio.is_none() {
             self.active_bus = Some(bus_name.to_owned());
         }
@@ -703,19 +718,18 @@ impl PlayerState {
                 )
             }));
             let next = {
-                // Remember the audible source across stream removal: an
-                // external pause notification can arrive before or after it.
-                let paused = self.last_audio_bus.as_deref().filter(|bus| {
+                // Silence can be part of playback or arrive before MPRIS
+                // reports a pause. Keep the last audible media session.
+                let last_playback = self.last_audio_bus.as_deref().filter(|bus| {
                     self.players.iter().any(|player| {
-                        player.bus_name == *bus
-                            && player.playback_status() == PlaybackStatus::Paused
+                        player.bus_name == *bus && player.playback_status().has_media()
                     })
                 });
                 preferred_audio_source(
                     &choices,
                     self.active_bus.as_deref(),
                     self.pinned,
-                    self.resume_bus.borrow().as_deref().or(paused),
+                    self.resume_bus.borrow().as_deref().or(last_playback),
                 )
             };
             if let Some((bus, _)) = choices
@@ -725,7 +739,7 @@ impl PlayerState {
                 self.last_audio_bus = self
                     .players
                     .iter()
-                    .any(|player| player.bus_name == *bus)
+                    .any(|player| player.bus_name == *bus && player.playback_status().has_media())
                     .then(|| bus.clone());
             }
             if self.pinned && next != self.active_bus {
